@@ -1,0 +1,1576 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>魚類調査記録</title>
+<link rel="manifest" href="./manifest.json">
+<meta name="theme-color" content="#0a0e14">
+<link rel="stylesheet" href="./leaflet.css">
+<style>
+:root{
+  --bg:#0a0e14; --panel:#141b25; --panel2:#1b2430; --line:#2b3644;
+  --fg:#e6edf5; --dim:#93a2b5; --accent:#4aa3ff; --ok:#3fb950; --warn:#d29922; --ng:#f85149;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
+  font-family:system-ui,-apple-system,"Segoe UI","Hiragino Sans","Noto Sans JP",sans-serif;
+  font-size:16px;line-height:1.5}
+body{padding-bottom:40px}
+header{position:sticky;top:0;z-index:900;background:var(--panel);border-bottom:1px solid var(--line);
+  padding:8px 10px calc(8px + env(safe-area-inset-top)) 10px;padding-top:calc(8px + env(safe-area-inset-top))}
+.hrow{display:flex;align-items:center;gap:8px;min-height:34px}
+#title{font-weight:700;font-size:17px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#sub{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+#sub:empty{margin-top:0}
+.pill{font-size:12px;background:var(--panel2);border:1px solid var(--line);border-radius:999px;
+  padding:2px 9px;color:var(--dim);white-space:nowrap}
+.pill.ok{color:var(--ok);border-color:#264d31}
+.pill.warn{color:var(--warn);border-color:#4d3f16}
+.pill.ng{color:var(--ng);border-color:#5c2626}
+main{padding:10px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:10px}
+.card.tap{cursor:pointer}
+.card.tap:active{background:var(--panel2)}
+.row{display:flex;gap:10px;align-items:center}
+.grow{flex:1;min-width:0}
+.dim{color:var(--dim);font-size:13px}
+.small{font-size:12px}
+h3{margin:16px 0 8px;font-size:14px;color:var(--dim);font-weight:600;letter-spacing:.04em}
+h3:first-child{margin-top:0}
+label{display:block;margin:10px 0 4px;font-size:13px;color:var(--dim)}
+input,select,textarea{width:100%;background:var(--panel2);color:var(--fg);border:1px solid var(--line);
+  border-radius:8px;padding:10px;font-size:16px;font-family:inherit}
+textarea{min-height:70px;resize:vertical}
+button{font-family:inherit;font-size:15px;cursor:pointer}
+.btn{display:block;width:100%;padding:13px;border-radius:9px;border:1px solid var(--line);
+  background:var(--panel2);color:var(--fg);margin-top:10px;text-align:center}
+.btn:active{background:#26303e}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:#04121f;font-weight:700}
+.btn.ok{background:#1c3a25;border-color:#2d5c3a;color:#8ce39c}
+.btn.ng{background:#3a1d1d;border-color:#5c2b2b;color:#ff9a92}
+.btn.sm{padding:8px;font-size:14px;margin-top:6px}
+.btn[disabled]{opacity:.4;pointer-events:none}
+.btn2{display:flex;gap:8px}
+.btn2 .btn{margin-top:10px}
+.seg{display:flex;flex-wrap:wrap;gap:6px}
+.seg button{background:var(--panel2);color:var(--dim);border:1px solid var(--line);
+  border-radius:8px;padding:9px 12px;font-size:14px}
+.seg button.on{background:var(--accent);border-color:var(--accent);color:#04121f;font-weight:700}
+.seg.basemap button{font-size:13px;padding:7px 10px}
+#toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(20px);
+  background:#0f1720;border:1px solid var(--line);color:var(--fg);padding:11px 16px;border-radius:9px;
+  max-width:88vw;opacity:0;pointer-events:none;transition:.2s;z-index:2000;font-size:14px;text-align:center}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.map{width:100%;height:60vh;min-height:320px;border-radius:10px;overflow:hidden;background:#0d1219}
+.leaflet-container{background:#0d1219;font-family:inherit}
+.pinmark{border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.6)}
+.hr{height:1px;background:var(--line);margin:14px 0}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{border-bottom:1px solid var(--line);padding:7px 4px;text-align:left}
+th{color:var(--dim);font-weight:600;font-size:12px}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+.warnbox{background:#2a2110;border:1px solid #4d3f16;color:#f0d48a;border-radius:8px;padding:10px;font-size:13px;margin:10px 0}
+.ngbox{background:#2a1414;border:1px solid #5c2626;color:#ffb4ad;border-radius:8px;padding:10px;font-size:13px;margin:10px 0}
+.okbox{background:#12271a;border:1px solid #264d31;color:#9be0aa;border-radius:8px;padding:10px;font-size:13px;margin:10px 0}
+.chip{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:6px;
+  padding:2px 7px;font-size:12px;color:var(--dim);margin:2px 4px 2px 0}
+.splist{max-height:52vh;overflow-y:auto;border:1px solid var(--line);border-radius:8px}
+.spitem{padding:11px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+.spitem:last-child{border-bottom:none}
+.spitem:active{background:var(--panel2)}
+.spitem .fam{color:var(--dim);font-size:12px;margin-left:8px}
+.big{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+<header>
+  <div class="hrow">
+    <button id="backBtn" class="seg" style="display:none;background:none;border:none;padding:0"
+      onclick="goBack()"><span style="display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 11px">戻る</span></button>
+    <div id="title">魚類調査記録</div>
+  </div>
+  <div id="sub"></div>
+</header>
+<main id="main"></main>
+<div id="toast"></div>
+
+<script src="./leaflet.js"></script>
+<script>
+/* ============================================================
+   魚類調査記録アプリ
+   単一HTMLのオフラインPWA。現場で獲れた魚と川の環境を記録し、
+   魚類データベースにそのまま取り込めるCSVを書き出す。
+
+   置き場所の分け方（同じ場所に鳥・産卵床のアプリがあるため必ず分ける）
+     localStorage  fs_          IndexedDB  fish_survey_media
+     キャッシュ    fish-survey-* / fish-map-*
+   ============================================================ */
+const APP_VERSION = 'v1';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+
+/* ---------- 小道具 ---------- */
+const $  = (s,r)=> (r||document).querySelector(s);
+const $$ = (s,r)=> Array.from((r||document).querySelectorAll(s));
+function uuid(){
+  if(window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,c=>{
+    const r=Math.random()*16|0; return (c==='x'?r:(r&0x3|0x8)).toString(16); });
+}
+function nowISO(){ return new Date().toISOString(); }
+function pad2(n){ return String(n).padStart(2,'0'); }
+function dateValue(d){ d=d||new Date();
+  return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`; }
+function timeValue(d){ d=d||new Date(); return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`; }
+function fmtDate(s){ if(!s) return '—'; return String(s).slice(0,10); }
+function fmtTime(s){ if(!s) return '—'; const d=new Date(s); if(isNaN(d)) return '—';
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`; }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,
+  c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function toast(msg, ms){ const t=$('#toast'); if(!t) return; t.textContent=msg; t.classList.add('show');
+  clearTimeout(toast._t); toast._t=setTimeout(()=>t.classList.remove('show'), ms||2400); }
+
+/* 数値の取り出し。空欄は '' のまま返す。
+   0 を未入力と取り違えないため。魚類では 流速0・水深0・通電0秒・尾数0 が普通にある */
+function numOf(v){
+  if(v===null || v===undefined) return '';
+  const s=String(v).trim(); if(s==='') return '';
+  const n=parseFloat(s); return isNaN(n) ? '' : n;
+}
+function numVal(sel){ const el=$(sel); return el ? numOf(el.value) : ''; }
+function strVal(sel){ const el=$(sel); return el ? String(el.value).trim() : ''; }
+/* 空欄を落とさずに数だけ集める。filter(v=>v) と書くと 0 が消える */
+function nums(arr){ return (arr||[]).map(numOf).filter(v=>v!==''); }
+function fmtNum(v, d){ return v==='' || v===null || v===undefined || isNaN(v)
+  ? '—' : (d===undefined ? String(v) : (+v).toFixed(d)); }
+function fmtDist(d){ d=+d||0; return d>=1000 ? (d/1000).toFixed(2)+'km' : Math.round(d)+'m'; }
+function fmtDur(sec){ sec=Math.max(0,Math.round(sec||0));
+  const h=Math.floor(sec/3600), m=Math.floor(sec%3600/60), s=sec%60;
+  return h ? `${h}時間${m}分` : (m ? `${m}分${pad2(s)}秒` : `${s}秒`); }
+
+/* ============================================================
+   使用権の確認（複数タブ）と書き込みの門
+   同じ記録を2つのタブで開くと、あとから保存したほうが相手の記録を消す。
+   起動時に使用権を取り、取れるまで・取れなければ一切書き込まない。
+   ============================================================ */
+const TAB_ID    = uuid();
+const LOCK_KEY  = 'fs_lock';
+const LOCK_TTL  = 12000;   // これより古い持ち主は、閉じられたものとみなす
+const LOCK_BEAT = 4000;    // 生きている印を書き直す間隔
+const LOCK_WAIT = 350;     // 取ったあと、割り込みが無かったか確かめるまでの待ち
+window.WRITE_OK   = false;
+window.READ_ONLY  = false;
+window.RECOVERY_OK= false;
+let SAVE_FATAL = false;    // 後片付けに失敗した状態。再読み込みでしか解けない
+
+function lockRead(){ try{
+  const o=JSON.parse(localStorage.getItem(LOCK_KEY)||'null');
+  return (o && typeof o.id==='string' && typeof o.at==='number') ? o : null;
+}catch(e){ return null; } }
+function lockAlive(o){ return !!o && (Date.now()-o.at) < LOCK_TTL; }
+function lockWrite(){ try{
+  localStorage.setItem(LOCK_KEY, JSON.stringify({id:TAB_ID, at:Date.now()})); return true;
+}catch(e){ return false; } }
+
+function goReadOnly(why){
+  window.WRITE_OK=false; window.READ_ONLY=true; LOCK_WHY=why;
+  clearInterval(lockBeatTimer); lockBeatTimer=null;
+  try{ render(); }catch(e){}
+}
+let LOCK_WHY='';
+let lockBeatTimer=null;
+
+function claimLock(){
+  const cur = lockRead();
+  if(lockAlive(cur) && cur.id!==TAB_ID){
+    goReadOnly('ほかのタブでこのアプリが開いています。そのタブを閉じてから開き直してください');
+    return;
+  }
+  if(!lockWrite()){
+    goReadOnly('このブラウザ／開き方では保存できません（保存領域が使えません）');
+    return;
+  }
+  // すぐに開放せず、間に別のタブが割り込まなかったか確かめてから開ける
+  setTimeout(()=>{
+    const c2 = lockRead();
+    if(!c2 || c2.id!==TAB_ID){
+      goReadOnly('ほかのタブでこのアプリが開かれました。どちらか一方だけにしてください');
+      return;
+    }
+    window.WRITE_OK=true; window.READ_ONLY=false; LOCK_WHY='';
+    lockBeatTimer = setInterval(()=>{ if(window.WRITE_OK) lockWrite(); }, LOCK_BEAT);
+    try{ render(); }catch(e){}
+  }, LOCK_WAIT);
+}
+/* このページを離れるときは使用権を手放す。
+   握ったままだと、同じタブで読み込み直しただけで「別のタブが開いている」と誤判定する */
+function releaseLock(){
+  const o = lockRead();
+  if(o && o.id===TAB_ID){ try{ localStorage.removeItem(LOCK_KEY); }catch(e){} }
+}
+window.addEventListener('pagehide', releaseLock);
+/* 戻るボタンなどで表に戻ってきたら取り直す */
+window.addEventListener('pageshow', e=>{ if(e.persisted){ window.WRITE_OK=false; claimLock(); } });
+
+window.addEventListener('storage', e=>{
+  if(e.key!==LOCK_KEY || !window.WRITE_OK) return;
+  const o = lockRead();
+  if(o && o.id!==TAB_ID) goReadOnly('ほかのタブでこのアプリが開かれました。どちらか一方だけにしてください');
+});
+
+/* 記録に関わる書き込みは必ずここを通す。
+   端末ごとの好み（地図の種類・下書き）は記録ではないので対象外 */
+function writeAllowed(){
+  if(SAVE_FATAL && !window.RECOVERY_OK){
+    toast('保存の後片付けに失敗しています。ページを読み込み直してください', 6000);
+    return false;
+  }
+  if(window.WRITE_OK || window.RECOVERY_OK) return true;
+  toast(window.READ_ONLY ? LOCK_WHY
+    : '起動時の確認が終わるまで保存できません。数秒待ってからやり直してください', 5000);
+  return false;
+}
+
+/* ============================================================
+   保存層（localStorage）
+   削除は deleted_at を立てる論理削除のみ。
+   保存に失敗したら false を返す。呼び出し側は「できたことにしない」
+   ============================================================ */
+const DB = {
+  key:{ sv:'fs_surveys', st:'fs_stations', ca:'fs_catches',
+        ind:'fs_individuals', nt:'fs_notes' },
+
+  /* 壊れていても空配列を返す。表示用 */
+  load(k){ try{ const a=JSON.parse(localStorage.getItem(k)||'[]'); return Array.isArray(a)?a:[]; }
+           catch(e){ return []; } },
+  /* 壊れていたら例外にする。「本当に空」と「読めない」を区別する必要がある処理用
+     （バックアップ・完全削除・書き出しなど、空を鵜呑みにすると記録を失うもの） */
+  loadRaw(k){
+    const raw = localStorage.getItem(k);
+    if(raw===null || raw==='') return [];
+    let a; try{ a=JSON.parse(raw); }
+    catch(e){ throw new Error('保存された記録を読み取れません: '+k); }
+    if(!Array.isArray(a)) throw new Error('保存された記録の形がおかしいです: '+k);
+    return a;
+  },
+  save(k, arr){
+    if(!writeAllowed()) return false;
+    try{ localStorage.setItem(k, JSON.stringify(arr)); return true; }
+    catch(e){
+      toast('保存できませんでした。端末の空き容量を確認してください', 6000);
+      return false;
+    }
+  },
+  get(k,u){ return this.load(k).find(x=>x.uuid===u) || null; },
+  alive(k){ return this.load(k).filter(x=>!x.deleted_at); },
+
+  upsert(k, rec){
+    if(!rec.uuid) rec.uuid = uuid();
+    rec.updated_at = nowISO();
+    let a; try{ a=this.loadRaw(k); }
+    catch(e){ toast('保存された記録を読み取れないため、保存を中止しました', 6000); return false; }
+    const i = a.findIndex(x=>x.uuid===rec.uuid);
+    if(i<0){ rec.created_at = rec.created_at || nowISO(); a.push(rec); }
+    else a[i] = rec;
+    return this.save(k, a) ? rec : false;
+  },
+  softDelete(k, u, by){
+    let a; try{ a=this.loadRaw(k); }
+    catch(e){ toast('記録を読み取れないため、削除を中止しました', 6000); return false; }
+    const t = nowISO();
+    let hit=false;
+    a.forEach(x=>{ if(x.uuid===u && !x.deleted_at){ x.deleted_at=t; if(by) x.deleted_by=by; hit=true; } });
+    if(!hit) return true;
+    return this.save(k, a);
+  },
+  restore(k, u){
+    let a; try{ a=this.loadRaw(k); }catch(e){ return false; }
+    a.forEach(x=>{ if(x.uuid===u){ delete x.deleted_at; delete x.deleted_by; } });
+    return this.save(k, a);
+  },
+
+  /* 親子のたどり方 */
+  surveys(){ return this.alive(this.key.sv)
+    .sort((a,b)=> String(b.survey_date||'').localeCompare(String(a.survey_date||''))
+               || String(b.created_at||'').localeCompare(String(a.created_at||''))); },
+  stationsOf(sv){ return this.alive(this.key.st).filter(x=>x.survey_uuid===sv)
+    .sort((a,b)=> (a.station_no||0)-(b.station_no||0)); },
+  catchesOf(st){ return this.alive(this.key.ca).filter(x=>x.station_uuid===st)
+    .sort((a,b)=> String(a.created_at||'').localeCompare(String(b.created_at||''))); },
+  catchesOfSurvey(sv){ return this.alive(this.key.ca).filter(x=>x.survey_uuid===sv); },
+  individualsOf(ca){ return this.alive(this.key.ind).filter(x=>x.catch_uuid===ca)
+    .sort((a,b)=> (a.individual_number||0)-(b.individual_number||0)); },
+  notesOf(sv){ return this.alive(this.key.nt).filter(x=>x.survey_uuid===sv); },
+};
+
+/* ---------- 完全に消した記録の印（墓標） ----------
+   後でデータベースへ「これは消した」と伝えるために残す。1件あたり数十バイト */
+function tombstones(){ try{
+  return (JSON.parse(localStorage.getItem('fs_tombstones')||'[]')||[])
+    .filter(t=>t && typeof t.uuid==='string' && t.uuid);
+}catch(e){ return []; } }
+function tombstoneAdd(u){
+  if(!u || !writeAllowed()) return false;
+  const a=tombstones();
+  if(!a.some(t=>t.uuid===u)) a.push({uuid:u, at:nowISO()});
+  try{ localStorage.setItem('fs_tombstones', JSON.stringify(a)); return true; }catch(e){ return false; }
+}
+
+/* ---------- 端末ごとの好み（記録ではないので門を通さない） ---------- */
+function prefs(){ try{ return JSON.parse(localStorage.getItem('fs_prefs')||'{}')||{}; }catch(e){ return {}; } }
+function prefSet(k,v){ const p=prefs(); p[k]=v; try{ localStorage.setItem('fs_prefs', JSON.stringify(p)); }catch(e){} }
+
+/* ============================================================
+   魚種リスト
+   ここは魚類データベースから作る。手で書き換えない。
+   作り直す: 魚類データベース/scripts/generate_fish_app_species.py
+   ============================================================ */
+/* <<<FS_SPECIES_AUTO_START>>>
+   ここから下は自動生成。手で書き換えない。
+   作り直す: 魚類データベース/scripts/generate_fish_app_species.py
+   元:       species_master の is_active=TRUE を sort_order 順に 101種 */
+const SPECIES = [
+  {id:"FW001", ja:"ミツバヤツメ", fam:"ヤツメウナギ科", ord:1},
+  {id:"FW003", ja:"キタスナヤツメ", fam:"ヤツメウナギ科", ord:2},
+  {id:"FW002", ja:"ウチワスナヤツメ", fam:"ヤツメウナギ科", ord:3},
+  {id:"FW103", ja:"スナヤツメ類", fam:"ヤツメウナギ科", ord:4},
+  {id:"FW005", ja:"シベリアヤツメ", fam:"ヤツメウナギ科", ord:5},
+  {id:"FW004", ja:"カワヤツメ", fam:"ヤツメウナギ科", ord:6},
+  {id:"FW102", ja:"カワヤツメ属", fam:"ヤツメウナギ科", ord:7},
+  {id:"FW006", ja:"ニホンウナギ", fam:"ウナギ科", ord:8},
+  {id:"FW007", ja:"コイ", fam:"コイ科", ord:9},
+  {id:"FW008", ja:"ゲンゴロウブナ", fam:"コイ科", ord:10},
+  {id:"FW009", ja:"キンギョ", fam:"コイ科", ord:11},
+  {id:"FW010", ja:"キンブナ", fam:"コイ科", ord:12},
+  {id:"FW106", ja:"フナ属", fam:"コイ科", ord:13},
+  {id:"FW011", ja:"ギンブナ", fam:"コイ科", ord:14},
+  {id:"FW012", ja:"タイリクバラタナゴ", fam:"コイ科", ord:15},
+  {id:"FW013", ja:"オイカワ", fam:"コイ科", ord:16},
+  {id:"FW014", ja:"ソウギョ", fam:"コイ科", ord:17},
+  {id:"FW015", ja:"アオウオ", fam:"コイ科", ord:18},
+  {id:"FW016", ja:"ヤチウグイ", fam:"コイ科", ord:19},
+  {id:"FW017", ja:"アブラハヤ", fam:"コイ科", ord:20},
+  {id:"FW018", ja:"ジュウサンウグイ", fam:"コイ科", ord:21},
+  {id:"FW019", ja:"マルタ", fam:"コイ科", ord:22},
+  {id:"FW020", ja:"エゾウグイ", fam:"コイ科", ord:23},
+  {id:"FW021", ja:"ウグイ", fam:"コイ科", ord:24},
+  {id:"FW104", ja:"ウグイ属", fam:"コイ科", ord:25},
+  {id:"FW022", ja:"モツゴ", fam:"コイ科", ord:26},
+  {id:"FW023", ja:"シナイモツゴ", fam:"コイ科", ord:27},
+  {id:"FW024", ja:"タモロコ", fam:"コイ科", ord:28},
+  {id:"FW025", ja:"ドジョウ", fam:"ドジョウ科", ord:29},
+  {id:"FW026", ja:"キタドジョウ", fam:"ドジョウ科", ord:30},
+  {id:"FW027", ja:"フクドジョウ", fam:"フクドジョウ科", ord:31},
+  {id:"FW028", ja:"エゾホトケドジョウ", fam:"フクドジョウ科", ord:32},
+  {id:"FW029", ja:"ナマズ", fam:"ナマズ科", ord:33},
+  {id:"FW107", ja:"ドジョウ類", fam:"ドジョウ科", ord:34},
+  {id:"FW030", ja:"シシャモ", fam:"キュウリウオ科", ord:35},
+  {id:"FW031", ja:"ワカサギ", fam:"キュウリウオ科", ord:36},
+  {id:"FW032", ja:"イシカリワカサギ", fam:"キュウリウオ科", ord:37},
+  {id:"FW033", ja:"アユ", fam:"アユ科", ord:38},
+  {id:"FW034", ja:"シラウオ", fam:"シラウオ科", ord:39},
+  {id:"FW035", ja:"シナノユキマス", fam:"サケ科", ord:40},
+  {id:"FW036", ja:"ゴレゴヌス・ペレッド", fam:"サケ科", ord:41},
+  {id:"FW037", ja:"イトウ", fam:"サケ科", ord:42},
+  {id:"FW038", ja:"ブラウントラウト", fam:"サケ科", ord:43},
+  {id:"FW039", ja:"カワマス", fam:"サケ科", ord:44},
+  {id:"FW040", ja:"アメマス", fam:"サケ科", ord:45},
+  {id:"FW041", ja:"オショロコマ", fam:"サケ科", ord:46},
+  {id:"FW042", ja:"ミヤベイワナ", fam:"サケ科", ord:47},
+  {id:"FW043", ja:"ニジマス", fam:"サケ科", ord:48},
+  {id:"FW044", ja:"サケ", fam:"サケ科", ord:49},
+  {id:"FW045", ja:"ベニザケ", fam:"サケ科", ord:50},
+  {id:"FW046", ja:"ヒメマス", fam:"サケ科", ord:51},
+  {id:"FW047", ja:"カラフトマス", fam:"サケ科", ord:52},
+  {id:"FW048", ja:"マスノスケ", fam:"サケ科", ord:53},
+  {id:"FW049", ja:"ギンザケ", fam:"サケ科", ord:54},
+  {id:"FW050", ja:"サクラマス（ヤマメ）", fam:"サケ科", ord:55},
+  {id:"FW051", ja:"サツキマス（アマゴ）", fam:"サケ科", ord:56},
+  {id:"FW052", ja:"イトヨ", fam:"トゲウオ科", ord:57},
+  {id:"FW053", ja:"陸封型イトヨ", fam:"トゲウオ科", ord:58},
+  {id:"FW054", ja:"ニホンイトヨ", fam:"トゲウオ科", ord:59},
+  {id:"FW095", ja:"イトヨ属", fam:"トゲウオ科", ord:60},
+  {id:"FW055", ja:"エゾトミヨ", fam:"トゲウオ科", ord:61},
+  {id:"FW056", ja:"トミヨ", fam:"トゲウオ科", ord:62},
+  {id:"FW057", ja:"トミヨ属汽水型", fam:"トゲウオ科", ord:63},
+  {id:"FW098", ja:"トミヨ属", fam:"トゲウオ科", ord:64},
+  {id:"FW058", ja:"ボラ", fam:"ボラ科", ord:65},
+  {id:"FW059", ja:"メナダ", fam:"ボラ科", ord:66},
+  {id:"FW060", ja:"グッピー", fam:"カダヤシ科", ord:67},
+  {id:"FW061", ja:"コクチモーリー", fam:"カダヤシ科", ord:68},
+  {id:"FW062", ja:"ミナミメダカ", fam:"メダカ科", ord:69},
+  {id:"FW063", ja:"ブルーギル", fam:"サンフィッシュ科", ord:70},
+  {id:"FW064", ja:"オオクチバス", fam:"サンフィッシュ科", ord:71},
+  {id:"FW065", ja:"コクチバス", fam:"サンフィッシュ科", ord:72},
+  {id:"FW066", ja:"カワスズメ", fam:"カワスズメ科", ord:73},
+  {id:"FW067", ja:"ナイルティラピア", fam:"カワスズメ科", ord:74},
+  {id:"FW068", ja:"カジカ中卵型", fam:"カジカ科", ord:75},
+  {id:"FW069", ja:"カンキョウカジカ", fam:"カジカ科", ord:76},
+  {id:"FW070", ja:"ハナカジカ", fam:"カジカ科", ord:77},
+  {id:"FW071", ja:"エゾハナカジカ", fam:"カジカ科", ord:78},
+  {id:"FW105", ja:"カジカ属", fam:"カジカ科", ord:79},
+  {id:"FW072", ja:"ミミズハゼ", fam:"ハゼ科", ord:80},
+  {id:"FW073", ja:"シロウオ", fam:"ハゼ科", ord:81},
+  {id:"FW074", ja:"マハゼ", fam:"ハゼ科", ord:82},
+  {id:"FW075", ja:"アシシロハゼ", fam:"ハゼ科", ord:83},
+  {id:"FW076", ja:"アカオビシマハゼ", fam:"ハゼ科", ord:84},
+  {id:"FW077", ja:"シモフリシマハゼ", fam:"ハゼ科", ord:85},
+  {id:"FW078", ja:"ヌマチチブ", fam:"ハゼ科", ord:86},
+  {id:"FW079", ja:"ルリヨシノボリ", fam:"ハゼ科", ord:87},
+  {id:"FW101", ja:"トウヨシノボリ種群", fam:"ハゼ科", ord:88},
+  {id:"FW099", ja:"ヨシノボリ属", fam:"ハゼ科", ord:89},
+  {id:"FW080", ja:"スミウキゴリ", fam:"ハゼ科", ord:90},
+  {id:"FW081", ja:"ウキゴリ", fam:"ハゼ科", ord:91},
+  {id:"FW082", ja:"シマウキゴリ", fam:"ハゼ科", ord:92},
+  {id:"FW083", ja:"ビリンゴ", fam:"ハゼ科", ord:93},
+  {id:"FW084", ja:"ジュズカケハゼ", fam:"ハゼ科", ord:94},
+  {id:"FW085", ja:"カムルチー", fam:"タイワンドジョウ科", ord:95},
+  {id:"FW086", ja:"ヌマガレイ", fam:"カレイ科", ord:96},
+  {id:"FW087", ja:"イシガレイ", fam:"カレイ科", ord:97},
+  {id:"FW108", ja:"スジエビ", fam:"テナガエビ科", ord:98},
+  {id:"FW109", ja:"テナガエビ", fam:"テナガエビ科", ord:99},
+  {id:"FW110", ja:"ヌマエビ", fam:"ヌマエビ科", ord:100},
+  {id:"FW111", ja:"モクズガニ", fam:"モクズガニ科", ord:101},
+];
+const SPECIES_ALIAS = {
+  "アカハラ": "FW021",
+  "アキアジ": "FW044",
+  "イトヨ(淡水型)": "FW053",
+  "イトヨ(遡河型)": "FW052",
+  "イトヨ（淡水型）": "FW053",
+  "イトヨ（遡河型）": "FW052",
+  "ウツセミカジカ": "FW069",
+  "エゾイワナ": "FW040",
+  "カジカ": "FW105",
+  "キングサーモン": "FW048",
+  "サクラマス": "FW050",
+  "スナヤツメ": "FW103",
+  "スナヤツメ北方種": "FW003",
+  "セッパリマス": "FW047",
+  "チチブ": "FW078",
+  "トミヨ属淡水型": "FW098",
+  "ブラックバス": "FW064",
+  "ヘラブナ": "FW008",
+  "マルタウグイ": "FW019",
+  "ヤマメ": "FW050",
+  "ヨシノボリ": "FW101",
+  "ライギョ": "FW085",
+};
+const SPECIES_STAMP = {n:101, sha:"d7be0336f474"};
+/* <<<FS_SPECIES_AUTO_END>>> */
+
+function speciesById(id){ return SPECIES.find(s=>s.id===id) || null; }
+/* 検索。正式な和名・科名に加えて、旧名や現場の呼び名（別名）でも見つかるようにする。
+   別名で見つけても、保存されるのは常に種ID */
+function speciesSearch(q){
+  q = String(q||'').trim();
+  if(!q) return SPECIES;
+  const hitIds = new Set();
+  Object.keys(SPECIES_ALIAS).forEach(name=>{ if(name.indexOf(q)>=0) hitIds.add(SPECIES_ALIAS[name]); });
+  return SPECIES.filter(s=> s.ja.indexOf(q)>=0 || (s.fam||'').indexOf(q)>=0 || hitIds.has(s.id));
+}
+function speciesAliasOf(id){
+  return Object.keys(SPECIES_ALIAS).filter(n=>SPECIES_ALIAS[n]===id);
+}
+
+/* ============================================================
+   選択肢（1か所にまとめる。値は魚類データベース側の言葉に合わせる）
+   ============================================================ */
+const OPT = {
+  season:      ['春','夏','秋','冬'],
+  weather:     ['晴れ','曇り','雨','雪','霧','その他'],
+  // 河川形態A（セグメント）。既存データの表記に合わせる
+  formA:       ['Aa型','Aa-Bb型','Bb型','Bb-Bc型','Bc型','Ab型','その他'],
+  // 環境区分（瀬淵）。QFieldテンプレートの kasenkeitai ＋ 現場で使う2語
+  habitat:     ['早瀬','平瀬','淵','瀬頭','トロ','たまり','その他'],
+  surveyType:  ['採取','目視'],
+  // 調査方法。QFieldテンプレートの catch_method
+  method:      ['投網','電気ショッカー','タモ網','手掴り','サデ網','カゴ網'],
+  // 河床材料。QFieldテンプレートの kashouzai（粒径区分）
+  substrate:   ['砂泥','小礫','中礫','大礫','巨礫','岩盤','コンクリート'],
+  gravel:      ['浮き石','はまり石','沈み石'],
+  confidence:  ['確実','推定','要確認'],
+};
+const SUBSTRATE_NOTE = {
+  '砂泥':'2mm未満','小礫':'2〜16mm','中礫':'16〜64mm','大礫':'64〜250mm',
+  '巨礫':'250mm以上','岩盤':'','コンクリート':'',
+};
+function seasonOf(dateStr){
+  const m = parseInt(String(dateStr||'').slice(5,7),10);
+  if(!m) return '';
+  return m<=2||m===12 ? '冬' : m<=5 ? '春' : m<=8 ? '夏' : '秋';
+}
+
+/* ============================================================
+   数えかた（ここ1本だけが尾数を決める）
+   まとめて30尾  = 個体0件 ＋ 未計測30
+   10尾測った    = 個体10件 ＋ 未計測は空欄
+   10尾測って残り20尾は数えただけ = 個体10件 ＋ 未計測20
+   ============================================================ */
+function catchTotal(c){
+  if(!c) return 0;
+  const measured = DB.individualsOf(c.uuid).length;
+  const un = numOf(c.count_unmeasured);
+  return measured + (un==='' ? 0 : un);
+}
+function catchLengths(c){
+  return nums(DB.individualsOf(c.uuid).map(i=>i.total_length_cm));
+}
+function stationTotal(st){ return DB.catchesOf(st.uuid).reduce((a,c)=>a+catchTotal(c), 0); }
+function surveyTotal(sv){ return DB.catchesOfSurvey(sv.uuid).reduce((a,c)=>a+catchTotal(c), 0); }
+
+/* ============================================================
+   下書き（画面を離れても書きかけを失わない）
+   「開いただけ」で入る自動の値は下書きに数えない。
+   数えてしまうと、開いて戻っただけで書きかけが残り続ける
+   ============================================================ */
+function draftAll(){ try{ return JSON.parse(localStorage.getItem('fs_draft_edit')||'{}')||{}; }
+  catch(e){ return {}; } }
+function draftSave(key, obj){
+  const a=draftAll();
+  if(obj===null) delete a[key]; else a[key]=obj;
+  try{ localStorage.setItem('fs_draft_edit', JSON.stringify(a)); }catch(e){}
+}
+function draftGet(key){ return draftAll()[key] || null; }
+function draftClear(key){ draftSave(key, null); }
+/* ユーザーが自分で入れたものが1つでもあるか。自動で入る値（種・位置・番号）は数えない */
+function draftUserContent(d, fields){
+  if(!d) return false;
+  return (fields||[]).some(f=>{
+    const v=d[f];
+    if(v===null || v===undefined) return false;
+    if(Array.isArray(v)) return v.length>0;
+    return String(v).trim() !== '';
+  });
+}
+
+/* ============================================================
+   画面のしくみ
+   ============================================================ */
+let STACK = [{name:'home', arg:null}];
+/* 画面を描くたびに増える番号。GPSや写真のような時間のかかる処理は
+   始めた時の番号を覚えておき、終わった時に変わっていたら何もしない。
+   そうしないと、待っている間に別の記録を開いたとき、そちらに書き込んでしまう */
+let SCREEN_SEQ = 0;
+function screenGen(){ return SCREEN_SEQ; }
+function screenStale(gen){ return gen !== SCREEN_SEQ; }
+const SCREENS = {};
+
+function nav(name, arg){ STACK.push({name,arg}); render(); }
+function goBack(){ if(STACK.length>1){ STACK.pop(); render(); } }
+function reset(name,arg){ STACK=[{name:name||'home',arg:arg||null}]; render(); }
+
+function render(){
+  SCREEN_SEQ++;
+  destroyMaps();
+  const cur = STACK[STACK.length-1];
+  const scr = SCREENS[cur.name] || SCREENS.home;
+  let v;
+  try{ v = scr(cur.arg); }
+  catch(e){ console.error(e); toast('画面を開けませんでした'); v = SCREENS.home(); }
+  if(!v){ STACK=[{name:'home',arg:null}]; v = SCREENS.home(); }
+  $('#title').textContent = v.title || '魚類調査記録';
+  $('#backBtn').style.display = STACK.length>1 ? '' : 'none';
+  const pills = (v.sub||[]).slice();
+  if(window.READ_ONLY) pills.unshift({text:'閲覧のみ', cls:'ng'});
+  else if(!window.WRITE_OK) pills.unshift({text:'確認中', cls:'warn'});
+  $('#sub').innerHTML = pills.map(s=>
+    `<span class="pill ${s.cls||''}">${esc(s.text)}</span>`).join('');
+  $('#main').innerHTML = (window.READ_ONLY
+      ? `<div class="ngbox">${esc(LOCK_WHY)}</div>` : '') + (v.html || '');
+  window.scrollTo(0,0);
+  if(v.onMount) try{ v.onMount(); }catch(e){ console.error(e); }
+}
+
+/* ---------- 選ぶボタン ---------- */
+function pickSeg(btn){
+  btn.parentElement.querySelectorAll('button').forEach(b=>b.classList.remove('on'));
+  btn.classList.add('on');
+}
+function segHtml(field, options, current, allowEmpty){
+  const opts = allowEmpty ? ['なし'].concat(options) : options;
+  const cur = current || (allowEmpty?'なし':'');
+  return `<div class="seg" data-seg="${esc(field)}">` + opts.map(o=>
+    `<button type="button" class="${o===cur?'on':''}" onclick="pickSeg(this)">${esc(o)}</button>`
+  ).join('') + `</div>`;
+}
+function segVal(field){
+  const on = document.querySelector(`[data-seg="${field}"] button.on`);
+  if(!on) return '';
+  return on.textContent==='なし' ? '' : on.textContent;
+}
+function pickSegMulti(btn){ btn.classList.toggle('on'); }
+function segMultiHtml(field, options, current){
+  const cur = current||[];
+  return `<div class="seg" data-segmulti="${esc(field)}">` + options.map(o=>
+    `<button type="button" class="${cur.indexOf(o)>=0?'on':''}" onclick="pickSegMulti(this)">${esc(o)}</button>`
+  ).join('') + `</div>`;
+}
+function segMultiVal(field){
+  return $$(`[data-segmulti="${field}"] button.on`).map(b=>b.textContent);
+}
+
+/* ============================================================
+   位置（GPS）
+   ============================================================ */
+const GPS_MAX_ACC = 50;     // これより粗い位置は軌跡に使わない（m）
+let lastFix = null;         // {lat, lon, acc, t}
+let gpsWatchId = null;
+
+function startGps(){
+  if(gpsWatchId!=null || !navigator.geolocation) return;
+  gpsWatchId = navigator.geolocation.watchPosition(p=>{
+    lastFix = {lat:p.coords.latitude, lon:p.coords.longitude,
+               acc:p.coords.accuracy, t:Date.now()};
+  }, ()=>{}, {enableHighAccuracy:true, maximumAge:5000, timeout:20000});
+}
+function stopGps(){ if(gpsWatchId!=null){ navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId=null; } }
+/* 古い測位を使わない。前の地点の座標が付くのを防ぐ */
+function freshFix(maxAgeMs){
+  if(!lastFix) return null;
+  return (Date.now()-lastFix.t) <= (maxAgeMs||30000) ? lastFix : null;
+}
+function validPt(p){ return Array.isArray(p) && p.length===2 && isFinite(p[0]) && isFinite(p[1])
+  && Math.abs(p[0])<=90 && Math.abs(p[1])<=180; }
+function distMeters(a,b){
+  const R=6378137, rad=Math.PI/180;
+  const y=(b[0]-a[0])*rad;
+  const x=(b[1]-a[1])*rad*Math.cos((a[0]+b[0])/2*rad);
+  return Math.sqrt(x*x+y*y)*R;
+}
+function pathLength(path){
+  const p=(path||[]).filter(validPt); let d=0;
+  for(let i=1;i<p.length;i++) d+=distMeters(p[i-1],p[i]);
+  return d;
+}
+/* 位置を1回だけ取る。決め方（GPS/地図/手入力）は呼び出し側が書く。
+   ここで position_source を書き換えない（上書きすると、地図で置いた位置がGPS扱いになる） */
+function getFixOnce(cb){
+  if(!navigator.geolocation){ cb(null); return; }
+  const g = screenGen();
+  navigator.geolocation.getCurrentPosition(p=>{
+    if(screenStale(g)) return;
+    cb({lat:p.coords.latitude, lon:p.coords.longitude, acc:p.coords.accuracy});
+  }, ()=>{ if(!screenStale(g)) cb(null); },
+     {enableHighAccuracy:true, maximumAge:3000, timeout:15000});
+}
+
+let OPOLYLAYER=null;   // 囲った範囲の線（destroyMaps が片付ける）
+/* ============================================================
+   地図
+   画像ファイルを使わない作りにする（文字ボタン＋divIcon）。
+   leaflet.css は images/*.png を参照するので、同梱しないと「？」に化ける
+   ============================================================ */
+const BASEMAPS = {
+  '航空写真': {url:'https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg',
+               max:18, attr:'国土地理院'},
+  '地形図':   {url:'https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png',
+               max:18, attr:'国土地理院'},
+  '淡色地図': {url:'https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png',
+               max:18, attr:'国土地理院'},
+};
+function baseMapName(){ const v=prefs().basemap; return BASEMAPS[v] ? v : '航空写真'; }
+/* 地図はここ1か所で持つ。let で宣言した変数を window['名前'] で触ると
+   別のものになり、画面を離れても地図が残る（同じ場所に2つ目を作れず壊れる） */
+const MAPS = { main:{map:null, layer:null}, off:{map:null, layer:null} };
+function destroyMaps(){
+  Object.keys(MAPS).forEach(k=>{
+    const s = MAPS[k];
+    if(s.map){ try{ s.map.remove(); }catch(e){} }
+    s.map=null; s.layer=null;
+  });
+  OPOLYLAYER=null;
+}
+function makeMap(elId, center, zoom){
+  const el = document.getElementById(elId);
+  if(!el || !window.L) return null;
+  const m = L.map(el, {zoomControl:true, attributionControl:true})
+             .setView(center||[43.06,141.35], zoom||14);
+  return m;
+}
+function applyBaseMap(slot, name){
+  const s = MAPS[slot];
+  if(!s || !s.map) return;
+  const b = BASEMAPS[name] || BASEMAPS['航空写真'];
+  if(s.layer){ try{ s.map.removeLayer(s.layer); }catch(e){} }
+  s.layer = L.tileLayer(b.url, {maxZoom:b.max, maxNativeZoom:b.max, attribution:b.attr})
+    .addTo(s.map);
+}
+function baseMapButtonsHtml(){
+  const cur = baseMapName();
+  return `<div class="seg basemap" style="margin-bottom:8px">` + Object.keys(BASEMAPS).map(n=>
+    `<button type="button" class="${n===cur?'on':''}" onclick="switchBaseMap(this,'${esc(n)}')">${esc(n)}</button>`
+  ).join('') + `</div>`;
+}
+function switchBaseMap(btn, name){
+  if(!BASEMAPS[name]) return;
+  pickSeg(btn); prefSet('basemap', name);
+  applyBaseMap('main', name);
+  applyBaseMap('off', name);
+}
+/* 丸い印。画像を使わない */
+function dotIcon(color, size){
+  const s = size||14;
+  return L.divIcon({className:'', iconSize:[s,s], iconAnchor:[s/2,s/2],
+    html:`<div class="pinmark" style="width:${s}px;height:${s}px;background:${color}"></div>`});
+}
+/* 現在地ボタン。画像を使わない自前のコントロール */
+function addLocateControl(map){
+  const C = L.Control.extend({
+    options:{position:'topleft'},
+    onAdd(){
+      const d = L.DomUtil.create('div','leaflet-bar');
+      const a = L.DomUtil.create('a','',d);
+      a.href='#'; a.title='現在地へ'; a.textContent='現';
+      a.style.cssText='font-weight:700;text-align:center';
+      L.DomEvent.on(a,'click',ev=>{
+        L.DomEvent.stop(ev);
+        getFixOnce(f=>{
+          if(!f){ toast('現在地を取れませんでした'); return; }
+          map.setView([f.lat,f.lon], Math.max(map.getZoom(),16));
+        });
+      });
+      return d;
+    }
+  });
+  map.addControl(new C());
+}
+
+/* ============================================================
+   オフライン地図（範囲を囲って先に落としておく）
+   ============================================================ */
+function lon2tx(lon,z){ return Math.floor((lon+180)/360*Math.pow(2,z)); }
+function lat2ty(lat,z){ const r=lat*Math.PI/180;
+  return Math.floor((1-Math.log(Math.tan(r)+1/Math.cos(r))/Math.PI)/2*Math.pow(2,z)); }
+function polyBounds(poly){
+  const lats=poly.map(p=>p[0]), lons=poly.map(p=>p[1]);
+  return {s:Math.min.apply(null,lats), n:Math.max.apply(null,lats),
+          w:Math.min.apply(null,lons), e:Math.max.apply(null,lons)};
+}
+function pointInPoly(lat, lon, poly){
+  let inside=false;
+  for(let i=0,j=poly.length-1;i<poly.length;j=i++){
+    const yi=poly[i][0], xi=poly[i][1], yj=poly[j][0], xj=poly[j][1];
+    if(((yi>lat)!==(yj>lat)) && (lon < (xj-xi)*(lat-yi)/(yj-yi)+xi)) inside=!inside;
+  }
+  return inside;
+}
+function tx2lon(x,z){ return x/Math.pow(2,z)*360-180; }
+function ty2lat(y,z){ const n=Math.PI-2*Math.PI*y/Math.pow(2,z);
+  return 180/Math.PI*Math.atan(0.5*(Math.exp(n)-Math.exp(-n))); }
+/* タイルが範囲にかかるか。四隅と中心のどれかが入っていれば拾う */
+function tileHitsPoly(x,y,z,poly){
+  const w=tx2lon(x,z), e=tx2lon(x+1,z), n=ty2lat(y,z), s=ty2lat(y+1,z);
+  const pts=[[n,w],[n,e],[s,w],[s,e],[(n+s)/2,(w+e)/2]];
+  return pts.some(p=>pointInPoly(p[0],p[1],poly));
+}
+function packTiles(poly, zmax){
+  const out=[];
+  for(let z=10; z<=zmax; z++){
+    const b=polyBounds(poly);
+    const x0=lon2tx(b.w,z), x1=lon2tx(b.e,z);
+    const y0=lat2ty(b.n,z), y1=lat2ty(b.s,z);
+    for(let x=x0;x<=x1;x++) for(let y=y0;y<=y1;y++){
+      if(tileHitsPoly(x,y,z,poly)) out.push([x,y,z]);
+    }
+  }
+  return out;
+}
+function packTileUrls(poly, zmax, layers){
+  const tiles = packTiles(poly, zmax);
+  const urls=[];
+  (layers||[]).forEach(name=>{
+    const b=BASEMAPS[name]; if(!b) return;
+    tiles.forEach(([x,y,z])=>{
+      if(z>b.max) return;
+      urls.push(b.url.replace('{z}',z).replace('{x}',x).replace('{y}',y));
+    });
+  });
+  return urls;
+}
+function packEstimate(poly, zmax, layers){
+  const n = packTileUrls(poly, zmax, layers).length;
+  return {tiles:n, mb: Math.round(n*0.02*10)/10};   // 1枚 約20KB で見積もる
+}
+function packStore(){ try{ return JSON.parse(localStorage.getItem('fs_map_packs')||'[]'); }
+  catch(e){ return []; } }
+function packSaveList(a){ try{ localStorage.setItem('fs_map_packs', JSON.stringify(a)); }catch(e){} }
+/* サービスワーカーに頼む（返事を待つ） */
+function swAsk(msg, timeoutMs){
+  return new Promise((res,rej)=>{
+    const sw = navigator.serviceWorker && navigator.serviceWorker.controller;
+    if(!sw){ rej(new Error('オフライン用の仕組みが動いていません')); return; }
+    const ch = new MessageChannel();
+    const t = setTimeout(()=>rej(new Error('返事がありません')), timeoutMs||120000);
+    ch.port1.onmessage = e=>{ clearTimeout(t); res(e.data); };
+    sw.postMessage(msg, [ch.port2]);
+  });
+}
+
+/* ============================================================
+   書き出し
+   列の決め方は1か所にまとめる。CSVも他の書き出しも同じものを見る
+   ============================================================ */
+/* 魚類データベース「資料管理 → 調査記録 → CSV/Excelから一括インポート」の
+   テンプレートと1文字も違わないこと。csvdb テストが照合する */
+const FS_DB_COLS = ['緯度','経度','調査日','季節','天気','水温','水深','流速',
+  '河川名','地点名','区間名','河川形態A','河川形態B','河床材料','礫の状況','環境区分',
+  '調査区分','調査方法','種ID','個体数','最大体長','最小体長','同定確度',
+  'コピー数','在不在','流量','開始時刻','終了時刻','備考','業務番号','業務名'];
+
+function download(filename, text, mime){
+  downloadBlob(filename, new Blob([text], {type: mime||'text/plain;charset=utf-8'}));
+}
+function downloadBlob(filename, blob){
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download=filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(()=>URL.revokeObjectURL(url), 3000);
+}
+function csvCell(v){
+  v = v==null ? '' : String(v);
+  // Excelの数式として読まれるのを防ぐ。数値（マイナスの緯度経度など）はそのまま通す
+  if(/^[=+\-@\t\r]/.test(v) && !/^[+-]?\d+(\.\d+)?$/.test(v)) v = "'"+v;
+  return /[",\n]/.test(v) ? '"'+v.replace(/"/g,'""')+'"' : v;
+}
+function toCsv(cols, rows){
+  return [cols.join(',')].concat(rows.map(r=>cols.map(c=>csvCell(r[c])).join(','))).join('\r\n');
+}
+/* 緯度経度は全部の行で同じ文字列にする。
+   桁がばらつくと、取り込み側が別々の調査として分けてしまう */
+function fixCoord(v){ const n=numOf(v); return n==='' ? '' : n.toFixed(6); }
+/* 内部は cm・cm/s で持ち、書き出す瞬間に m・m/s に直す */
+function cmToM(v){ const n=numOf(v); return n==='' ? '' : (n/100); }
+
+/* 取り込み側が「同じ箇所」とみなす手がかり。
+   この12項目の文字が全部同じだと、別々の箇所が1つにまとめられてしまう。
+   魚類データベース app/pages/4_資料管理.py の _HABITAT_KEY と同じ並び */
+const FS_HABITAT_KEY = ['環境区分','河川形態B','水温','水深','流速','流量',
+  '河床材料','礫の状況','調査区分','調査方法','開始時刻','終了時刻'];
+
+/* データベース取り込み用の行を組み立てる。
+   1行 = 1種の結果。落とすものは黙って落とさず、理由と件数を返す */
+function buildDbRows(sv){
+  const rows=[], excluded=[], blocked=[], warnings=[];
+  const stations = DB.stationsOf(sv.uuid);
+  const lat = fixCoord(sv.latitude), lon = fixCoord(sv.longitude);
+  if(lat==='' || lon===''){
+    blocked.push('調査の位置（緯度経度）が入っていません');
+  }
+  stations.forEach(st=>{
+    // 開始・終了時刻が空だと、取り込み側が別々の箇所を1つにまとめてしまう
+    if(!st.survey_time_start){
+      blocked.push(`${st.name||'箇所'}：開始時刻が入っていません`);
+    }
+    DB.catchesOf(st.uuid).forEach(c=>{
+      const n = catchTotal(c);
+      const name = c.species_name || '(種名なし)';
+      if(!c.species_id){ excluded.push(`${name}（種IDがありません）`); return; }
+      if(n<=0){ excluded.push(`${name}（尾数が0です）`); return; }
+      rows.push(dbRowOf(sv, st, c));
+    });
+  });
+  // 別々の箇所が1つにまとめられてしまう組み合わせを探す。
+  // 実際に書き出す文字で見る（画面の値ではなく、CSVに載る形で比べる）
+  const seen = {};
+  stations.forEach(st=>{
+    const src = dbRowOf(sv, st, null);
+    const k = FS_HABITAT_KEY.map(c=>String(src[c]==null?'':src[c])).join('');
+    if(seen[k]) warnings.push(`${seen[k]} と ${st.name} は、取り込み側で1つの箇所にまとめられます`);
+    else seen[k] = st.name;
+  });
+
+  return {rows, excluded, blocked, warnings};
+}
+/* CSVの1行を組み立てる。c が null なら魚の欄は空のまま（箇所の鍵を調べるときに使う） */
+function dbRowOf(sv, st, c){
+  const ls = c ? catchLengths(c) : [];
+  return {
+    '緯度': fixCoord(sv.latitude), '経度': fixCoord(sv.longitude),
+    '調査日':sv.survey_date||'', '季節':sv.season||'', '天気':sv.weather||'',
+    '水温': numOf(st.water_temp),
+    '水深': cmToM(st.depth_rep_cm),
+    '流速': cmToM(st.velocity_rep_cms),
+    '河川名':sv.river_name||'', '地点名':sv.site_name||'', '区間名':sv.section_name||'',
+    '河川形態A':sv.river_morphology_a||'', '河川形態B':st.river_morphology_b||'',
+    '河床材料':st.substrate1||'', '礫の状況':st.gravel_condition||'',
+    '環境区分':st.habitat_type||'',
+    '調査区分':st.survey_type||'', '調査方法':(st.survey_method||[]).join(','),
+    '種ID': c ? (c.species_id||'') : '', '個体数': c ? catchTotal(c) : '',
+    '最大体長': ls.length ? Math.max.apply(null,ls) : '',
+    '最小体長': ls.length ? Math.min.apply(null,ls) : '',
+    '同定確度': c ? (c.identification_confidence||'') : '',
+    'コピー数':'', '在不在':'',
+    '流量': numOf(st.flow_rate),
+    '開始時刻':st.survey_time_start||'', '終了時刻':st.survey_time_end||'',
+    '備考': c ? (c.notes||'') : '',
+    '業務番号':sv.project_number||'', '業務名':sv.project_name||'',
+  };
+}
+function exportFileBase(sv){
+  const d=(sv.survey_date||dateValue()).replace(/-/g,'');
+  const r=(sv.river_name||'調査').replace(/[\\/:*?"<>|\s]/g,'');
+  return `魚類調査_${d}_${r}_${(sv.uuid||'').slice(0,8)}`;
+}
+/* 書き出しでデータベースに渡らない項目。書き出し画面に必ず出す */
+const NOT_IN_DB_CSV = ['通電秒数','調査面積','調査距離','左右岸のカバー',
+  '測点ごとの水深・流速','1尾ずつの体長','写真','GPSの精度','調査者'];
+
+/* ============================================================
+   画面
+   ============================================================ */
+
+/* ---------- ホーム ---------- */
+SCREENS.home = ()=>{
+  const list = DB.surveys();
+  const cards = list.map(s=>{
+    const nSt = DB.stationsOf(s.uuid).length;
+    const nSp = new Set(DB.catchesOfSurvey(s.uuid).map(c=>c.species_id||c.species_name)).size;
+    const cls = s.status==='調査中' ? 'ok' : (s.status==='終了' ? '' : 'warn');
+    return `<div class="card tap" onclick="nav('survey','${s.uuid}')">
+      <div class="row">
+        <div class="grow">
+          <div style="font-weight:700">${esc(s.river_name||'(河川名なし)')} ${esc(s.site_name||'')}</div>
+          <div class="dim small">${esc(fmtDate(s.survey_date))}　箇所${nSt}　${nSp}種　${surveyTotal(s)}尾</div>
+        </div>
+        <span class="pill ${cls}">${esc(s.status||'未開始')}</span>
+      </div></div>`;
+  }).join('');
+  return {
+    title:'魚類調査記録',
+    sub:[{text:`調査 ${list.length}件`}, {text:`魚種 ${SPECIES.length}`}],
+    html:`
+      <button class="btn pri" onclick="nav('surveyEdit',null)">新しい調査をはじめる</button>
+      ${list.length ? cards : '<div class="card dim">まだ調査がありません。上のボタンから作ってください。</div>'}
+      <div class="hr"></div>
+      <div class="dim small">版 ${esc(APP_VERSION)}　魚種リスト ${SPECIES_STAMP.n}種</div>
+    `};
+};
+
+/* ---------- 調査の作成・編集 ---------- */
+SCREENS.surveyEdit = (svUuid)=>{
+  const isNew = !svUuid;
+  const sv = isNew ? {} : (DB.get(DB.key.sv, svUuid) || {});
+  const p = prefs();
+  const today = dateValue();
+  const d = isNew ? (draftGet('newSurvey')||{}) : {};
+  const g = k => (d[k]!==undefined ? d[k] : (sv[k]!==undefined ? sv[k] : ''));
+  return {
+    title: isNew ? '新しい調査' : '調査の設定',
+    html:`
+      <div class="card">
+        <label>調査日</label>
+        <input id="f_date" type="date" value="${esc(g('survey_date')||today)}" onchange="onSurveyDate()">
+        <label>季節（調査日から自動で入ります）</label>
+        <div id="f_season_wrap">${segHtml('season', OPT.season, g('season')||seasonOf(g('survey_date')||today), true)}</div>
+        <label>天気</label>
+        ${segHtml('weather', OPT.weather, g('weather'), true)}
+        <label>河川名</label>
+        <input id="f_river" value="${esc(g('river_name'))}" placeholder="例）尻別川">
+        <label>地点名</label>
+        <input id="f_site" value="${esc(g('site_name'))}" placeholder="例）○○橋下流">
+        <label>区間名（調査全体で1つ。箇所ごとに変えない）</label>
+        <input id="f_section" value="${esc(g('section_name'))}">
+        <label>河川形態A（セグメント）</label>
+        ${segHtml('formA', OPT.formA, g('river_morphology_a'), true)}
+      </div>
+      <div class="card">
+        <h3>位置（この調査の代表点）</h3>
+        <div class="row">
+          <div class="grow"><label>緯度</label>
+            <input id="f_lat" inputmode="decimal" value="${esc(g('latitude'))}"></div>
+          <div class="grow"><label>経度</label>
+            <input id="f_lon" inputmode="decimal" value="${esc(g('longitude'))}"></div>
+        </div>
+        <div class="dim small" id="posInfo">${esc(sv.position_source ? '決め方：'+sv.position_source : '')}</div>
+        <button class="btn sm" onclick="grabPos()">現在地を入れる</button>
+        <div class="dim small">取り込み側は緯度経度で調査をひとまとめにします。桁がばらつくと別々の調査になるため、書き出すときに小数6桁へそろえます。</div>
+      </div>
+      <div class="card">
+        <h3>業務・調査者</h3>
+        <label>業務番号</label>
+        <input id="f_pno" value="${esc(g('project_number')||(isNew?(p.project_number||''):''))}">
+        <label>業務名</label>
+        <input id="f_pname" value="${esc(g('project_name')||(isNew?(p.project_name||''):''))}">
+        <label>調査者</label>
+        <input id="f_inv" value="${esc(g('investigator')||(isNew?(p.investigator||''):''))}">
+        <label>既定の調査区分</label>
+        ${segHtml('svtype', OPT.surveyType, g('survey_type_default')||'採取')}
+        <label>メモ</label>
+        <textarea id="f_memo">${esc(g('memo'))}</textarea>
+      </div>
+      <button class="btn pri" onclick="saveSurvey('${svUuid||''}')">${isNew?'この調査をつくる':'保存する'}</button>
+      ${isNew?'':`<button class="btn ng" onclick="deleteSurvey('${svUuid}')">この調査を削除する</button>`}
+    `,
+    onMount(){ startGps(); }
+  };
+};
+function onSurveyDate(){
+  const s = seasonOf(strVal('#f_date'));
+  const wrap = $('#f_season_wrap');
+  if(wrap && s) wrap.innerHTML = segHtml('season', OPT.season, s, true);
+}
+function grabPos(){
+  toast('現在地を取っています…');
+  getFixOnce(f=>{
+    if(!f){ toast('現在地を取れませんでした'); return; }
+    const la=$('#f_lat'), lo=$('#f_lon');
+    if(la) la.value = f.lat.toFixed(6);
+    if(lo) lo.value = f.lon.toFixed(6);
+    const el=$('#posInfo');
+    if(el) el.textContent = `決め方：GPS（精度およそ${Math.round(f.acc)}m）`;
+    window._posSource = 'GPS'; window._posAcc = f.acc;
+    toast('現在地を入れました');
+  });
+}
+function saveSurvey(svUuid){
+  const rec = svUuid ? (DB.get(DB.key.sv, svUuid)||{uuid:svUuid}) : {uuid:uuid(), status:'未開始'};
+  rec.survey_date        = strVal('#f_date');
+  rec.season             = segVal('season');
+  rec.weather            = segVal('weather');
+  rec.river_name         = strVal('#f_river');
+  rec.site_name          = strVal('#f_site');
+  rec.section_name       = strVal('#f_section');
+  rec.river_morphology_a = segVal('formA');
+  rec.latitude           = numVal('#f_lat');
+  rec.longitude          = numVal('#f_lon');
+  if(window._posSource){ rec.position_source = window._posSource; rec.gps_accuracy = window._posAcc; }
+  rec.project_number     = strVal('#f_pno');
+  rec.project_name       = strVal('#f_pname');
+  rec.investigator       = strVal('#f_inv');
+  rec.survey_type_default= segVal('svtype') || '採取';
+  rec.memo               = strVal('#f_memo');
+  if(!rec.river_name && !rec.site_name){ toast('河川名か地点名のどちらかは入れてください'); return; }
+  const ok = DB.upsert(DB.key.sv, rec);
+  if(!ok) return;                       // 保存できていないので画面も動かさない
+  window._posSource=null; window._posAcc=null;
+  prefSet('project_number', rec.project_number);
+  prefSet('project_name', rec.project_name);
+  prefSet('investigator', rec.investigator);
+  draftClear('newSurvey');
+  toast('保存しました');
+  if(svUuid) goBack(); else reset('survey', rec.uuid);
+}
+function deleteSurvey(u){
+  if(!confirm('この調査を削除します。よろしいですか？（ごみ箱に入ります）')) return;
+  if(DB.softDelete(DB.key.sv, u)){ toast('削除しました'); reset('home'); }
+}
+
+/* ---------- 調査ハブ ---------- */
+SCREENS.survey = (svUuid)=>{
+  const sv = DB.get(DB.key.sv, svUuid);
+  if(!sv) return null;
+  const stations = DB.stationsOf(svUuid);
+  const running  = stations.find(s=>!s.ended_at);
+  const nSp = new Set(DB.catchesOfSurvey(svUuid).map(c=>c.species_id).filter(Boolean)).size;
+  const stCards = stations.map(st=>{
+    const n = stationTotal(st);
+    const sp = DB.catchesOf(st.uuid).length;
+    return `<div class="card tap" onclick="nav('station','${st.uuid}')">
+      <div class="row">
+        <div class="grow">
+          <div style="font-weight:700">${esc(st.name)}　<span class="dim small">${esc(st.habitat_type||'区分なし')}</span></div>
+          <div class="dim small">${esc(st.survey_time_start||'--:--')}〜${esc(st.survey_time_end||'')}　${sp}種 ${n}尾</div>
+        </div>
+        ${st.ended_at?'':'<span class="pill ok">記録中</span>'}
+      </div></div>`;
+  }).join('');
+  return {
+    title: `${sv.river_name||''} ${sv.site_name||''}`.trim() || '調査',
+    sub:[{text:fmtDate(sv.survey_date)}, {text:sv.status||'未開始', cls: sv.status==='調査中'?'ok':''},
+         {text:`${nSp}種 ${surveyTotal(sv)}尾`}],
+    html:`
+      ${sv.status==='未開始'
+        ? `<button class="btn pri" onclick="startSurvey('${svUuid}')">調査をはじめる</button>`
+        : (running
+           ? `<button class="btn pri" onclick="nav('station','${running.uuid}')">記録中の ${esc(running.name)} を開く</button>`
+           : `<button class="btn pri" onclick="newStation('${svUuid}')">箇所をはじめる</button>`)}
+      ${sv.status==='調査中' && !running
+        ? `<button class="btn" onclick="endSurvey('${svUuid}')">調査を終える</button>` : ''}
+      ${sv.status==='終了'
+        ? `<button class="btn" onclick="reopenSurvey('${svUuid}')">調査を再開する</button>` : ''}
+
+      <h3>箇所（瀬淵ごと）</h3>
+      ${stations.length ? stCards : '<div class="card dim">まだ箇所がありません。</div>'}
+
+      <div class="hr"></div>
+      <button class="btn" onclick="nav('map','${svUuid}')">地図で見る</button>
+      <button class="btn" onclick="nav('exportHub','${svUuid}')">書き出す</button>
+      <button class="btn" onclick="nav('surveyEdit','${svUuid}')">調査の設定</button>
+    `,
+    onMount(){ startGps(); }
+  };
+};
+function startSurvey(u){
+  const sv = DB.get(DB.key.sv, u); if(!sv) return;
+  sv.status='調査中'; sv.started_at = sv.started_at || nowISO();
+  if(DB.upsert(DB.key.sv, sv)){ startGps(); render(); }
+}
+function endSurvey(u){
+  const sv = DB.get(DB.key.sv, u); if(!sv) return;
+  sv.status='終了'; sv.finished_at = nowISO();
+  if(DB.upsert(DB.key.sv, sv)){ stopGps(); toast('調査を終えました'); render(); }
+}
+function reopenSurvey(u){
+  const sv = DB.get(DB.key.sv, u); if(!sv) return;
+  sv.status='調査中'; delete sv.finished_at;
+  if(DB.upsert(DB.key.sv, sv)){ render(); }
+}
+function newStation(svUuid){
+  const sv = DB.get(DB.key.sv, svUuid); if(!sv) return;
+  if(sv.status!=='調査中'){ toast('先に「調査をはじめる」を押してください'); return; }
+  nav('stationEdit', {survey:svUuid});
+}
+
+/* ---------- 箇所の作成・編集 ---------- */
+SCREENS.stationEdit = (arg)=>{
+  arg = arg||{};
+  const isNew = !arg.uuid;
+  const st = isNew ? {} : (DB.get(DB.key.st, arg.uuid) || {});
+  const svUuid = isNew ? arg.survey : st.survey_uuid;
+  const sv = DB.get(DB.key.sv, svUuid);
+  if(!sv) return null;
+  const no = isNew ? (DB.stationsOf(svUuid).length + 1) : st.station_no;
+  const g = k => (st[k]!==undefined && st[k]!=='' ? st[k] : '');
+  return {
+    title: isNew ? `箇所 St.${no}` : `${st.name} の設定`,
+    sub:[{text:sv.river_name||''}],
+    html:`
+      <div class="card">
+        <label>名前</label>
+        <input id="s_name" value="${esc(st.name || ('St.'+no))}">
+        <label>環境区分（瀬淵）</label>
+        ${segHtml('habitat', OPT.habitat, g('habitat_type'), true)}
+        <label>調査区分</label>
+        ${segHtml('svtype2', OPT.surveyType, g('survey_type') || sv.survey_type_default || '採取')}
+        <label>調査方法（いくつでも選べます）</label>
+        ${segMultiHtml('method', OPT.method, st.survey_method||[])}
+        <label>水温（℃）</label>
+        <input id="s_wt" inputmode="decimal" value="${esc(g('water_temp'))}">
+      </div>
+      <div class="card">
+        <h3>川底と流れ（分かる範囲で）</h3>
+        <label>河床材料（いちばん多いもの）</label>
+        ${segHtml('sub1', OPT.substrate, g('substrate1'), true)}
+        <div class="dim small">${OPT.substrate.map(s=>SUBSTRATE_NOTE[s]?`${s}=${SUBSTRATE_NOTE[s]}`:'').filter(Boolean).join('　')}</div>
+        <label>礫の状況</label>
+        ${segHtml('gravel', OPT.gravel, g('gravel_condition'), true)}
+        <label>代表の水深（cm）</label>
+        <input id="s_depth" inputmode="decimal" value="${esc(g('depth_rep_cm'))}">
+        <label>代表の流速（cm/s）</label>
+        <input id="s_vel" inputmode="decimal" value="${esc(g('velocity_rep_cms'))}">
+        <div class="dim small">書き出すときに m・m/s に直します。0 は「測って0だった」として残します。</div>
+        <label>メモ</label>
+        <textarea id="s_memo">${esc(g('memo'))}</textarea>
+      </div>
+      <button class="btn pri" onclick="saveStation('${svUuid}','${arg.uuid||''}')">
+        ${isNew?'この箇所をはじめる':'保存する'}</button>
+      ${isNew?'':`<button class="btn ng" onclick="deleteStation('${arg.uuid}')">この箇所を削除する</button>`}
+    `};
+};
+function saveStation(svUuid, stUuid){
+  const isNew = !stUuid;
+  const rec = isNew
+    ? {uuid:uuid(), survey_uuid:svUuid, station_no: DB.stationsOf(svUuid).length+1,
+       started_at:nowISO(), survey_time_start:timeValue(), env_points:[]}
+    : (DB.get(DB.key.st, stUuid)||{uuid:stUuid, survey_uuid:svUuid});
+  rec.name              = strVal('#s_name') || ('St.'+(rec.station_no||1));
+  rec.habitat_type      = segVal('habitat');
+  rec.survey_type       = segVal('svtype2') || '採取';
+  rec.survey_method     = segMultiVal('method');
+  rec.water_temp        = numVal('#s_wt');
+  rec.substrate1        = segVal('sub1');
+  rec.gravel_condition  = segVal('gravel');
+  rec.depth_rep_cm      = numVal('#s_depth');
+  rec.velocity_rep_cms  = numVal('#s_vel');
+  rec.memo              = strVal('#s_memo');
+  const ok = DB.upsert(DB.key.st, rec);
+  if(!ok) return;
+  toast(isNew?'箇所をはじめました':'保存しました');
+  if(isNew) reset('station', rec.uuid); else goBack();
+}
+function deleteStation(u){
+  const n = DB.catchesOf(u).length;
+  if(!confirm(`この箇所を削除します。${n>0?`記録${n}件も一緒に消えます。`:''}よろしいですか？`)) return;
+  if(!DB.softDelete(DB.key.st, u)) return;
+  DB.catchesOf(u).forEach(c=>DB.softDelete(DB.key.ca, c.uuid, u));
+  toast('削除しました'); goBack();
+}
+
+/* ---------- 箇所ハブ ---------- */
+SCREENS.station = (stUuid)=>{
+  const st = DB.get(DB.key.st, stUuid);
+  if(!st) return null;
+  const sv = DB.get(DB.key.sv, st.survey_uuid);
+  const cs = DB.catchesOf(stUuid);
+  const rows = cs.map(c=>`<tr onclick="nav('catchEdit',{uuid:'${c.uuid}'})" style="cursor:pointer">
+      <td>${esc(c.species_name||'(種名なし)')}${c.species_id?'':' <span class="pill ng">種IDなし</span>'}</td>
+      <td class="num">${catchTotal(c)}</td>
+      <td class="dim small">${esc(c.identification_confidence||'')}</td>
+    </tr>`).join('');
+  return {
+    title: st.name || '箇所',
+    sub:[{text:sv?sv.river_name||'':''}, {text:st.habitat_type||'区分なし'},
+         {text:`${cs.length}種 ${stationTotal(st)}尾`},
+         st.ended_at ? {text:'終了'} : {text:'記録中', cls:'ok'}],
+    html:`
+      ${st.ended_at ? '' : `<button class="btn pri" onclick="nav('speciesPick','${stUuid}')">魚を記録する</button>`}
+      <div class="card">
+        <div class="row">
+          <div class="grow"><div class="dim small">時刻</div>
+            <div>${esc(st.survey_time_start||'--:--')} 〜 ${esc(st.survey_time_end||'（記録中）')}</div></div>
+          <div class="grow"><div class="dim small">調査方法</div>
+            <div>${(st.survey_method||[]).map(m=>`<span class="chip">${esc(m)}</span>`).join('')||'<span class="dim">—</span>'}</div></div>
+        </div>
+        <div class="hr"></div>
+        <div class="row">
+          <div class="grow"><div class="dim small">水温</div><div>${fmtNum(numOf(st.water_temp))} ℃</div></div>
+          <div class="grow"><div class="dim small">水深</div><div>${fmtNum(numOf(st.depth_rep_cm))} cm</div></div>
+          <div class="grow"><div class="dim small">流速</div><div>${fmtNum(numOf(st.velocity_rep_cms))} cm/s</div></div>
+        </div>
+      </div>
+
+      <h3>この箇所で記録した魚</h3>
+      ${cs.length ? `<div class="card" style="padding:4px 12px">
+        <table><thead><tr><th>魚種</th><th class="num">尾数</th><th>同定</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>`
+       : '<div class="card dim">まだ記録がありません。</div>'}
+
+      <div class="hr"></div>
+      ${st.ended_at
+        ? `<button class="btn" onclick="reopenStation('${stUuid}')">この箇所を再開する</button>`
+        : `<button class="btn ok" onclick="endStation('${stUuid}')">この箇所を終える</button>`}
+      <button class="btn" onclick="nav('stationEdit',{uuid:'${stUuid}'})">箇所の設定</button>
+    `};
+};
+function endStation(u){
+  const st = DB.get(DB.key.st, u); if(!st) return;
+  st.ended_at = nowISO();
+  st.survey_time_end = timeValue();
+  if(DB.upsert(DB.key.st, st)){ toast('箇所を終えました'); reset('survey', st.survey_uuid); }
+}
+function reopenStation(u){
+  const st = DB.get(DB.key.st, u); if(!st) return;
+  delete st.ended_at; st.survey_time_end='';
+  if(DB.upsert(DB.key.st, st)){ render(); }
+}
+
+/* ---------- 魚種を選ぶ ---------- */
+SCREENS.speciesPick = (stUuid)=>{
+  const st = DB.get(DB.key.st, stUuid);
+  if(!st) return null;
+  return {
+    title:'魚種を選ぶ',
+    sub:[{text:st.name||''}, {text:`${SPECIES.length}種`}],
+    html:`
+      <div class="card">
+        <input id="spq" placeholder="和名・科名・昔の呼び名で探す" oninput="renderSpeciesList('${stUuid}')" autocomplete="off">
+        <div class="dim small" style="margin-top:6px">昔の呼び名（エゾイワナ・ヤマメなど）でも探せます。保存されるのは正式な種です。</div>
+      </div>
+      <div id="splist"></div>
+    `,
+    onMount(){ renderSpeciesList(stUuid); const q=$('#spq'); if(q) q.focus(); }
+  };
+};
+function renderSpeciesList(stUuid){
+  const q = strVal('#spq');
+  const list = speciesSearch(q).slice(0, 200);
+  const box = $('#splist'); if(!box) return;
+  if(!list.length){
+    box.innerHTML = `<div class="card dim">見つかりませんでした。魚類データベースの種リストに無い種かもしれません。</div>`;
+    return;
+  }
+  box.innerHTML = `<div class="splist">` + list.map(s=>{
+    const al = speciesAliasOf(s.id);
+    return `<div class="spitem" onclick="pickSpecies('${stUuid}','${s.id}')">
+      ${esc(s.ja)}<span class="fam">${esc(s.fam||'')}</span>
+      ${al.length?`<div class="dim small">別名：${esc(al.join('・'))}</div>`:''}
+    </div>`;
+  }).join('') + `</div>`;
+}
+function pickSpecies(stUuid, spId){
+  nav('catchEdit', {station:stUuid, species:spId});
+}
+
+/* ---------- 尾数を入れる ---------- */
+SCREENS.catchEdit = (arg)=>{
+  arg = arg||{};
+  const isNew = !arg.uuid;
+  const c  = isNew ? {} : (DB.get(DB.key.ca, arg.uuid)||{});
+  const stUuid = isNew ? arg.station : c.station_uuid;
+  const st = DB.get(DB.key.st, stUuid);
+  if(!st) return null;
+  const spId = isNew ? arg.species : c.species_id;
+  const sp = speciesById(spId);
+  const name = sp ? sp.ja : (c.species_name||'(種名なし)');
+  const nInd = isNew ? 0 : DB.individualsOf(c.uuid).length;
+  return {
+    title: name,
+    sub:[{text:st.name||''}, {text:sp?sp.fam||'':''}],
+    html:`
+      <div class="card">
+        <label>尾数（数えただけの分）</label>
+        <input id="c_n" inputmode="numeric" value="${esc(c.count_unmeasured!==undefined?c.count_unmeasured:'')}"
+          placeholder="例）30">
+        <div class="dim small">1尾ずつ体長を測る機能はこの次の段階で入ります。いまはここに合計を入れてください。</div>
+        ${nInd?`<div class="okbox">1尾ずつ測った記録が ${nInd}尾 あります。尾数はこれと足した ${catchTotal(c)}尾 になります。</div>`:''}
+        <label>同定の確からしさ</label>
+        ${segHtml('conf', OPT.confidence, c.identification_confidence||'確実')}
+        <label>備考</label>
+        <textarea id="c_note">${esc(c.notes||'')}</textarea>
+      </div>
+      ${sp?'':'<div class="ngbox">この記録には種IDがありません。データベース取り込み用のCSVからは除かれます。</div>'}
+      <button class="btn pri" onclick="saveCatch('${stUuid}','${arg.uuid||''}','${spId||''}',false)">保存する</button>
+      <button class="btn" onclick="saveCatch('${stUuid}','${arg.uuid||''}','${spId||''}',true)">保存して次の魚種へ</button>
+      ${isNew?'':`<button class="btn ng" onclick="deleteCatch('${arg.uuid}')">この記録を削除する</button>`}
+    `,
+    onMount(){ const el=$('#c_n'); if(el && isNew) el.focus(); }
+  };
+};
+function saveCatch(stUuid, caUuid, spId, next){
+  const st = DB.get(DB.key.st, stUuid); if(!st) return;
+  const sp = speciesById(spId);
+  const rec = caUuid ? (DB.get(DB.key.ca, caUuid)||{uuid:caUuid})
+                     : {uuid:uuid(), survey_uuid:st.survey_uuid, station_uuid:stUuid,
+                        recorded_at:nowISO()};
+  rec.survey_uuid  = rec.survey_uuid  || st.survey_uuid;
+  rec.station_uuid = rec.station_uuid || stUuid;
+  if(spId){ rec.species_id=spId; rec.species_name=sp?sp.ja:''; rec.species_family=sp?sp.fam:''; }
+  rec.count_unmeasured        = numVal('#c_n');
+  rec.identification_confidence = segVal('conf');
+  rec.notes                   = strVal('#c_note');
+  if(catchTotalOf(rec)<=0){
+    toast('尾数を入れてください（0だと書き出しから除かれます）');
+  }
+  if(!DB.upsert(DB.key.ca, rec)) return;
+  toast('保存しました');
+  if(next){ STACK.pop(); nav('speciesPick', stUuid); }
+  else { reset('station', stUuid); }
+}
+/* まだ保存していない記録にも使える版 */
+function catchTotalOf(rec){
+  const measured = rec.uuid ? DB.individualsOf(rec.uuid).length : 0;
+  const un = numOf(rec.count_unmeasured);
+  return measured + (un===''?0:un);
+}
+function deleteCatch(u){
+  if(!confirm('この記録を削除します。よろしいですか？')) return;
+  const c = DB.get(DB.key.ca, u);
+  if(DB.softDelete(DB.key.ca, u)){ toast('削除しました'); reset('station', c?c.station_uuid:null); }
+}
+
+/* ---------- 地図 ---------- */
+SCREENS.map = (svUuid)=>{
+  const sv = DB.get(DB.key.sv, svUuid);
+  if(!sv) return null;
+  return {
+    title:'地図',
+    sub:[{text:sv.river_name||''}],
+    html:`
+      ${baseMapButtonsHtml()}
+      <div id="themap" class="map"></div>
+      <div class="dim small" style="margin-top:8px">地図をタップすると、この調査の位置をそこへ動かせます。</div>
+      <button class="btn" onclick="nav('offlineMap','${svUuid}')">圏外にそなえて地図を保存する</button>
+    `,
+    onMount(){
+      const c = (numOf(sv.latitude)!=='' && numOf(sv.longitude)!=='')
+        ? [+sv.latitude, +sv.longitude] : [43.06,141.35];
+      MAPS.main.map = makeMap('themap', c, 15);
+      const map = MAPS.main.map;
+      if(!map) return;
+      applyBaseMap('main', baseMapName());
+      addLocateControl(map);
+      if(numOf(sv.latitude)!==''){
+        L.marker(c, {icon:dotIcon('#4aa3ff',16)}).addTo(map).bindPopup('調査の位置');
+      }
+      map.on('click', e=>{
+        if(!confirm('この調査の位置を、いまタップした場所に変えますか？')) return;
+        const rec = DB.get(DB.key.sv, svUuid); if(!rec) return;
+        rec.latitude  = +e.latlng.lat.toFixed(6);
+        rec.longitude = +e.latlng.lng.toFixed(6);
+        rec.position_source = '地図';   // 決め方を必ず書き換える
+        rec.gps_accuracy = '';
+        if(DB.upsert(DB.key.sv, rec)){ toast('位置を変えました'); render(); }
+      });
+    }
+  };
+};
+
+/* ---------- オフライン地図 ---------- */
+let OPOLY = [];
+SCREENS.offlineMap = (svUuid)=>{
+  const sv = DB.get(DB.key.sv, svUuid);
+  const packs = packStore();
+  OPOLY = [];
+  return {
+    title:'圏外用の地図',
+    html:`
+      <div class="card">
+        <div class="dim small">地図を長押し（またはタップ）して、落としておきたい範囲を3点以上で囲ってください。</div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn sm grow" onclick="opolyUndo()">1点もどす</button>
+          <button class="btn sm grow" onclick="opolyClear()">全部消す</button>
+          <button class="btn sm grow" onclick="opolyView()">今の表示範囲を使う</button>
+        </div>
+      </div>
+      ${baseMapButtonsHtml()}
+      <div id="omap" class="map"></div>
+      <div class="card">
+        <label>いちばん細かい大きさ</label>
+        ${segHtml('ozoom', ['z14（粗い）','z15','z16（細かい）'], 'z15')}
+        <label>落とす地図</label>
+        ${segMultiHtml('olayers', Object.keys(BASEMAPS), [baseMapName()])}
+        <button class="btn sm" onclick="opolyEstimate()">どれくらいになるか見る</button>
+        <div id="oest" class="dim small" style="margin-top:8px"></div>
+        <button class="btn pri" onclick="opolySave('${svUuid}')">この範囲を保存する</button>
+        <div id="oprog" class="dim small" style="margin-top:8px"></div>
+      </div>
+      <h3>保存済み</h3>
+      ${packs.length ? packs.map((p,i)=>`<div class="card">
+        <div class="row"><div class="grow">
+          <div>${esc(p.name||('範囲'+(i+1)))}</div>
+          <div class="dim small">${p.tiles}枚　およそ${p.mb}MB　${esc((p.layers||[]).join('・'))}</div>
+        </div><button class="btn sm ng" style="width:auto;margin:0"
+          onclick="packDrop(${i})">消す</button></div></div>`).join('')
+        : '<div class="card dim">まだありません。</div>'}
+    `,
+    onMount(){
+      const c = (sv && numOf(sv.latitude)!=='') ? [+sv.latitude, +sv.longitude] : [43.06,141.35];
+      MAPS.off.map = makeMap('omap', c, 13);
+      const map = MAPS.off.map;
+      if(!map) return;
+      applyBaseMap('off', baseMapName());
+      addLocateControl(map);
+      map.on('click', e=>{ OPOLY.push([e.latlng.lat, e.latlng.lng]); opolyDraw(); });
+    }
+  };
+};
+function opolyDraw(){
+  const map = MAPS.off.map;
+  if(!map) return;
+  if(OPOLYLAYER){ try{ map.removeLayer(OPOLYLAYER); }catch(e){} OPOLYLAYER=null; }
+  if(OPOLY.length<2){
+    if(OPOLY.length===1) OPOLYLAYER = L.circleMarker(OPOLY[0], {radius:5, color:'#4aa3ff'}).addTo(map);
+    return;
+  }
+  OPOLYLAYER = (OPOLY.length>=3
+    ? L.polygon(OPOLY, {color:'#4aa3ff', weight:2, fillOpacity:.15})
+    : L.polyline(OPOLY, {color:'#4aa3ff', weight:2})).addTo(map);
+}
+function opolyUndo(){ OPOLY.pop(); opolyDraw(); }
+function opolyClear(){ OPOLY=[]; opolyDraw(); }
+function opolyView(){
+  const map = MAPS.off.map;
+  if(!map) return;
+  const b=map.getBounds();
+  OPOLY=[[b.getSouth(),b.getWest()],[b.getNorth(),b.getWest()],
+         [b.getNorth(),b.getEast()],[b.getSouth(),b.getEast()]];
+  opolyDraw();
+}
+function opolyZmax(){ const v=segVal('ozoom')||'z15'; return parseInt(v.replace(/[^\d]/g,''),10)||15; }
+function opolyEstimate(){
+  const el=$('#oest'); if(!el) return;
+  if(OPOLY.length<3){ el.textContent='まず3点以上で囲ってください。'; return; }
+  const layers = segMultiVal('olayers');
+  if(!layers.length){ el.textContent='落とす地図を選んでください。'; return; }
+  const e = packEstimate(OPOLY, opolyZmax(), layers);
+  el.textContent = `およそ ${e.tiles}枚・${e.mb}MB。通信できるところで保存してください。`;
+}
+function opolySave(svUuid){
+  if(OPOLY.length<3){ toast('まず3点以上で囲ってください'); return; }
+  const layers = segMultiVal('olayers');
+  if(!layers.length){ toast('落とす地図を選んでください'); return; }
+  const urls = packTileUrls(OPOLY, opolyZmax(), layers);
+  const prog = $('#oprog');
+  if(prog) prog.textContent = `${urls.length}枚を保存しています…`;
+  swAsk({type:'savePack', urls}, 600000).then(r=>{
+    const okN = (r && r.ok) || 0;
+    const list = packStore();
+    list.push({name:`範囲${list.length+1}`, tiles:okN, mb:Math.round(okN*0.02*10)/10,
+               layers, zmax:opolyZmax(), at:nowISO()});
+    packSaveList(list);
+    if(prog) prog.textContent = `${okN}枚を保存しました。`;
+    toast('保存しました'); render();
+  }).catch(e=>{
+    if(prog) prog.textContent = '保存できませんでした：'+e.message;
+    toast('保存できませんでした');
+  });
+}
+function packDrop(i){
+  const list=packStore();
+  if(!list[i]) return;
+  if(!confirm('この範囲の地図を消します。よろしいですか？')) return;
+  list.splice(i,1); packSaveList(list); render();
+}
+
+/* ---------- 書き出し ---------- */
+SCREENS.exportHub = (svUuid)=>{
+  const sv = DB.get(DB.key.sv, svUuid);
+  if(!sv) return null;
+  const r = buildDbRows(sv);
+  return {
+    title:'書き出す',
+    sub:[{text:sv.river_name||''}],
+    html:`
+      ${r.blocked.length ? `<div class="ngbox"><b>このままでは書き出せません</b><br>
+        ${r.blocked.map(b=>esc(b)).join('<br>')}
+        <br><br>時刻が空のままだと、取り込み側が別々の箇所を1つにまとめてしまいます。</div>` : ''}
+      ${r.warnings.length ? `<div class="warnbox"><b>箇所がまとめられます</b><br>
+        ${r.warnings.map(w=>esc(w)).join('<br>')}
+        <br><br>取り込み側は、環境区分・水温・水深・流速・調査方法・時刻などが
+        すべて同じ箇所を1つとして扱います。分けて残したいときは、
+        時刻か環境の値のどれかが違うようにしてください。</div>` : ''}
+      <div class="card">
+        <div class="big">${r.rows.length} 行</div>
+        <div class="dim small">データベース取り込み用のCSV（31列）</div>
+        ${r.excluded.length ? `<div class="warnbox">除外 ${r.excluded.length}件<br>
+          ${r.excluded.slice(0,10).map(e=>esc(e)).join('<br>')}
+          ${r.excluded.length>10?`<br>ほか ${r.excluded.length-10}件`:''}</div>` : ''}
+        <div class="warnbox">このCSVに出ない項目：<br>${NOT_IN_DB_CSV.map(x=>esc(x)).join('、')}
+          <br>これらは次の段階で「個体」「箇所」のCSVとして出せるようにします。</div>
+        <button class="btn pri" ${r.blocked.length?'disabled':''}
+          onclick="exportDbCsv('${svUuid}')">CSVを書き出す</button>
+        ${sv.exported_at ? `<div class="dim small" style="margin-top:8px">
+          前回の書き出し：${esc(fmtDate(sv.exported_at))} ${esc(fmtTime(sv.exported_at))}<br>
+          同じCSVをもう一度取り込むと、記録が二重に増えます。</div>` : ''}
+      </div>
+      <div class="card">
+        <h3>取り込みかた</h3>
+        <div class="dim small">
+          魚類データベースを開き、「資料管理」→「調査記録」→「CSV / Excel から一括インポート」に
+          書き出したファイルを入れてください。
+        </div>
+      </div>
+    `};
+};
+function exportDbCsv(svUuid){
+  const sv = DB.get(DB.key.sv, svUuid); if(!sv) return;
+  const r = buildDbRows(sv);
+  if(r.blocked.length){ toast('先に足りないところを直してください'); return; }
+  if(!r.rows.length){ toast('書き出す記録がありません'); return; }
+  const csv = toCsv(FS_DB_COLS, r.rows);
+  download(`${exportFileBase(sv)}_DB取込用.csv`, '﻿'+csv, 'text/csv;charset=utf-8');
+  sv.exported_at = nowISO();
+  DB.upsert(DB.key.sv, sv);
+  toast(`${r.rows.length}行を書き出しました`);
+  render();
+}
+
+/* ============================================================
+   起動
+   ============================================================ */
+function boot(){
+  render();            // 先に画面を出す。保存領域の準備を待つと白いままになる
+  claimLock();
+  startGps();
+  if(navigator.storage && navigator.storage.persist){
+    try{ navigator.storage.persist(); }catch(e){}
+  }
+  if('serviceWorker' in navigator){
+    navigator.serviceWorker.register('./sw.js').catch(()=>{});
+  }
+}
+if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', boot);
+else boot();
+</script>
+</body>
+</html>
