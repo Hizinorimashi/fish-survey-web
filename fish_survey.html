@@ -106,7 +106,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v4';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v5';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -614,6 +614,97 @@ function stationTotal(st){ return DB.catchesOf(st.uuid).reduce((a,c)=>a+catchTot
 function surveyTotal(sv){ return DB.catchesOfSurvey(sv.uuid).reduce((a,c)=>a+catchTotal(c), 0); }
 
 /* ============================================================
+   とった労力（通電秒数・歩いた距離・調べた面積）
+   ============================================================ */
+const TRACK_MIN_MOVE = 3;      // これ未満しか動いていなければ、軌跡に足さない（m）
+const TRACK_SAVE_MS  = 15000;  // 軌跡を保存する間隔（書き込みすぎを防ぐ）
+
+/* いまの通電秒数。押しっぱなしの分は、実際の時計で足す。
+   秒数を数え続ける仕掛けを持たないので、画面を移してもアプリを閉じても狂わない */
+function effortSeconds(st){
+  if(!st) return 0;
+  const base = numOf(st.effort_seconds);
+  let n = base==='' ? 0 : base;
+  if(st.effort_started_at){
+    const t = Date.parse(st.effort_started_at);
+    if(isFinite(t)) n += Math.max(0, (Date.now()-t)/1000);
+  }
+  return n;
+}
+function effortRunning(st){ return !!(st && st.effort_started_at); }
+
+/* 区間の長さ。
+   電気ショッカーは行きつ戻りつするので、軌跡の総延長をそのまま使うと
+   同じ50mを3往復して150mになる。面積が3倍、単位努力量あたりの尾数が
+   3分の1になり、労力を記録する意味が消える。
+   だから既定は「始点から終点までの直線」。軌跡も残して、後から確かめられるようにする */
+function stationLengths(st){
+  const track = (st.track||[]).filter(validPt);
+  const trackLen = pathLength(track);
+  let straight = '';
+  const a = track.length ? track[0] : null;
+  const b = track.length ? track[track.length-1] : null;
+  if(a && b) straight = distMeters(a, b);
+  const manual = numOf(st.length_m_manual);
+  const used = manual!=='' ? manual : (straight!=='' && straight>0 ? straight : trackLen);
+  return {track:trackLen, straight, manual, used};
+}
+function stationAreas(st){
+  const L = stationLengths(st).used;
+  const w = numOf(st.width_m);
+  const calc = (w==='' || !isFinite(L)) ? '' : L * w;
+  const manual = numOf(st.area_m2_manual);
+  const used = manual!=='' ? manual : calc;
+  return {calc, manual, used};
+}
+/* 調査ぜんぶの合計。箇所の「使う値」を足す */
+function surveyLengths(sv){
+  const auto = DB.stationsOf(sv.uuid)
+    .reduce((a,st)=>{ const v=stationLengths(st).used; return a + (isFinite(v)?v:0); }, 0);
+  const manual = numOf(sv.survey_length_m_manual);
+  return {auto, manual, used: manual!=='' ? manual : auto};
+}
+function surveyAreas(sv){
+  const auto = DB.stationsOf(sv.uuid)
+    .reduce((a,st)=>{ const v=stationAreas(st).used; return a + (v===''||!isFinite(v)?0:v); }, 0);
+  const manual = numOf(sv.survey_area_m2_manual);
+  return {auto, manual, used: manual!=='' ? manual : auto};
+}
+/* 単位努力量あたりの尾数 */
+function cpue(st){
+  const n = stationTotal(st);
+  const sec = effortSeconds(st);
+  const area = stationAreas(st).used;
+  return {
+    per100s: sec>0 ? n/sec*100 : '',
+    per100m2: (area!=='' && area>0) ? n/area*100 : '',
+  };
+}
+
+/* ---- 歩いた道すじを記録する ---- */
+let TRACK_SAVED_AT = 0;
+function trackTick(fix){
+  if(!fix || !window.WRITE_OK) return;
+  if(fix.acc > GPS_MAX_ACC) return;        // 粗すぎる位置は使わない
+  const sv = DB.surveys().find(x=>x.status==='調査中');
+  if(!sv) return;
+  const st = DB.stationsOf(sv.uuid).find(x=>!x.ended_at);
+  if(!st) return;
+  const pt = [fix.lat, fix.lon];
+  if(!validPt(pt)) return;
+  const track = (st.track||[]).filter(validPt);
+  const last = track.length ? track[track.length-1] : null;
+  // 立ち止まっていても距離が伸びるのを防ぐ
+  if(last && distMeters(last, pt) < TRACK_MIN_MOVE) return;
+  track.push(pt);
+  st.track = track;
+  if(Date.now() - TRACK_SAVED_AT < TRACK_SAVE_MS){
+    return;                                 // 書き込みすぎない。次の機会にまとめて保存
+  }
+  if(DB.upsert(DB.key.st, st)) TRACK_SAVED_AT = Date.now();
+}
+
+/* ============================================================
    下書き（画面を離れても書きかけを失わない）
    「開いただけ」で入る自動の値は下書きに数えない。
    数えてしまうと、開いて戻っただけで書きかけが残り続ける
@@ -724,9 +815,11 @@ function navReplace(name, arg){
   render();
 }
 
+let EFFORT_TIMER = null;
 function render(){
   SCREEN_SEQ++;
   draftUnbind();
+  if(EFFORT_TIMER){ clearInterval(EFFORT_TIMER); EFFORT_TIMER=null; }
   destroyMaps();
   const cur = STACK[STACK.length-1];
   const scr = SCREENS[cur.name] || SCREENS.home;
@@ -791,6 +884,7 @@ function startGps(){
   gpsWatchId = navigator.geolocation.watchPosition(p=>{
     lastFix = {lat:p.coords.latitude, lon:p.coords.longitude,
                acc:p.coords.accuracy, t:Date.now()};
+    try{ trackTick(lastFix); }catch(e){}
   }, ()=>{}, {enableHighAccuracy:true, maximumAge:5000, timeout:20000});
 }
 function stopGps(){ if(gpsWatchId!=null){ navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId=null; } }
@@ -1169,12 +1263,129 @@ function dbRowOf(sv, st, c, inds){
     '業務番号':sv.project_number||'', '業務名':sv.project_name||'',
   };
 }
+/* 1尾ずつの記録（1行＝1尾） */
+function buildIndRows(sv, snap){
+  const rows = [];
+  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid)
+    .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
+  stations.forEach(st=>{
+    snap.ca.filter(c=>c.station_uuid===st.uuid).forEach(c=>{
+      indsOf(snap, c.uuid)
+        .slice().sort((a,b)=>(a.individual_number||0)-(b.individual_number||0))
+        .forEach(i=>{
+          rows.push({
+            '調査日':sv.survey_date||'', '河川名':sv.river_name||'', '地点名':sv.site_name||'',
+            '箇所':st.name||'', '種ID':c.species_id||'', '種名':c.species_name||'',
+            '個体番号': numOf(i.individual_number),
+            '全長cm': numOf(i.total_length_cm),
+            '尾叉長cm': numOf(i.fork_length_cm),
+            '記録した時刻': i.recorded_at ? fmtTime(i.recorded_at) : '',
+            '調査ID':sv.uuid, '箇所ID':st.uuid, '記録ID':c.uuid,
+          });
+        });
+    });
+  });
+  return rows;
+}
+
+/* 箇所ごと（1行＝1箇所） */
+function buildStationRows(sv, snap){
+  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid)
+    .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
+  return stations.map(st=>{
+    const len = stationLengths(st), area = stationAreas(st);
+    const cs = snap.ca.filter(c=>c.station_uuid===st.uuid);
+    const n = cs.reduce((a,c)=>a+catchTotal(c, snap), 0);
+    const cp = {
+      per100s: effortSeconds(st)>0 ? n/effortSeconds(st)*100 : '',
+      per100m2: (area.used!=='' && area.used>0) ? n/area.used*100 : '',
+    };
+    return {
+      '調査日':sv.survey_date||'', '河川名':sv.river_name||'', '地点名':sv.site_name||'',
+      '箇所':st.name||'', '環境区分':st.habitat_type||'',
+      '河川形態B':st.river_morphology_b||'',
+      '調査区分':st.survey_type||'', '調査方法':(st.survey_method||[]).join(','),
+      '開始時刻':st.survey_time_start||'', '終了時刻':st.survey_time_end||'',
+      '水温': numOf(st.water_temp),
+      '代表水深cm': numOf(st.depth_rep_cm), '代表流速cms': numOf(st.velocity_rep_cms),
+      '河床材料':st.substrate1||'', '礫の状況':st.gravel_condition||'',
+      '通電秒数': Math.round(effortSeconds(st)),
+      '通電回数': numOf(st.effort_passes),
+      '川幅m': numOf(st.width_m),
+      '距離_軌跡m': round1(len.track), '距離_直線m': round1(len.straight),
+      '距離_手入力m': len.manual, '距離_使う値m': round1(len.used),
+      '面積_計算m2': round1(area.calc), '面積_手入力m2': area.manual,
+      '面積_使う値m2': round1(area.used),
+      '種数': cs.length, '尾数': n,
+      '100秒あたり尾数': round1(cp.per100s), '100m2あたり尾数': round1(cp.per100m2),
+      'メモ':st.memo||'', '調査ID':sv.uuid, '箇所ID':st.uuid,
+    };
+  });
+}
+
+/* 調査ぜんぶ（1行） */
+function buildSurveyRow(sv, snap){
+  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid);
+  const ids = new Set(stations.map(x=>x.uuid));
+  const cs = snap.ca.filter(c=>ids.has(c.station_uuid));
+  const n = cs.reduce((a,c)=>a+catchTotal(c, snap), 0);
+  const measured = cs.reduce((a,c)=>a+indsOf(snap, c.uuid).length, 0);
+  const len = surveyLengths(sv), area = surveyAreas(sv);
+  return [{
+    '調査日':sv.survey_date||'', '季節':sv.season||'', '天気':sv.weather||'',
+    '河川名':sv.river_name||'', '地点名':sv.site_name||'', '区間名':sv.section_name||'',
+    '河川形態A':sv.river_morphology_a||'',
+    '緯度': fixCoord(sv.latitude), '経度': fixCoord(sv.longitude),
+    'GPS精度m': numOf(sv.gps_accuracy), '位置の決め方':sv.position_source||'',
+    '調査者':sv.investigator||'',
+    '業務番号':sv.project_number||'', '業務名':sv.project_name||'',
+    '箇所数': stations.length,
+    '種数': new Set(cs.map(c=>c.species_id||c.species_name)).size,
+    '尾数': n, '測った尾数': measured,
+    '通電秒数_合計': Math.round(stations.reduce((a,st)=>a+effortSeconds(st), 0)),
+    '距離_合計m': round1(len.auto), '距離_手入力m': len.manual, '距離_使う値m': round1(len.used),
+    '面積_合計m2': round1(area.auto), '面積_手入力m2': area.manual,
+    '面積_使う値m2': round1(area.used),
+    '開始': sv.started_at ? fmtTime(sv.started_at) : '',
+    '終了': sv.finished_at ? fmtTime(sv.finished_at) : '',
+    'メモ':sv.memo||'', '調査ID':sv.uuid,
+  }];
+}
+function round1(v){
+  const n = numOf(v);
+  return n==='' || !isFinite(n) ? '' : Math.round(n*10)/10;
+}
+
 function exportFileBase(sv){
   const d=(sv.survey_date||dateValue()).replace(/-/g,'');
   const r=(sv.river_name||'調査').replace(/[\\/:*?"<>|\s]/g,'');
   return `魚類調査_${d}_${r}_${(sv.uuid||'').slice(0,8)}`;
 }
-/* 書き出しでデータベースに渡らない項目。書き出し画面に必ず出す */
+/* 31列のCSVに乗らない項目は、こちらの3本に出す。
+   列名はデータベースの表に合わせてある（Phase 5 の取り込みスクリプトで使う）
+     個体.csv  → body_lengths（individual_number / total_length / fork_length）
+     箇所.csv  → survey_habitats（habitat_area / habitat_length ほか）
+     調査.csv  → survey_events（survey_area / survey_length ほか） */
+const FS_IND_COLS = ['調査日','河川名','地点名','箇所','種ID','種名',
+  '個体番号','全長cm','尾叉長cm','記録した時刻','調査ID','箇所ID','記録ID'];
+
+const FS_STATION_COLS = ['調査日','河川名','地点名','箇所','環境区分','河川形態B',
+  '調査区分','調査方法','開始時刻','終了時刻','水温',
+  '代表水深cm','代表流速cms','河床材料','礫の状況',
+  '通電秒数','通電回数','川幅m',
+  '距離_軌跡m','距離_直線m','距離_手入力m','距離_使う値m',
+  '面積_計算m2','面積_手入力m2','面積_使う値m2',
+  '種数','尾数','100秒あたり尾数','100m2あたり尾数',
+  'メモ','調査ID','箇所ID'];
+
+const FS_SURVEY_COLS = ['調査日','季節','天気','河川名','地点名','区間名','河川形態A',
+  '緯度','経度','GPS精度m','位置の決め方','調査者','業務番号','業務名',
+  '箇所数','種数','尾数','測った尾数',
+  '通電秒数_合計','距離_合計m','距離_手入力m','距離_使う値m',
+  '面積_合計m2','面積_手入力m2','面積_使う値m2',
+  '開始','終了','メモ','調査ID'];
+
+/* 書き出しでデータベースの31列CSVに乗らない項目。書き出し画面に必ず出す */
 const NOT_IN_DB_CSV = ['通電秒数','調査面積','調査距離','左右岸のカバー',
   '測点ごとの水深・流速','1尾ずつの体長','写真','GPSの精度','調査者'];
 
@@ -1369,6 +1580,8 @@ SCREENS.survey = (svUuid)=>{
   if(!sv) return null;
   const stations = DB.stationsOf(svUuid);
   const running  = stations.find(s=>!s.ended_at);
+  const svLen = surveyLengths(sv), svArea = surveyAreas(sv);
+  const svSec = stations.reduce((a,st)=>a+effortSeconds(st), 0);
   const nSp = new Set(DB.catchesOfSurvey(svUuid).map(c=>c.species_id).filter(Boolean)).size;
   const stCards = stations.map(st=>{
     const n = stationTotal(st);
@@ -1377,7 +1590,8 @@ SCREENS.survey = (svUuid)=>{
       <div class="row">
         <div class="grow">
           <div style="font-weight:700">${esc(st.name)}　<span class="dim small">${esc(st.habitat_type||'区分なし')}</span></div>
-          <div class="dim small">${esc(st.survey_time_start||'--:--')}〜${esc(st.survey_time_end||'')}　${sp}種 ${n}尾</div>
+          <div class="dim small">${esc(st.survey_time_start||'--:--')}〜${esc(st.survey_time_end||'')}　${sp}種 ${n}尾${
+            effortSeconds(st)>0 ? '　通電'+esc(fmtDur(effortSeconds(st))) : ''}</div>
         </div>
         ${st.ended_at?'':'<span class="pill ok">記録中</span>'}
       </div></div>`;
@@ -1396,6 +1610,18 @@ SCREENS.survey = (svUuid)=>{
         ? `<button class="btn" onclick="endSurvey('${svUuid}')">調査を終える</button>` : ''}
       ${sv.status==='終了'
         ? `<button class="btn" onclick="reopenSurvey('${svUuid}')">調査を再開する</button>` : ''}
+
+      <div class="card">
+        <div class="row">
+          <div class="grow"><div class="dim small">調べた距離（合計）</div>
+            <div>${esc(fmtDist(svLen.used))}</div></div>
+          <div class="grow"><div class="dim small">調べた面積（合計）</div>
+            <div>${svArea.used===''||!svArea.used?'—':esc(fmtNum(svArea.used,1))+' m²'}</div></div>
+          <div class="grow"><div class="dim small">通電（合計）</div>
+            <div>${esc(fmtDur(svSec))}</div></div>
+        </div>
+        <div class="dim small">箇所ごとの「使う値」を足したものです。</div>
+      </div>
 
       <h3>箇所（瀬淵ごと）</h3>
       ${stations.length ? stCards : '<div class="card dim">まだ箇所がありません。</div>'}
@@ -1542,11 +1768,17 @@ SCREENS.station = (stUuid)=>{
   if(!st) return null;
   const sv = DB.get(DB.key.sv, st.survey_uuid);
   const cs = DB.catchesOf(stUuid);
-  const rows = cs.map(c=>`<tr onclick="nav('catchEdit',{uuid:'${c.uuid}'})" style="cursor:pointer">
+  const len = stationLengths(st), area = stationAreas(st), cp = cpue(st);
+  const rows = cs.map(c=>{
+    const ls = catchLengths(c);
+    return `<tr onclick="nav('catchEdit',{uuid:'${c.uuid}'})" style="cursor:pointer">
       <td>${esc(c.species_name||'(種名なし)')}${c.species_id?'':' <span class="pill ng">種IDなし</span>'}</td>
       <td class="num">${catchTotal(c)}</td>
+      <td class="num dim small">${ls.length
+        ? `${fmtNum(Math.min.apply(null,ls),1)}〜${fmtNum(Math.max.apply(null,ls),1)}` : '—'}</td>
       <td class="dim small">${esc(c.identification_confidence||'')}</td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
   return {
     title: st.name || '箇所',
     sub:[{text:sv?sv.river_name||'':''}, {text:st.habitat_type||'区分なし'},
@@ -1569,9 +1801,57 @@ SCREENS.station = (stUuid)=>{
         </div>
       </div>
 
+      <div class="card">
+        <h3 style="margin-top:0">とった労力</h3>
+        <div class="row">
+          <div class="grow">
+            <div class="dim small">電気ショッカーの通電</div>
+            <div class="big" id="effClock">${esc(fmtDur(effortSeconds(st)))}</div>
+          </div>
+          <button class="btn ${effortRunning(st)?'ng':'ok'}" style="width:auto;margin:0;padding:12px 18px"
+            onclick="toggleEffort('${stUuid}')">${effortRunning(st)?'ストップ':'スタート'}</button>
+        </div>
+        <div class="dim small">画面を移してもアプリを閉じても、時計で数えるので狂いません。</div>
+
+        <label>流した回数</label>
+        <input id="e_passes" inputmode="numeric" value="${esc(st.effort_passes!==undefined?st.effort_passes:'')}">
+        <label>平均の川幅（m）</label>
+        <input id="e_width" inputmode="decimal" value="${esc(st.width_m!==undefined?st.width_m:'')}">
+
+        <h3>調べた区間の長さ</h3>
+        <table><tbody>
+          <tr><td class="dim">歩いた軌跡</td><td class="num">${esc(fmtDist(len.track))}</td></tr>
+          <tr><td class="dim">始点から終点の直線</td>
+              <td class="num">${len.straight===''?'—':esc(fmtDist(len.straight))}</td></tr>
+          <tr><td class="dim">手で入れた値</td>
+              <td class="num">${len.manual===''?'—':esc(fmtDist(len.manual))}</td></tr>
+          <tr><td style="font-weight:700">使う値</td>
+              <td class="num" style="font-weight:700">${esc(fmtDist(len.used))}</td></tr>
+        </tbody></table>
+        <div class="dim small">電気ショッカーは行き来するので、軌跡の長さは実際の区間より長くなります。
+          既定は直線です。手で入れればそちらを使います。</div>
+        <label>区間の長さを手で入れる（m）</label>
+        <input id="e_len" inputmode="decimal" value="${esc(st.length_m_manual!==undefined?st.length_m_manual:'')}">
+
+        <h3>調べた面積</h3>
+        <div class="dim small">使う長さ × 川幅 ＝ ${area.calc===''?'（川幅を入れると出ます）':esc(fmtNum(area.calc,1))+' m²'}</div>
+        <label>面積を手で入れる（m²）</label>
+        <input id="e_area" inputmode="decimal" value="${esc(st.area_m2_manual!==undefined?st.area_m2_manual:'')}">
+        <div class="row" style="margin-top:8px">
+          <div class="grow"><div class="dim small">使う面積</div>
+            <div>${area.used===''?'—':esc(fmtNum(area.used,1))+' m²'}</div></div>
+          <div class="grow"><div class="dim small">100秒あたり</div>
+            <div>${cp.per100s===''?'—':esc(fmtNum(cp.per100s,1))+' 尾'}</div></div>
+          <div class="grow"><div class="dim small">100m²あたり</div>
+            <div>${cp.per100m2===''?'—':esc(fmtNum(cp.per100m2,1))+' 尾'}</div></div>
+        </div>
+        <button class="btn" onclick="saveEffort('${stUuid}')">労力を保存する</button>
+      </div>
+
       <h3>この箇所で記録した魚</h3>
       ${cs.length ? `<div class="card" style="padding:4px 12px">
-        <table><thead><tr><th>魚種</th><th class="num">尾数</th><th>同定</th></tr></thead>
+        <table><thead><tr><th>魚種</th><th class="num">尾数</th>
+          <th class="num">体長cm</th><th>同定</th></tr></thead>
         <tbody>${rows}</tbody></table></div>`
        : '<div class="card dim">まだ記録がありません。</div>'}
 
@@ -1580,10 +1860,49 @@ SCREENS.station = (stUuid)=>{
         ? `<button class="btn" onclick="reopenStation('${stUuid}')">この箇所を再開する</button>`
         : `<button class="btn ok" onclick="endStation('${stUuid}')">この箇所を終える</button>`}
       <button class="btn" onclick="nav('stationEdit',{uuid:'${stUuid}'})">箇所の設定</button>
-    `};
+    `,
+    onMount(){
+      startGps();
+      if(effortRunning(st)){
+        const el = $('#effClock');
+        EFFORT_TIMER = setInterval(()=>{
+          const now = DB.getAlive(DB.key.st, stUuid);
+          if(!el || !now || !effortRunning(now)){ clearInterval(EFFORT_TIMER); EFFORT_TIMER=null; return; }
+          el.textContent = fmtDur(effortSeconds(now));
+        }, 1000);
+      }
+    }
+  };
 };
+
+/* 通電のスタート・ストップ。押した時刻だけを覚え、表示は時計から作る */
+function toggleEffort(stUuid){
+  const st = DB.liveStation(stUuid); if(!st) return;
+  if(effortRunning(st)){
+    st.effort_seconds = Math.round(effortSeconds(st));
+    delete st.effort_started_at;
+    if(DB.upsert(DB.key.st, st)){ toast(`通電 ${fmtDur(st.effort_seconds)}`); render(); }
+  }else{
+    st.effort_started_at = nowISO();
+    if(DB.upsert(DB.key.st, st)){ toast('通電をはじめました'); render(); }
+  }
+}
+function saveEffort(stUuid){
+  const st = DB.liveStation(stUuid); if(!st) return;
+  const passes = strVal('#e_passes');
+  if(countOf(passes)===null){ toast('流した回数は0以上の整数で入れてください'); return; }
+  st.effort_passes    = countOf(passes);
+  st.width_m          = numVal('#e_width');
+  st.length_m_manual  = numVal('#e_len');
+  st.area_m2_manual   = numVal('#e_area');
+  if(DB.upsert(DB.key.st, st)){ toast('保存しました'); render(); }
+}
 function endStation(u){
   const st = DB.get(DB.key.st, u); if(!st) return;
+  if(effortRunning(st)){          // 押しっぱなしのまま終わらせない
+    st.effort_seconds = Math.round(effortSeconds(st));
+    delete st.effort_started_at;
+  }
   st.ended_at = nowISO();
   st.survey_time_end = timeValue();
   if(DB.upsert(DB.key.st, st)){ toast('箇所を終えました'); goTo('survey', st.survey_uuid); }
@@ -1648,11 +1967,21 @@ SCREENS.catchEdit = (arg)=>{
     sub:[{text:st.name||''}, {text:sp?sp.fam||'':''}],
     html:`
       <div class="card">
-        <label>尾数（数えただけの分）</label>
+        <div class="row">
+          <div class="grow">
+            <div class="dim small">この魚種の合計</div>
+            <div class="big">${isNew ? 0 : catchTotal(c)} 尾</div>
+          </div>
+          <div class="grow dim small">
+            測った ${nInd}尾<br>数えただけ ${esc(c.count_unmeasured!==undefined&&c.count_unmeasured!==''?c.count_unmeasured:0)}尾
+          </div>
+        </div>
+        <button class="btn ok" onclick="toIndividuals('${stUuid}','${arg.uuid||''}','${spId||''}')">
+          1尾ずつ測る${nInd?`（いま ${nInd}尾）`:''}</button>
+        <label>数えただけの尾数（測らない分）</label>
         <input id="c_n" inputmode="numeric" value="${esc(c.count_unmeasured!==undefined?c.count_unmeasured:'')}"
           placeholder="例）30">
-        <div class="dim small">1尾ずつ体長を測る機能はこの次の段階で入ります。いまはここに合計を入れてください。</div>
-        ${nInd?`<div class="okbox">1尾ずつ測った記録が ${nInd}尾 あります。尾数はこれと足した ${catchTotal(c)}尾 になります。</div>`:''}
+        <div class="dim small">測った分と足して尾数になります。全部測るならここは空のままで構いません。</div>
         <label>同定の確からしさ</label>
         ${segHtml('conf', OPT.confidence, c.identification_confidence||'確実')}
         <label>備考</label>
@@ -1718,6 +2047,30 @@ function saveCatch(stUuid, caUuid, spId, next){
   }
   else { goTo('station', stUuid); }
 }
+/* 「1尾ずつ測る」へ。記録がまだ無ければ先に作る（個体は記録にぶら下がるため） */
+function toIndividuals(stUuid, caUuid, spId){
+  if(caUuid){ nav('individuals', caUuid); return; }
+  const st = DB.getAlive(DB.key.st, stUuid); if(!st) return;
+  const raw = strVal('#c_n');
+  if(countOf(raw)===null){
+    toast('数えただけの尾数は0以上の整数で入れてください（空でも構いません）', 5000);
+    return;
+  }
+  const sp = speciesById(spId);
+  const rec = {uuid:uuid(), survey_uuid:st.survey_uuid, station_uuid:stUuid,
+    recorded_at:nowISO(),
+    species_id:spId||'', species_name:sp?sp.ja:'', species_family:sp?sp.fam:'',
+    count_unmeasured: countOf(raw),
+    identification_confidence: segVal('conf'),
+    notes: strVal('#c_note')};
+  if(!DB.upsert(DB.key.ca, rec)) return;
+  draftClear('catch:new:'+stUuid+':'+(spId||''));
+  draftUnbind();
+  // 履歴に「魚の記録」を残したまま個体入力へ。戻れば尾数の画面に帰る
+  navReplace('catchEdit', {uuid: rec.uuid});
+  nav('individuals', rec.uuid);
+}
+
 /* まだ保存していない記録にも使える版 */
 function catchTotalOf(rec){
   const measured = rec.uuid ? DB.individualsOf(rec.uuid).length : 0;
@@ -1728,6 +2081,82 @@ function deleteCatch(u){
   if(!confirm('この記録を削除します。よろしいですか？')) return;
   const c = DB.get(DB.key.ca, u);
   if(DB.softDelete(DB.key.ca, u)){ toast('削除しました'); goTo('station', c?c.station_uuid:null); }
+}
+
+/* ---------- 1尾ずつ測る ---------- */
+SCREENS.individuals = (caUuid)=>{
+  const c = DB.getAlive(DB.key.ca, caUuid);
+  if(!c) return null;
+  const st = DB.liveStation(c.station_uuid);
+  if(!st) return null;
+  const list = DB.individualsOf(caUuid);
+  const ls = nums(list.map(i=>i.total_length_cm));
+  const rows = list.map(i=>`<tr>
+      <td class="num dim">${i.individual_number}</td>
+      <td class="num" style="font-weight:700">${fmtNum(numOf(i.total_length_cm),1)}</td>
+      <td class="num dim">${numOf(i.fork_length_cm)===''?'—':fmtNum(numOf(i.fork_length_cm),1)}</td>
+      <td style="text-align:right"><button class="btn sm ng" style="width:auto;margin:0;padding:4px 10px"
+        onclick="delIndividual('${i.uuid}')">消す</button></td>
+    </tr>`).reverse().join('');
+  return {
+    title: c.species_name || '1尾ずつ測る',
+    sub:[{text:st.name||''}, {text:`測った ${list.length}尾`},
+         ls.length?{text:`${Math.min.apply(null,ls)}〜${Math.max.apply(null,ls)}cm`}:null].filter(Boolean),
+    html:`
+      <div class="card">
+        <label>全長（cm）</label>
+        <input id="i_tl" inputmode="decimal" placeholder="例）8.2"
+          onkeydown="if(event.key==='Enter'){event.preventDefault();addIndividual('${caUuid}');}">
+        <label>尾叉長（cm）　<span class="dim small">分かるときだけ</span></label>
+        <input id="i_fl" inputmode="decimal" placeholder="任意"
+          onkeydown="if(event.key==='Enter'){event.preventDefault();addIndividual('${caUuid}');}">
+        <button class="btn pri" onclick="addIndividual('${caUuid}')">この1尾を記録して次へ</button>
+        <div class="dim small">記録すると欄が空になります。前の魚の値は残しません。</div>
+      </div>
+
+      ${list.length ? `<div class="card" style="padding:4px 12px">
+        <table><thead><tr>
+          <th class="num">番号</th><th class="num">全長cm</th><th class="num">尾叉長cm</th><th></th>
+        </tr></thead><tbody>${rows}</tbody></table></div>
+        <div class="card">
+          <div class="row">
+            <div class="grow"><div class="dim small">最小</div><div>${fmtNum(Math.min.apply(null,ls),1)} cm</div></div>
+            <div class="grow"><div class="dim small">最大</div><div>${fmtNum(Math.max.apply(null,ls),1)} cm</div></div>
+            <div class="grow"><div class="dim small">平均</div>
+              <div>${fmtNum(ls.reduce((a,b)=>a+b,0)/ls.length,1)} cm</div></div>
+          </div>
+        </div>`
+       : '<div class="card dim">まだ1尾も測っていません。</div>'}
+
+      <button class="btn" onclick="goBack()">測り終える</button>
+    `,
+    onMount(){ const el=$('#i_tl'); if(el) el.focus(); }
+  };
+};
+
+function addIndividual(caUuid){
+  const c = DB.getAlive(DB.key.ca, caUuid); if(!c) return;
+  const tl = numVal('#i_tl');
+  if(tl===''){ toast('全長を入れてください'); return; }
+  if(tl<=0){ toast('全長は0より大きい数で入れてください'); return; }
+  const fl = numVal('#i_fl');
+  if(fl!=='' && fl<=0){ toast('尾叉長は0より大きい数で入れてください'); return; }
+  if(fl!=='' && fl>tl){ toast('尾叉長が全長より長くなっています。確かめてください', 5000); }
+  const list = DB.individualsOf(caUuid);
+  const no = list.reduce((m,i)=>Math.max(m, numOf(i.individual_number)||0), 0) + 1;
+  const rec = {uuid:uuid(), catch_uuid:caUuid,
+    station_uuid:c.station_uuid, survey_uuid:c.survey_uuid,
+    individual_number:no, total_length_cm:tl, fork_length_cm:fl,
+    recorded_at:nowISO()};
+  if(!DB.upsert(DB.key.ind, rec)) return;   // 保存できていないので欄も消さない
+  toast(`${no}尾目：${tl}cm`);
+  render();                                  // 一覧を出し直し、欄は空に戻る
+}
+function delIndividual(u){
+  const i = DB.get(DB.key.ind, u);
+  if(!i) return;
+  if(!confirm(`${i.individual_number}尾目（${i.total_length_cm}cm）を消します。よろしいですか？`)) return;
+  if(DB.softDelete(DB.key.ind, u)){ toast('消しました'); render(); }
 }
 
 /* ---------- 地図 ---------- */
@@ -2115,6 +2544,11 @@ SCREENS.exportHub = (svUuid)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
   const r = buildDbRows(sv);
+  let extra = {ind:0, st:0};
+  try{
+    const snap = exportSnapshot();
+    extra = {ind: buildIndRows(sv, snap).length, st: buildStationRows(sv, snap).length};
+  }catch(e){}
   return {
     title:'書き出す',
     sub:[{text:sv.river_name||''}],
@@ -2142,6 +2576,22 @@ SCREENS.exportHub = (svUuid)=>{
           同じCSVをもう一度取り込むと、記録が二重に増えます。</div>` : ''}
       </div>
       <div class="card">
+        <h3 style="margin-top:0">31列に乗らない分</h3>
+        <div class="row">
+          <div class="grow"><div class="dim small">1尾ずつの体長</div>
+            <div class="big">${extra.ind} 尾</div></div>
+          <div class="grow"><div class="dim small">箇所</div>
+            <div class="big">${extra.st} 件</div></div>
+        </div>
+        <div class="dim small">通電秒数・距離・面積・1尾ずつの体長は、こちらに出ます。
+          いまはデータベースに取り込む口がないので、Excelで開いて使ってください。</div>
+        <button class="btn" ${extra.ind?'':'disabled'}
+          onclick="exportExtraCsv('${svUuid}','個体')">1尾ずつの体長を書き出す</button>
+        <button class="btn" onclick="exportExtraCsv('${svUuid}','箇所')">箇所ごとの記録を書き出す</button>
+        <button class="btn" onclick="exportExtraCsv('${svUuid}','調査')">調査のまとめを書き出す</button>
+      </div>
+
+      <div class="card">
         <h3>取り込みかた</h3>
         <div class="dim small">
           魚類データベースを開き、「資料管理」→「調査記録」→「CSV / Excel から一括インポート」に
@@ -2150,6 +2600,37 @@ SCREENS.exportHub = (svUuid)=>{
       </div>
     `};
 };
+/* 31列に乗らない分の書き出し */
+function exportExtraCsv(svUuid, kind){
+  if(!ownsLock()){
+    toast('このタブでは書き出せません。記録を入れているタブから書き出してください', 6000);
+    return;
+  }
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
+  let snap;
+  try{ snap = exportSnapshot(); }
+  catch(e){ toast(e.message, 8000); return; }
+
+  const table = {
+    '個体': [FS_IND_COLS,     buildIndRows(sv, snap)],
+    '箇所': [FS_STATION_COLS, buildStationRows(sv, snap)],
+    '調査': [FS_SURVEY_COLS,  buildSurveyRow(sv, snap)],
+  }[kind];
+  if(!table){ toast('書き出せません'); return; }
+  const [cols, rows] = table;
+  if(!rows.length){ toast('書き出す記録がありません'); return; }
+
+  const csv = toCsv(cols, rows);
+  const fname = `${exportFileBase(sv)}_${kind}.csv`;
+  if(!ownsLock()){
+    toast('書き出しの途中で、ほかのタブに使用権が移りました。'
+        + 'このタブを読み込み直してからやり直してください', 8000);
+    return;
+  }
+  download(fname, '﻿'+csv, 'text/csv;charset=utf-8');
+  toast(`${rows.length}行を書き出しました`);
+}
+
 function exportDbCsv(svUuid){
   // 使用権のないタブから書き出すと、別のタブが書き換えている途中の
   // ばらばらな中身を1つのCSVに混ぜてしまう
