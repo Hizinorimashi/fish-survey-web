@@ -117,7 +117,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v12';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v13';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2772,11 +2772,17 @@ SCREENS.individuals = (caUuid)=>{
       </div>
 
       ${foldHtml('bulk', 'まとめて入れる', '<span class="fsub">読み上げを聞きながら</span>', `
-        <div class="dim small">全長の数字を、空白・カンマ・改行で区切って並べてください。
+        <div class="dim small">全長を打って「つぎ」。これを繰り返してから、まとめて追加します。
           尾叉長は入りません（必要なときは、上の1尾ずつの欄で入れてください）。</div>
-        <textarea id="i_bulk" style="min-height:110px" placeholder="8.2 9.1 7.6
-12.4 10.2 6.8" oninput="bulkHint()"></textarea>
-        <div class="dim small" id="i_bulkInfo">数字を空白・カンマ・改行で区切って並べてください。</div>
+        <textarea id="i_bulk" inputmode="decimal" style="min-height:96px"
+          placeholder="8.2 9.1 7.6" oninput="bulkHint()"></textarea>
+        <div class="btn2">
+          <button class="btn ok" onclick="bulkSep()">つぎ</button>
+          <button class="btn" onclick="bulkUndo()">1つ消す</button>
+        </div>
+        <div class="dim small">テンキーには空白キーが無いので、「つぎ」で区切ります。
+          文字の打てるキーボードなら、空白・カンマ・改行でも構いません。</div>
+        <div class="dim small" id="i_bulkInfo">数字を打って「つぎ」を押してください。</div>
         <button class="btn pri" id="i_bulkBtn" disabled
           onclick="addIndividualsBulk('${caUuid}')">まとめて追加</button>
         <div class="dim small">1つでも読めない値があれば、1尾も入れません。
@@ -2823,7 +2829,7 @@ function bulkHint(){
   if(!box || !out) return;
   const r = parseLengths(box.value);
   out.innerHTML = r.n===0
-    ? '数字を空白・カンマ・改行で区切って並べてください。'
+    ? '数字を打って「つぎ」を押してください。'
     : (r.bad.length
         ? `<span class="pill ng">読めない値 ${r.bad.length}個</span> ${esc(r.bad.slice(0,6).join(' '))}`
           + '<br>直してから追加してください。'
@@ -2835,6 +2841,24 @@ function bulkHint(){
       ? `${r.ok.length}尾をまとめて追加` : 'まとめて追加';
   }
 }
+/* 区切りを入れる。テンキーには空白キーが無いので、画面のボタンで区切る */
+function bulkSep(){
+  const box = $('#i_bulk'); if(!box) return;
+  const v = String(box.value);
+  if(v.trim()!=='' && !/[\s,、，;；\/]$/.test(v)) box.value = v + ' ';
+  box.focus();
+  bulkHint();
+}
+/* 打ち間違いを1つ戻す。テンキーだと文字を選んで直しにくいため */
+function bulkUndo(){
+  const box = $('#i_bulk'); if(!box) return;
+  const t = String(box.value).split(/[\s,、，;；\/]+/).filter(x=>x!=='');
+  t.pop();
+  box.value = t.length ? t.join(' ') + ' ' : '';
+  box.focus();
+  bulkHint();
+}
+
 /* まとめて追加。1つでも読めない値があれば、1尾も入れない
    （半端に入ると、どこまで入ったか分からなくなる） */
 function addIndividualsBulk(caUuid){
