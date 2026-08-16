@@ -106,7 +106,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v5';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v6';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -580,6 +580,14 @@ const SUBSTRATE_NOTE = {
   '砂泥':'2mm未満','小礫':'2〜16mm','中礫':'16〜64mm','大礫':'64〜250mm',
   '巨礫':'250mm以上','岩盤':'','コンクリート':'',
 };
+/* いま現場にいる調査か。
+   調査日が今日で、かつ「調査中」のときだけ、時刻を自動で入れる。
+   あとから書き起こすときに今の時刻を入れてしまうと、
+   実際の調査時刻と食い違い、取り込み側の箇所のまとまり方まで狂う */
+function isLiveNow(sv){
+  return !!sv && sv.status==='調査中' && sv.survey_date===dateValue();
+}
+
 function seasonOf(dateStr){
   const m = parseInt(String(dateStr||'').slice(5,7),10);
   if(!m) return '';
@@ -1579,7 +1587,9 @@ SCREENS.survey = (svUuid)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
   const stations = DB.stationsOf(svUuid);
-  const running  = stations.find(s=>!s.ended_at);
+  // 「記録中」は、いま現場にいるときだけの言い方。
+  // あとから書き起こしているときに「記録中」と出ると、何かが動いている誤解になる
+  const running  = isLiveNow(sv) ? stations.find(s=>!s.ended_at) : null;
   const svLen = surveyLengths(sv), svArea = surveyAreas(sv);
   const svSec = stations.reduce((a,st)=>a+effortSeconds(st), 0);
   const nSp = new Set(DB.catchesOfSurvey(svUuid).map(c=>c.species_id).filter(Boolean)).size;
@@ -1590,10 +1600,12 @@ SCREENS.survey = (svUuid)=>{
       <div class="row">
         <div class="grow">
           <div style="font-weight:700">${esc(st.name)}　<span class="dim small">${esc(st.habitat_type||'区分なし')}</span></div>
-          <div class="dim small">${esc(st.survey_time_start||'--:--')}〜${esc(st.survey_time_end||'')}　${sp}種 ${n}尾${
+          <div class="dim small">${st.survey_time_start
+            ? esc(st.survey_time_start)+'〜'+esc(st.survey_time_end||'')
+            : '<span class="pill ng">時刻なし</span>'}　${sp}種 ${n}尾${
             effortSeconds(st)>0 ? '　通電'+esc(fmtDur(effortSeconds(st))) : ''}</div>
         </div>
-        ${st.ended_at?'':'<span class="pill ok">記録中</span>'}
+        ${(isLiveNow(sv) && !st.ended_at) ? '<span class="pill ok">記録中</span>' : ''}
       </div></div>`;
   }).join('');
   return {
@@ -1601,15 +1613,25 @@ SCREENS.survey = (svUuid)=>{
     sub:[{text:fmtDate(sv.survey_date)}, {text:sv.status||'未開始', cls: sv.status==='調査中'?'ok':''},
          {text:`${nSp}種 ${surveyTotal(sv)}尾`}],
     html:`
-      ${sv.status==='未開始'
-        ? `<button class="btn pri" onclick="startSurvey('${svUuid}')">調査をはじめる</button>`
-        : (running
-           ? `<button class="btn pri" onclick="nav('station','${running.uuid}')">記録中の ${esc(running.name)} を開く</button>`
-           : `<button class="btn pri" onclick="newStation('${svUuid}')">箇所をはじめる</button>`)}
-      ${sv.status==='調査中' && !running
-        ? `<button class="btn" onclick="endSurvey('${svUuid}')">調査を終える</button>` : ''}
-      ${sv.status==='終了'
-        ? `<button class="btn" onclick="reopenSurvey('${svUuid}')">調査を再開する</button>` : ''}
+      ${running
+        ? `<button class="btn pri" onclick="nav('station','${running.uuid}')">記録中の ${esc(running.name)} を開く</button>`
+        : `<button class="btn pri" onclick="newStation('${svUuid}')">箇所を追加する</button>`}
+
+      <div class="card">
+        <div class="row">
+          <div class="grow">
+            <div class="dim small">いま現場にいるとき</div>
+            <div>${sv.status==='調査中'
+              ? 'GPSで歩いた道すじを記録しています'
+              : '「はじめる」を押すと、時刻が自動で入り、道すじを記録します'}</div>
+          </div>
+          ${sv.status==='調査中'
+            ? `<button class="btn" style="width:auto;margin:0" onclick="endSurvey('${svUuid}')">終える</button>`
+            : `<button class="btn ok" style="width:auto;margin:0" onclick="startSurvey('${svUuid}')">はじめる</button>`}
+        </div>
+        <div class="dim small">押さなくても記録はできます。
+          あとから書き起こすときは、そのまま「箇所を追加する」へどうぞ。</div>
+      </div>
 
       <div class="card">
         <div class="row">
@@ -1649,9 +1671,10 @@ function reopenSurvey(u){
   sv.status='調査中'; delete sv.finished_at;
   if(DB.upsert(DB.key.sv, sv)){ render(); }
 }
+/* 箇所はいつでも足せる。現場でも、家に帰ってからでも。
+   「調査中」は、GPSで道すじを記録するかどうかの合図にすぎない */
 function newStation(svUuid){
-  const sv = DB.get(DB.key.sv, svUuid); if(!sv) return;
-  if(sv.status!=='調査中'){ toast('先に「調査をはじめる」を押してください'); return; }
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
   nav('stationEdit', {survey:svUuid});
 }
 
@@ -1683,6 +1706,27 @@ SCREENS.stationEdit = (arg)=>{
         <input id="s_wt" inputmode="decimal" value="${esc(g('water_temp'))}">
       </div>
       <div class="card">
+        <h3 style="margin-top:0">時刻</h3>
+        <div class="row">
+          <div class="grow">
+            <label>開始</label>
+            <input id="s_t1" type="time" value="${esc(g('survey_time_start'))}">
+          </div>
+          <button class="btn sm" style="width:auto;margin:0;align-self:flex-end"
+            onclick="nowInto('#s_t1')">いま</button>
+        </div>
+        <div class="row">
+          <div class="grow">
+            <label>終了</label>
+            <input id="s_t2" type="time" value="${esc(g('survey_time_end'))}">
+          </div>
+          <button class="btn sm" style="width:auto;margin:0;align-self:flex-end"
+            onclick="nowInto('#s_t2')">いま</button>
+        </div>
+        <div class="warnbox">開始の時刻は必ず入れてください。
+          空だと、取り込み側が別々の瀬淵を1つの箇所にまとめてしまいます。</div>
+      </div>
+      <div class="card">
         <h3>川底と流れ（分かる範囲で）</h3>
         <label>河床材料（いちばん多いもの）</label>
         ${segHtml('sub1', OPT.substrate, g('substrate1'), true)}
@@ -1698,16 +1742,22 @@ SCREENS.stationEdit = (arg)=>{
         <textarea id="s_memo">${esc(g('memo'))}</textarea>
       </div>
       <button class="btn pri" onclick="saveStation('${svUuid}','${arg.uuid||''}')">
-        ${isNew?'この箇所をはじめる':'保存する'}</button>
+        ${isNew ? (isLiveNow(sv) ? 'この箇所をはじめる' : 'この箇所を追加する') : '保存する'}</button>
       ${isNew?'':`<button class="btn ng" onclick="deleteStation('${arg.uuid}')">この箇所を削除する</button>`}
     `,
     onMount(){
+      // いま現場にいるなら、開始の時刻をあらかじめ入れておく
+      if(isNew && isLiveNow(sv)){
+        const el = $('#s_t1');
+        if(el && !el.value) el.value = timeValue();
+      }
       const key = 'station:'+(arg.uuid || ('new:'+svUuid));
       const base = collectStation();    // 書きかけを戻す前の姿を控える
       const d = draftGet(key);
       if(d){
         applyVals({'#s_name':d.name, '#s_wt':d.water_temp, '#s_depth':d.depth_rep_cm,
-          '#s_vel':d.velocity_rep_cms, '#s_memo':d.memo});
+          '#s_vel':d.velocity_rep_cms, '#s_memo':d.memo,
+          '#s_t1':d.survey_time_start, '#s_t2':d.survey_time_end});
         applySeg('habitat', d.habitat_type); applySeg('svtype2', d.survey_type);
         applySeg('sub1', d.substrate1); applySeg('gravel', d.gravel_condition);
         applySegMulti('method', d.survey_method);
@@ -1720,6 +1770,7 @@ SCREENS.stationEdit = (arg)=>{
 function collectStation(){
   return {
     name: strVal('#s_name'), habitat_type: segVal('habitat'),
+    survey_time_start: strVal('#s_t1'), survey_time_end: strVal('#s_t2'),
     survey_type: segVal('svtype2'), survey_method: segMultiVal('method'),
     water_temp: strVal('#s_wt'), substrate1: segVal('sub1'),
     gravel_condition: segVal('gravel'), depth_rep_cm: strVal('#s_depth'),
@@ -1727,14 +1778,28 @@ function collectStation(){
   };
 }
 
+function nowInto(sel){
+  const el = $(sel);
+  if(!el) return;
+  el.value = timeValue();
+  draftTouch();
+  toast('いまの時刻を入れました');
+}
 function saveStation(svUuid, stUuid){
   const isNew = !stUuid;
+  const sv = DB.getAlive(DB.key.sv, svUuid);
   const rec = isNew
     ? {uuid:uuid(), survey_uuid:svUuid, station_no: DB.stationsOf(svUuid).length+1,
-       started_at:nowISO(), survey_time_start:timeValue(), env_points:[]}
+       started_at:nowISO(), env_points:[]}
     : (DB.get(DB.key.st, stUuid)||{uuid:stUuid, survey_uuid:svUuid});
   const f = collectStation();
   rec.name              = f.name || ('St.'+(rec.station_no||1));
+  rec.survey_time_start = f.survey_time_start;
+  rec.survey_time_end   = f.survey_time_end;
+  // いま現場にいる調査で、開始の時刻が空のままなら、いまの時刻を入れる。
+  // 調査日が今日でないときは入れない（あとから書き起こしている最中なので、
+  // 今の時刻を入れると実際の調査時刻と食い違う）
+  if(isNew && !rec.survey_time_start && isLiveNow(sv)) rec.survey_time_start = timeValue();
   rec.habitat_type      = f.habitat_type;
   rec.survey_type       = f.survey_type || '採取';
   rec.survey_method     = f.survey_method;
@@ -1783,13 +1848,16 @@ SCREENS.station = (stUuid)=>{
     title: st.name || '箇所',
     sub:[{text:sv?sv.river_name||'':''}, {text:st.habitat_type||'区分なし'},
          {text:`${cs.length}種 ${stationTotal(st)}尾`},
-         st.ended_at ? {text:'終了'} : {text:'記録中', cls:'ok'}],
+         (sv && isLiveNow(sv) && !st.ended_at) ? {text:'記録中', cls:'ok'}
+           : (st.ended_at ? {text:'終了'} : null)].filter(Boolean),
     html:`
-      ${st.ended_at ? '' : `<button class="btn pri" onclick="nav('speciesPick','${stUuid}')">魚を記録する</button>`}
+      <button class="btn pri" onclick="nav('speciesPick','${stUuid}')">魚を記録する</button>
       <div class="card">
         <div class="row">
           <div class="grow"><div class="dim small">時刻</div>
-            <div>${esc(st.survey_time_start||'--:--')} 〜 ${esc(st.survey_time_end||'（記録中）')}</div></div>
+            <div>${st.survey_time_start
+              ? esc(st.survey_time_start)+' 〜 '+esc(st.survey_time_end||'（未入力）')
+              : '<span class="pill ng">未入力</span>'}</div></div>
           <div class="grow"><div class="dim small">調査方法</div>
             <div>${(st.survey_method||[]).map(m=>`<span class="chip">${esc(m)}</span>`).join('')||'<span class="dim">—</span>'}</div></div>
         </div>
@@ -1856,9 +1924,10 @@ SCREENS.station = (stUuid)=>{
        : '<div class="card dim">まだ記録がありません。</div>'}
 
       <div class="hr"></div>
-      ${st.ended_at
-        ? `<button class="btn" onclick="reopenStation('${stUuid}')">この箇所を再開する</button>`
-        : `<button class="btn ok" onclick="endStation('${stUuid}')">この箇所を終える</button>`}
+      ${(!sv || !isLiveNow(sv)) ? ''
+        : (st.ended_at
+          ? `<button class="btn" onclick="reopenStation('${stUuid}')">この箇所を再開する</button>`
+          : `<button class="btn ok" onclick="endStation('${stUuid}')">この箇所を終える</button>`)}
       <button class="btn" onclick="nav('stationEdit',{uuid:'${stUuid}'})">箇所の設定</button>
     `,
     onMount(){
@@ -1899,17 +1968,20 @@ function saveEffort(stUuid){
 }
 function endStation(u){
   const st = DB.get(DB.key.st, u); if(!st) return;
+  const sv = DB.getAlive(DB.key.sv, st.survey_uuid);
   if(effortRunning(st)){          // 押しっぱなしのまま終わらせない
     st.effort_seconds = Math.round(effortSeconds(st));
     delete st.effort_started_at;
   }
   st.ended_at = nowISO();
-  st.survey_time_end = timeValue();
+  // 終了の時刻は、いま現場にいるときだけ自動で入れる。
+  // あとから書き起こしているときは、手で入れた時刻を上書きしない
+  if(isLiveNow(sv) && !st.survey_time_end) st.survey_time_end = timeValue();
   if(DB.upsert(DB.key.st, st)){ toast('箇所を終えました'); goTo('survey', st.survey_uuid); }
 }
 function reopenStation(u){
   const st = DB.get(DB.key.st, u); if(!st) return;
-  delete st.ended_at; st.survey_time_end='';
+  delete st.ended_at;   // 入れた終了時刻は消さない（手で入れたものかもしれない）
   if(DB.upsert(DB.key.st, st)){ render(); }
 }
 
