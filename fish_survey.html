@@ -117,7 +117,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v10';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v11';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -938,15 +938,19 @@ function render(){
 
 /* ---------- 折りたたみ ----------
    開いているかどうかは端末ごとに覚える（記録ではないので門を通さない） */
-function foldOpen(key){ const f = prefs().fold || {}; return !!f[key]; }
+/* まだ一度も開け閉めしていなければ、既定（defOpen）に従う */
+function foldOpen(key, defOpen){
+  const f = prefs().fold || {};
+  return (key in f) ? !!f[key] : !!defOpen;
+}
 function foldSet(key, open){
   const f = Object.assign({}, prefs().fold || {});
   f[key] = !!open;
   prefSet('fold', f);
 }
 /* head は summary の中に出す（たたんでいても見える）。inner が中身 */
-function foldHtml(key, title, head, inner){
-  return `<details class="fold card" ${foldOpen(key)?'open':''}
+function foldHtml(key, title, head, inner, defOpen){
+  return `<details class="fold card" data-fold="${esc(key)}" ${foldOpen(key, defOpen)?'open':''}
       ontoggle="foldSet('${esc(key)}', this.open)">
     <summary><span class="ftitle">${esc(title)}</span>${head||''}</summary>
     <div class="fbody">${inner}</div>
@@ -2115,7 +2119,13 @@ SCREENS.station = (stUuid)=>{
            : (st.ended_at && !isDetail(sv) ? {text:'終了'} : null)].filter(Boolean),
     html:`
       <button class="btn pri" onclick="nav('speciesPick','${stUuid}')">魚を記録する</button>
-      <div class="card">
+      ${foldHtml('stinfo', `この${W}のこと`, `
+        <span class="fsub">${st.survey_time_start
+          ? esc(st.survey_time_start) : '<span class="pill ng">時刻なし</span>'}${
+          detail
+            ? (numOf(st.latitude)==='' ? '　<span class="pill ng">位置なし</span>'
+                                       : '　±'+fmtNum(numOf(st.gps_accuracy),0)+'m')
+            : (numOf(st.water_temp)==='' ? '' : '　'+fmtNum(numOf(st.water_temp),1)+'℃')}</span>`, `
         <div class="row">
           <div class="grow"><div class="dim small">時刻</div>
             <div>${st.survey_time_start
@@ -2141,7 +2151,8 @@ SCREENS.station = (stUuid)=>{
           <div class="grow"><div class="dim small">流速</div>
             <div>${vel.rep===''?'—':fmtNum(vel.rep,1)} cm/s</div></div>
         </div>
-      </div>
+        <button class="btn sm" onclick="nav('stationEdit',{uuid:'${stUuid}'})">${W}の設定を開く</button>`,
+        !detail)}
 
       ${detail ? '' : foldHtml('effort', 'とった労力', `
         <span class="fsub">通電 <b id="effClock">${esc(fmtDur(effortSeconds(st)))}</b></span>
@@ -2185,7 +2196,8 @@ SCREENS.station = (stUuid)=>{
         </div>
         <button class="btn" onclick="saveEffort('${stUuid}')">労力を保存する</button>`)}
 
-      <div class="card tap" onclick="nav('env','${stUuid}')">
+      <div class="card tap" onclick="nav('env','${stUuid}')"
+        ${detail ? 'style="opacity:.85"' : ''}>
         <div class="row">
           <div class="grow">
             <div style="font-weight:700">川の環境を${detail?'詳しく記録する':'記録する'}</div>
@@ -2198,7 +2210,7 @@ SCREENS.station = (stUuid)=>{
         </div>
       </div>
 
-      <h3>この箇所で記録した魚</h3>
+      <h3>この${W}で記録した魚</h3>
       ${cs.length ? `<div class="card" style="padding:4px 12px">
         <table><thead><tr><th>魚種</th><th class="num">尾数</th>
           <th class="num">体長cm</th><th>同定</th></tr></thead>
