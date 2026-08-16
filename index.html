@@ -106,7 +106,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v3';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v4';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1205,7 +1205,21 @@ SCREENS.home = ()=>{
       <button class="btn pri" onclick="nav('surveyEdit',null)">新しい調査をはじめる</button>
       ${list.length ? cards : '<div class="card dim">まだ調査がありません。上のボタンから作ってください。</div>'}
       <div class="hr"></div>
-      <div class="dim small">版 ${esc(APP_VERSION)}　魚種リスト ${SPECIES_STAMP.n}種</div>
+      <div class="card">
+        <div class="row">
+          <div class="grow">
+            <div class="dim small">この端末に入っている版</div>
+            <div style="font-weight:700">${esc(APP_VERSION)}
+              <span class="dim small">魚種リスト ${SPECIES_STAMP.n}種</span></div>
+          </div>
+          <button class="btn sm" style="width:auto;margin:0"
+            onclick="checkUpdate()">新しい版があるか見る</button>
+        </div>
+        <div id="updInfo" class="dim small" style="margin-top:6px"></div>
+        <button class="btn sm" onclick="forceUpdate()">最新に更新する</button>
+        <div class="dim small">記録した調査と、圏外用に落とした地図は消えません。
+          電波の届くところで行ってください。</div>
+      </div>
     `};
 };
 
@@ -2167,6 +2181,75 @@ function exportDbCsv(svUuid){
   }
   toast(`${r.rows.length}行を書き出しました`);
   render();
+}
+
+/* ============================================================
+   アプリを最新にする
+   記録（調査・箇所・魚）と、圏外用に落とした地図は消さない。
+   消すのはアプリのプログラムと、地図を動かして自然に溜まった分だけ。
+   ============================================================ */
+/* 消してよい保管場所の名前を返す。
+   - fish-map-pack-*（自分で範囲を囲って落とした地図）は消さない。
+     利用者がわざわざ落としたもので、アプリの更新とは関係がない
+   - 鳥（bird-）や産卵床（redd-）のものは、当然さわらない */
+function cachesToClear(keys){
+  return (keys||[]).filter(k =>
+    k.startsWith('fish-survey-') || k.startsWith('fish-map-tiles-'));
+}
+
+/* いま配信されている版を見に行く（読むだけ。何も消さない） */
+function checkLatestVersion(){
+  return fetch('./fish_survey.html', {cache:'no-store'})
+    .then(r=>{
+      if(!r.ok) throw new Error('取りに行けませんでした（'+r.status+'）');
+      return r.text();
+    })
+    .then(t=>{
+      const m = t.match(/const APP_VERSION = '([^']*)'/);
+      if(!m) throw new Error('版が読み取れませんでした');
+      return m[1];
+    });
+}
+
+function checkUpdate(){
+  const box = $('#updInfo');
+  if(box) box.textContent = '調べています…';
+  checkLatestVersion().then(latest=>{
+    if(!box) return;
+    box.textContent = latest === APP_VERSION
+      ? `最新です（${APP_VERSION}）`
+      : `新しい版があります：${latest}（いまは ${APP_VERSION}）。下のボタンで取り込めます`;
+  }).catch(e=>{
+    if(box) box.textContent = '調べられませんでした：' + e.message
+      + '（電波の届くところでお試しください）';
+  });
+}
+
+function forceUpdate(){
+  // 出し入れの途中なら、聞くまでもなく止める
+  if(typeof packLocked==='function' && packLocked()){
+    toast('圏外用の地図の出し入れが終わっていません。終わってからお試しください', 8000);
+    return;
+  }
+  if(!confirm('アプリのプログラムだけを最新に読み込み直します。\n\n'
+    + '・記録した調査・箇所・魚はそのまま残ります\n'
+    + '・圏外用に落とした地図もそのまま残ります\n'
+    + '・電波の届くところで行ってください\n\nよろしいですか？')) return;
+
+  toast('最新に読み込み直しています…', 8000);
+  const reload = ()=>location.reload();
+  const tasks = [];
+  // このアプリのものだけを対象にする（同じ場所の別アプリを壊さない）
+  if('serviceWorker' in navigator){
+    tasks.push(navigator.serviceWorker.getRegistration()
+      .then(r=>r ? r.unregister() : null).catch(()=>{}));
+  }
+  if(window.caches){
+    tasks.push(caches.keys()
+      .then(ks=>Promise.all(cachesToClear(ks).map(k=>caches.delete(k))))
+      .catch(()=>{}));
+  }
+  Promise.all(tasks).then(reload, reload);
 }
 
 /* ============================================================
