@@ -106,7 +106,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v6';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v7';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -575,7 +575,12 @@ const OPT = {
   substrate:   ['砂泥','小礫','中礫','大礫','巨礫','岩盤','コンクリート'],
   gravel:      ['浮き石','はまり石','沈み石'],
   confidence:  ['確実','推定','要確認'],
+  // 岸のカバー。QFieldテンプレートの Cover_list
+  cover:       ['岸際植生（樹木）','岸際植生（草本）','水中植生（沈水）','倒木','岩',
+                'アンダーカット','落差工・堰','なし'],
 };
+/* 河床材料は7区分。番号はデータベースの substrate_pct_1〜7 に対応する */
+const SUBSTRATE_NO = {'砂泥':1,'小礫':2,'中礫':3,'大礫':4,'巨礫':5,'岩盤':6,'コンクリート':7};
 const SUBSTRATE_NOTE = {
   '砂泥':'2mm未満','小礫':'2〜16mm','中礫':'16〜64mm','大礫':'64〜250mm',
   '巨礫':'250mm以上','岩盤':'','コンクリート':'',
@@ -620,6 +625,61 @@ function indsOf(inds, catchUuid){
 }
 function stationTotal(st){ return DB.catchesOf(st.uuid).reduce((a,c)=>a+catchTotal(c), 0); }
 function surveyTotal(sv){ return DB.catchesOfSurvey(sv.uuid).reduce((a,c)=>a+catchTotal(c), 0); }
+
+/* ============================================================
+   川の環境（測点・河床材の割合・岸のカバー）
+   ============================================================ */
+function envPoints(st){ return (st && Array.isArray(st.env_points)) ? st.env_points : []; }
+
+/* 測点から最小・最大・平均を出す。代表値は手入力があればそちら。
+   0 を落とさないよう nums() を通す（淵の流速0・干出部の水深0は測った値） */
+function pointStats(st, field, manualField){
+  const v = nums(envPoints(st).map(p=>p[field]));
+  const manual = numOf(st[manualField]);
+  const avg = v.length ? v.reduce((a,b)=>a+b,0)/v.length : '';
+  return {
+    n: v.length,
+    min: v.length ? Math.min.apply(null,v) : '',
+    max: v.length ? Math.max.apply(null,v) : '',
+    avg, manual,
+    rep: manual!=='' ? manual : avg,
+  };
+}
+function depthStats(st){ return pointStats(st, 'depth_cm', 'depth_rep_cm'); }
+function velocityStats(st){ return pointStats(st, 'velocity_cms', 'velocity_rep_cms'); }
+
+/* 河床材の割合（7区分） */
+function substratePct(st){
+  const o = st && st.substrate_pct;
+  return (o && typeof o === 'object') ? o : {};
+}
+function substratePctSum(st){
+  const p = substratePct(st);
+  return OPT.substrate.reduce((a,k)=>{ const v=numOf(p[k]); return a + (v===''?0:v); }, 0);
+}
+/* 割合の多い順。優占・次優占を出すのに使う */
+function substrateRank(st){
+  const p = substratePct(st);
+  return OPT.substrate
+    .map(k=>({name:k, pct: numOf(p[k])===''?0:numOf(p[k])}))
+    .filter(x=>x.pct>0)
+    .sort((a,b)=>b.pct-a.pct);
+}
+
+/* 岸のカバー。side は 'left' か 'right' */
+function coverList(st, side){
+  const a = st && st['cover_'+side];
+  return Array.isArray(a) ? a.filter(x=>x && x.type) : [];
+}
+function coverPctSum(st, side){
+  return coverList(st, side).reduce((a,c)=>{ const v=numOf(c.pct); return a+(v===''?0:v); }, 0);
+}
+/* カバーがあるか。「なし」だけならカバー無し */
+function coverPresent(st, side){
+  const list = coverList(st, side);
+  if(!list.length) return '';
+  return list.some(c=>c.type && c.type!=='なし') ? 'あり' : 'なし';
+}
 
 /* ============================================================
    とった労力（通電秒数・歩いた距離・調べた面積）
@@ -868,6 +928,14 @@ function segVal(field){
   const on = document.querySelector(`[data-seg="${field}"] button.on`);
   if(!on) return '';
   return on.textContent==='なし' ? '' : on.textContent;
+}
+/* 選んだ文字をそのまま返す。
+   segVal は「なし」を空欄の合図として空文字に読み替えるが、
+   岸のカバーは正本の一覧に「なし」という選択肢が実在する。
+   読み替えると、選んだ「なし」が消えてしまう（2026-08-16 に実際に起きた） */
+function segRaw(field){
+  const on = document.querySelector(`[data-seg="${field}"] button.on`);
+  return on ? on.textContent : '';
 }
 function pickSegMulti(btn){ btn.classList.toggle('on'); draftTouch(); }
 function segMultiHtml(field, options, current){
@@ -1253,8 +1321,9 @@ function dbRowOf(sv, st, c, inds){
     '緯度': fixCoord(sv.latitude), '経度': fixCoord(sv.longitude),
     '調査日':sv.survey_date||'', '季節':sv.season||'', '天気':sv.weather||'',
     '水温': numOf(st.water_temp),
-    '水深': cmToM(st.depth_rep_cm),
-    '流速': cmToM(st.velocity_rep_cms),
+    // 代表値は「手入力があればそれ、無ければ測点の平均」
+    '水深': cmToM(depthStats(st).rep),
+    '流速': cmToM(velocityStats(st).rep),
     '河川名':sv.river_name||'', '地点名':sv.site_name||'', '区間名':sv.section_name||'',
     '河川形態A':sv.river_morphology_a||'', '河川形態B':st.river_morphology_b||'',
     '河床材料':st.substrate1||'', '礫の状況':st.gravel_condition||'',
@@ -1296,12 +1365,36 @@ function buildIndRows(sv, snap){
   return rows;
 }
 
+/* 測点ごと（1行＝1測点） */
+const FS_POINT_COLS = ['調査日','河川名','地点名','箇所','測点番号',
+  '水深cm','流速cms','河床材料','備考','調査ID','箇所ID'];
+function buildPointRows(sv, snap){
+  const rows = [];
+  snap.st.filter(x=>x.survey_uuid===sv.uuid)
+    .sort((a,b)=>(a.station_no||0)-(b.station_no||0))
+    .forEach(st=>{
+      envPoints(st).forEach((pt,i)=>{
+        rows.push({
+          '調査日':sv.survey_date||'', '河川名':sv.river_name||'', '地点名':sv.site_name||'',
+          '箇所':st.name||'', '測点番号': i+1,
+          '水深cm': numOf(pt.depth_cm), '流速cms': numOf(pt.velocity_cms),
+          '河床材料': pt.substrate||'', '備考': pt.note||'',
+          '調査ID':sv.uuid, '箇所ID':st.uuid,
+        });
+      });
+    });
+  return rows;
+}
+
 /* 箇所ごと（1行＝1箇所） */
 function buildStationRows(sv, snap){
   const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid)
     .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
   return stations.map(st=>{
     const len = stationLengths(st), area = stationAreas(st);
+    const d = depthStats(st), v = velocityStats(st);
+    const pct = substratePct(st);
+    const L = coverList(st,'left'), R = coverList(st,'right');
     const cs = snap.ca.filter(c=>c.station_uuid===st.uuid);
     const n = cs.reduce((a,c)=>a+catchTotal(c, snap), 0);
     const cp = {
@@ -1315,8 +1408,26 @@ function buildStationRows(sv, snap){
       '調査区分':st.survey_type||'', '調査方法':(st.survey_method||[]).join(','),
       '開始時刻':st.survey_time_start||'', '終了時刻':st.survey_time_end||'',
       '水温': numOf(st.water_temp),
-      '代表水深cm': numOf(st.depth_rep_cm), '代表流速cms': numOf(st.velocity_rep_cms),
-      '河床材料':st.substrate1||'', '礫の状況':st.gravel_condition||'',
+      '測点数': d.n,
+      '水深_最小cm': round1(d.min), '水深_最大cm': round1(d.max),
+      '水深_平均cm': round1(d.avg), '水深_代表cm': round1(d.rep),
+      '流速_最小cms': round1(v.min), '流速_最大cms': round1(v.max),
+      '流速_平均cms': round1(v.avg), '流速_代表cms': round1(v.rep),
+      '河床材_砂泥%': numOf(pct['砂泥']), '河床材_小礫%': numOf(pct['小礫']),
+      '河床材_中礫%': numOf(pct['中礫']), '河床材_大礫%': numOf(pct['大礫']),
+      '河床材_巨礫%': numOf(pct['巨礫']), '河床材_岩盤%': numOf(pct['岩盤']),
+      '河床材_コンクリート%': numOf(pct['コンクリート']),
+      '河床材_割合合計%': round1(substratePctSum(st)),
+      '左岸カバー1': (L[0]||{}).type||'', '左岸カバー割合1%': numOf((L[0]||{}).pct),
+      '左岸カバー2': (L[1]||{}).type||'', '左岸カバー割合2%': numOf((L[1]||{}).pct),
+      '左岸カバー3': (L[2]||{}).type||'', '左岸カバー割合3%': numOf((L[2]||{}).pct),
+      '左岸カバー長m': numOf(st.cover_left_length_m), '左岸カバーあり': coverPresent(st,'left'),
+      '右岸カバー1': (R[0]||{}).type||'', '右岸カバー割合1%': numOf((R[0]||{}).pct),
+      '右岸カバー2': (R[1]||{}).type||'', '右岸カバー割合2%': numOf((R[1]||{}).pct),
+      '右岸カバー3': (R[2]||{}).type||'', '右岸カバー割合3%': numOf((R[2]||{}).pct),
+      '右岸カバー長m': numOf(st.cover_right_length_m), '右岸カバーあり': coverPresent(st,'right'),
+      '河床材料':st.substrate1||'', '次に多い河床材料':st.substrate2||'',
+      '礫の状況':st.gravel_condition||'',
       '通電秒数': Math.round(effortSeconds(st)),
       '通電回数': numOf(st.effort_passes),
       '川幅m': numOf(st.width_m),
@@ -1379,7 +1490,16 @@ const FS_IND_COLS = ['調査日','河川名','地点名','箇所','種ID','種�
 
 const FS_STATION_COLS = ['調査日','河川名','地点名','箇所','環境区分','河川形態B',
   '調査区分','調査方法','開始時刻','終了時刻','水温',
-  '代表水深cm','代表流速cms','河床材料','礫の状況',
+  '測点数',
+  '水深_最小cm','水深_最大cm','水深_平均cm','水深_代表cm',
+  '流速_最小cms','流速_最大cms','流速_平均cms','流速_代表cms',
+  '河床材_砂泥%','河床材_小礫%','河床材_中礫%','河床材_大礫%',
+  '河床材_巨礫%','河床材_岩盤%','河床材_コンクリート%','河床材_割合合計%',
+  '左岸カバー1','左岸カバー割合1%','左岸カバー2','左岸カバー割合2%',
+  '左岸カバー3','左岸カバー割合3%','左岸カバー長m','左岸カバーあり',
+  '右岸カバー1','右岸カバー割合1%','右岸カバー2','右岸カバー割合2%',
+  '右岸カバー3','右岸カバー割合3%','右岸カバー長m','右岸カバーあり',
+  '河床材料','次に多い河床材料','礫の状況',
   '通電秒数','通電回数','川幅m',
   '距離_軌跡m','距離_直線m','距離_手入力m','距離_使う値m',
   '面積_計算m2','面積_手入力m2','面積_使う値m2',
@@ -1395,7 +1515,7 @@ const FS_SURVEY_COLS = ['調査日','季節','天気','河川名','地点名','�
 
 /* 書き出しでデータベースの31列CSVに乗らない項目。書き出し画面に必ず出す */
 const NOT_IN_DB_CSV = ['通電秒数','調査面積','調査距離','左右岸のカバー',
-  '測点ごとの水深・流速','1尾ずつの体長','写真','GPSの精度','調査者'];
+  '河床材料の割合','測点ごとの水深・流速','1尾ずつの体長','写真','GPSの精度','調査者'];
 
 /* ============================================================
    画面
@@ -1649,6 +1769,7 @@ SCREENS.survey = (svUuid)=>{
       ${stations.length ? stCards : '<div class="card dim">まだ箇所がありません。</div>'}
 
       <div class="hr"></div>
+      <button class="btn" onclick="nav('notes','${svUuid}')">メモ（${DB.notesOf(svUuid).length}件）</button>
       <button class="btn" onclick="nav('map','${svUuid}')">地図で見る</button>
       <button class="btn" onclick="nav('exportHub','${svUuid}')">書き出す</button>
       <button class="btn" onclick="nav('surveyEdit','${svUuid}')">調査の設定</button>
@@ -1733,11 +1854,8 @@ SCREENS.stationEdit = (arg)=>{
         <div class="dim small">${OPT.substrate.map(s=>SUBSTRATE_NOTE[s]?`${s}=${SUBSTRATE_NOTE[s]}`:'').filter(Boolean).join('　')}</div>
         <label>礫の状況</label>
         ${segHtml('gravel', OPT.gravel, g('gravel_condition'), true)}
-        <label>代表の水深（cm）</label>
-        <input id="s_depth" inputmode="decimal" value="${esc(g('depth_rep_cm'))}">
-        <label>代表の流速（cm/s）</label>
-        <input id="s_vel" inputmode="decimal" value="${esc(g('velocity_rep_cms'))}">
-        <div class="dim small">書き出すときに m・m/s に直します。0 は「測って0だった」として残します。</div>
+        <div class="dim small">水深・流速・河床材の割合・岸のカバーは、
+          箇所の画面の「川の環境を記録する」から入れます。</div>
         <label>メモ</label>
         <textarea id="s_memo">${esc(g('memo'))}</textarea>
       </div>
@@ -1755,8 +1873,8 @@ SCREENS.stationEdit = (arg)=>{
       const base = collectStation();    // 書きかけを戻す前の姿を控える
       const d = draftGet(key);
       if(d){
-        applyVals({'#s_name':d.name, '#s_wt':d.water_temp, '#s_depth':d.depth_rep_cm,
-          '#s_vel':d.velocity_rep_cms, '#s_memo':d.memo,
+        applyVals({'#s_name':d.name, '#s_wt':d.water_temp,
+          '#s_memo':d.memo,
           '#s_t1':d.survey_time_start, '#s_t2':d.survey_time_end});
         applySeg('habitat', d.habitat_type); applySeg('svtype2', d.survey_type);
         applySeg('sub1', d.substrate1); applySeg('gravel', d.gravel_condition);
@@ -1773,8 +1891,7 @@ function collectStation(){
     survey_time_start: strVal('#s_t1'), survey_time_end: strVal('#s_t2'),
     survey_type: segVal('svtype2'), survey_method: segMultiVal('method'),
     water_temp: strVal('#s_wt'), substrate1: segVal('sub1'),
-    gravel_condition: segVal('gravel'), depth_rep_cm: strVal('#s_depth'),
-    velocity_rep_cms: strVal('#s_vel'), memo: strVal('#s_memo'),
+    gravel_condition: segVal('gravel'), memo: strVal('#s_memo'),
   };
 }
 
@@ -1806,8 +1923,6 @@ function saveStation(svUuid, stUuid){
   rec.water_temp        = numOf(f.water_temp);
   rec.substrate1        = f.substrate1;
   rec.gravel_condition  = f.gravel_condition;
-  rec.depth_rep_cm      = numOf(f.depth_rep_cm);
-  rec.velocity_rep_cms  = numOf(f.velocity_rep_cms);
   rec.memo              = f.memo;
   const ok = DB.upsert(DB.key.st, rec);
   if(!ok) return;                       // 保存できていないので書きかけを消さない
@@ -1834,6 +1949,7 @@ SCREENS.station = (stUuid)=>{
   const sv = DB.get(DB.key.sv, st.survey_uuid);
   const cs = DB.catchesOf(stUuid);
   const len = stationLengths(st), area = stationAreas(st), cp = cpue(st);
+  const dep = depthStats(st), vel = velocityStats(st);
   const rows = cs.map(c=>{
     const ls = catchLengths(c);
     return `<tr onclick="nav('catchEdit',{uuid:'${c.uuid}'})" style="cursor:pointer">
@@ -1864,8 +1980,10 @@ SCREENS.station = (stUuid)=>{
         <div class="hr"></div>
         <div class="row">
           <div class="grow"><div class="dim small">水温</div><div>${fmtNum(numOf(st.water_temp))} ℃</div></div>
-          <div class="grow"><div class="dim small">水深</div><div>${fmtNum(numOf(st.depth_rep_cm))} cm</div></div>
-          <div class="grow"><div class="dim small">流速</div><div>${fmtNum(numOf(st.velocity_rep_cms))} cm/s</div></div>
+          <div class="grow"><div class="dim small">水深</div>
+            <div>${dep.rep===''?'—':fmtNum(dep.rep,1)} cm</div></div>
+          <div class="grow"><div class="dim small">流速</div>
+            <div>${vel.rep===''?'—':fmtNum(vel.rep,1)} cm/s</div></div>
         </div>
       </div>
 
@@ -1914,6 +2032,19 @@ SCREENS.station = (stUuid)=>{
             <div>${cp.per100m2===''?'—':esc(fmtNum(cp.per100m2,1))+' 尾'}</div></div>
         </div>
         <button class="btn" onclick="saveEffort('${stUuid}')">労力を保存する</button>
+      </div>
+
+      <div class="card tap" onclick="nav('env','${stUuid}')">
+        <div class="row">
+          <div class="grow">
+            <div style="font-weight:700">川の環境を記録する</div>
+            <div class="dim small">測点 ${envPoints(st).length}点
+              水深 ${dep.rep===''?'—':fmtNum(dep.rep,1)+'cm'}
+              流速 ${vel.rep===''?'—':fmtNum(vel.rep,1)+'cm/s'}
+              河床材 ${esc(st.substrate1||'—')}
+              カバー 左${coverPresent(st,'left')||'—'}／右${coverPresent(st,'right')||'—'}</div>
+          </div>
+        </div>
       </div>
 
       <h3>この箇所で記録した魚</h3>
@@ -2153,6 +2284,232 @@ function deleteCatch(u){
   if(!confirm('この記録を削除します。よろしいですか？')) return;
   const c = DB.get(DB.key.ca, u);
   if(DB.softDelete(DB.key.ca, u)){ toast('削除しました'); goTo('station', c?c.station_uuid:null); }
+}
+
+/* ---------- 川の環境（測点・河床材の割合・岸のカバー） ---------- */
+SCREENS.env = (stUuid)=>{
+  const st = DB.liveStation(stUuid);
+  if(!st) return null;
+  const pts = envPoints(st);
+  const d = depthStats(st), v = velocityStats(st);
+  const pct = substratePct(st);
+  const sum = substratePctSum(st);
+  const rank = substrateRank(st);
+
+  const ptRows = pts.map((pt,i)=>`<tr>
+      <td class="num dim">${i+1}</td>
+      <td class="num">${numOf(pt.depth_cm)===''?'—':fmtNum(numOf(pt.depth_cm),1)}</td>
+      <td class="num">${numOf(pt.velocity_cms)===''?'—':fmtNum(numOf(pt.velocity_cms),1)}</td>
+      <td class="dim small">${esc(pt.substrate||'')}</td>
+      <td style="text-align:right"><button class="btn sm ng" style="width:auto;margin:0;padding:4px 10px"
+        onclick="delEnvPoint('${stUuid}',${i})">消す</button></td>
+    </tr>`).reverse().join('');
+
+  const coverBlock = (side, label)=>{
+    const list = coverList(st, side);
+    // 8種類×3枠×左右でボタンを並べると、スマホでは押しにくい。
+    // 「なし」は正本の一覧にある選択肢なので、空欄は別に用意する
+    const rows = [0,1,2].map(i=>{
+      const c = list[i] || {};
+      const opts = ['<option value="">（選ばない）</option>'].concat(
+        OPT.cover.map(o=>`<option value="${esc(o)}"${o===c.type?' selected':''}>${esc(o)}</option>`)
+      ).join('');
+      return `<div class="row" style="margin-top:8px">
+        <div class="grow">
+          <select id="cv_${side}_${i}_t">${opts}</select>
+        </div>
+        <div style="width:92px">
+          <input id="cv_${side}_${i}" inputmode="decimal" placeholder="割合%"
+            value="${esc(c.pct!==undefined?c.pct:'')}">
+        </div>
+      </div>`;
+    }).join('');
+    return `<div class="card">
+      <h3 style="margin-top:0">${label}のカバー</h3>
+      <div class="dim small">種類と、その岸に占める割合（%）を3つまで。</div>
+      ${rows}
+      <label>カバーの長さ（m）</label>
+      <input id="cv_${side}_len" inputmode="decimal"
+        value="${esc(st['cover_'+side+'_length_m']!==undefined?st['cover_'+side+'_length_m']:'')}">
+      <div class="dim small">いまの合計 ${fmtNum(coverPctSum(st,side),0)}%　／
+        カバー：${coverPresent(st,side)||'—'}</div>
+    </div>`;
+  };
+
+  return {
+    title:'川の環境',
+    sub:[{text:st.name||''}, {text:`測点 ${pts.length}`}],
+    html:`
+      <div class="card">
+        <h3 style="margin-top:0">測点（水深・流速）</h3>
+        <div class="row">
+          <div class="grow"><label>水深（cm）</label>
+            <input id="p_d" inputmode="decimal" placeholder="例）35"
+              onkeydown="if(event.key==='Enter'){event.preventDefault();addEnvPoint('${stUuid}');}"></div>
+          <div class="grow"><label>流速（cm/s）</label>
+            <input id="p_v" inputmode="decimal" placeholder="例）48"
+              onkeydown="if(event.key==='Enter'){event.preventDefault();addEnvPoint('${stUuid}');}"></div>
+        </div>
+        <label>その場の河床材料</label>
+        ${segHtml('p_sub', OPT.substrate, '', true)}
+        <label>備考</label>
+        <input id="p_note" placeholder="任意">
+        <button class="btn pri" onclick="addEnvPoint('${stUuid}')">この測点を記録して次へ</button>
+        <div class="dim small">0 も「測って0だった」として残ります。水深と流速はどちらか片方でも構いません。</div>
+      </div>
+
+      ${pts.length ? `<div class="card" style="padding:4px 12px">
+        <table><thead><tr><th class="num">番号</th><th class="num">水深cm</th>
+          <th class="num">流速cm/s</th><th>河床材</th><th></th></tr></thead>
+        <tbody>${ptRows}</tbody></table></div>` : ''}
+
+      <div class="card">
+        <h3 style="margin-top:0">測点のまとめ</h3>
+        <table><tbody>
+          <tr><td class="dim">水深</td><td class="num">${d.n
+            ? `${fmtNum(d.min,1)} 〜 ${fmtNum(d.max,1)} cm（平均 ${fmtNum(d.avg,1)}）` : '—'}</td></tr>
+          <tr><td class="dim">流速</td><td class="num">${v.n
+            ? `${fmtNum(v.min,1)} 〜 ${fmtNum(v.max,1)} cm/s（平均 ${fmtNum(v.avg,1)}）` : '—'}</td></tr>
+          <tr><td style="font-weight:700">代表の水深</td>
+              <td class="num" style="font-weight:700">${d.rep===''?'—':fmtNum(d.rep,1)+' cm'}</td></tr>
+          <tr><td style="font-weight:700">代表の流速</td>
+              <td class="num" style="font-weight:700">${v.rep===''?'—':fmtNum(v.rep,1)+' cm/s'}</td></tr>
+        </tbody></table>
+        <div class="dim small">データベースへ渡すのは代表の値です。
+          手で入れればそちらを、入れなければ測点の平均を使います。</div>
+        <div class="row">
+          <div class="grow"><label>代表の水深を手で入れる（cm）</label>
+            <input id="e_drep" inputmode="decimal" value="${esc(st.depth_rep_cm!==undefined?st.depth_rep_cm:'')}"></div>
+          <div class="grow"><label>代表の流速を手で入れる（cm/s）</label>
+            <input id="e_vrep" inputmode="decimal" value="${esc(st.velocity_rep_cms!==undefined?st.velocity_rep_cms:'')}"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0">河床材料の割合</h3>
+        ${OPT.substrate.map(k=>`<div class="row" style="margin-top:4px">
+          <div class="grow dim">${esc(k)}${SUBSTRATE_NOTE[k]?` <span class="small">${SUBSTRATE_NOTE[k]}</span>`:''}</div>
+          <div style="width:90px"><input id="sp_${SUBSTRATE_NO[k]}" inputmode="decimal"
+            placeholder="%" value="${esc(pct[k]!==undefined?pct[k]:'')}"></div>
+        </div>`).join('')}
+        <div class="${Math.abs(sum-100)>0.5 && sum>0 ? 'warnbox':'dim small'}" style="margin-top:8px">
+          いまの合計 ${fmtNum(sum,0)}%${Math.abs(sum-100)>0.5 && sum>0
+            ? '　100%になっていません（このままでも保存はできます）' : ''}
+        </div>
+        <div class="dim small">いちばん多い：${rank[0]?esc(rank[0].name):'—'}
+          次に多い：${rank[1]?esc(rank[1].name):'—'}</div>
+        <div class="dim small">保存すると、この2つが「河床材料」「次に多い河床材料」に入ります。</div>
+      </div>
+
+      ${coverBlock('left','左岸')}
+      ${coverBlock('right','右岸')}
+
+      <button class="btn pri" onclick="saveEnv('${stUuid}')">環境を保存する</button>
+    `,
+    onMount(){ const el=$('#p_d'); if(el) el.focus(); }
+  };
+};
+
+function addEnvPoint(stUuid){
+  const st = DB.liveStation(stUuid); if(!st) return;
+  const d = numVal('#p_d'), v = numVal('#p_v');
+  if(d==='' && v===''){ toast('水深か流速のどちらかは入れてください'); return; }
+  if(d!=='' && d<0){ toast('水深は0以上で入れてください'); return; }
+  if(v!=='' && v<0){ toast('流速は0以上で入れてください'); return; }
+  const pts = envPoints(st).slice();
+  pts.push({depth_cm:d, velocity_cms:v, substrate:segVal('p_sub'), note:strVal('#p_note')});
+  st.env_points = pts;
+  if(!DB.upsert(DB.key.st, st)) return;      // 保存できていないので欄も消さない
+  toast(`${pts.length}点目`);
+  render();
+}
+function delEnvPoint(stUuid, i){
+  const st = DB.liveStation(stUuid); if(!st) return;
+  const pts = envPoints(st).slice();
+  if(i<0 || i>=pts.length) return;
+  if(!confirm(`${i+1}点目を消します。よろしいですか？`)) return;
+  pts.splice(i,1);
+  st.env_points = pts;
+  if(DB.upsert(DB.key.st, st)){ toast('消しました'); render(); }
+}
+function saveEnv(stUuid){
+  const st = DB.liveStation(stUuid); if(!st) return;
+  st.depth_rep_cm     = numVal('#e_drep');
+  st.velocity_rep_cms = numVal('#e_vrep');
+
+  const pct = {};
+  OPT.substrate.forEach(k=>{ pct[k] = numVal('#sp_'+SUBSTRATE_NO[k]); });
+  st.substrate_pct = pct;
+  // 割合を入れたなら、多い順の1位2位を優占・次優占にする
+  const rank = substrateRank({substrate_pct:pct});
+  if(rank.length){
+    st.substrate1 = rank[0].name;
+    st.substrate2 = rank[1] ? rank[1].name : '';
+  }
+
+  ['left','right'].forEach(side=>{
+    const list = [];
+    [0,1,2].forEach(i=>{
+      const type = strVal('#cv_'+side+'_'+i+'_t');
+      const p = numVal('#cv_'+side+'_'+i);
+      if(type) list.push({type, pct:p});
+    });
+    st['cover_'+side] = list;
+    st['cover_'+side+'_length_m'] = numVal('#cv_'+side+'_len');
+  });
+
+  if(DB.upsert(DB.key.st, st)){ toast('保存しました'); goBack(); }
+}
+
+/* ---------- 調査メモ ---------- */
+SCREENS.notes = (svUuid)=>{
+  const sv = DB.getAlive(DB.key.sv, svUuid);
+  if(!sv) return null;
+  const list = DB.notesOf(svUuid)
+    .sort((a,b)=>String(b.created_at||'').localeCompare(String(a.created_at||'')));
+  return {
+    title:'メモ',
+    sub:[{text:sv.river_name||''}, {text:`${list.length}件`}],
+    html:`
+      <button class="btn pri" onclick="nav('noteEdit',{survey:'${svUuid}'})">メモを追加する</button>
+      ${list.length ? list.map(n=>`<div class="card tap"
+        onclick="nav('noteEdit',{uuid:'${n.uuid}'})">
+        <div class="dim small">${esc(fmtTime(n.created_at))}</div>
+        <div>${esc((n.content||'').slice(0,120))}</div></div>`).join('')
+        : '<div class="card dim">まだメモがありません。</div>'}
+    `};
+};
+SCREENS.noteEdit = (arg)=>{
+  arg = arg||{};
+  const isNew = !arg.uuid;
+  const n = isNew ? {} : (DB.getAlive(DB.key.nt, arg.uuid)||null);
+  if(!isNew && !n) return null;
+  const svUuid = isNew ? arg.survey : n.survey_uuid;
+  if(!DB.getAlive(DB.key.sv, svUuid)) return null;
+  return {
+    title: isNew ? 'メモを追加' : 'メモ',
+    html:`
+      <div class="card">
+        <label>内容</label>
+        <textarea id="n_body" style="min-height:160px">${esc(n.content||'')}</textarea>
+      </div>
+      <button class="btn pri" onclick="saveNote('${svUuid}','${arg.uuid||''}')">保存する</button>
+      ${isNew?'':`<button class="btn ng" onclick="deleteNote('${arg.uuid}')">このメモを消す</button>`}
+    `,
+    onMount(){ const el=$('#n_body'); if(el && isNew) el.focus(); }
+  };
+};
+function saveNote(svUuid, uu){
+  const body = strVal('#n_body');
+  if(!body){ toast('内容を入れてください'); return; }
+  const rec = uu ? (DB.get(DB.key.nt, uu)||{uuid:uu}) : {uuid:uuid(), survey_uuid:svUuid};
+  rec.survey_uuid = rec.survey_uuid || svUuid;
+  rec.content = body;
+  if(DB.upsert(DB.key.nt, rec)){ toast('保存しました'); goBack(); }
+}
+function deleteNote(uu){
+  if(!confirm('このメモを消します。よろしいですか？')) return;
+  if(DB.softDelete(DB.key.nt, uu)){ toast('消しました'); goBack(); }
 }
 
 /* ---------- 1尾ずつ測る ---------- */
@@ -2616,10 +2973,11 @@ SCREENS.exportHub = (svUuid)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
   const r = buildDbRows(sv);
-  let extra = {ind:0, st:0};
+  let extra = {ind:0, st:0, pt:0};
   try{
     const snap = exportSnapshot();
-    extra = {ind: buildIndRows(sv, snap).length, st: buildStationRows(sv, snap).length};
+    extra = {ind: buildIndRows(sv, snap).length, st: buildStationRows(sv, snap).length,
+             pt: buildPointRows(sv, snap).length};
   }catch(e){}
   return {
     title:'書き出す',
@@ -2652,6 +3010,8 @@ SCREENS.exportHub = (svUuid)=>{
         <div class="row">
           <div class="grow"><div class="dim small">1尾ずつの体長</div>
             <div class="big">${extra.ind} 尾</div></div>
+          <div class="grow"><div class="dim small">測点</div>
+            <div class="big">${extra.pt} 点</div></div>
           <div class="grow"><div class="dim small">箇所</div>
             <div class="big">${extra.st} 件</div></div>
         </div>
@@ -2659,6 +3019,8 @@ SCREENS.exportHub = (svUuid)=>{
           いまはデータベースに取り込む口がないので、Excelで開いて使ってください。</div>
         <button class="btn" ${extra.ind?'':'disabled'}
           onclick="exportExtraCsv('${svUuid}','個体')">1尾ずつの体長を書き出す</button>
+        <button class="btn" ${extra.pt?'':'disabled'}
+          onclick="exportExtraCsv('${svUuid}','測点')">測点ごとの水深・流速を書き出す</button>
         <button class="btn" onclick="exportExtraCsv('${svUuid}','箇所')">箇所ごとの記録を書き出す</button>
         <button class="btn" onclick="exportExtraCsv('${svUuid}','調査')">調査のまとめを書き出す</button>
       </div>
@@ -2687,6 +3049,7 @@ function exportExtraCsv(svUuid, kind){
     '個体': [FS_IND_COLS,     buildIndRows(sv, snap)],
     '箇所': [FS_STATION_COLS, buildStationRows(sv, snap)],
     '調査': [FS_SURVEY_COLS,  buildSurveyRow(sv, snap)],
+    '測点': [FS_POINT_COLS,   buildPointRows(sv, snap)],
   }[kind];
   if(!table){ toast('書き出せません'); return; }
   const [cols, rows] = table;
