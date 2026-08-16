@@ -117,7 +117,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v11';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v12';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2280,23 +2280,27 @@ function reopenStation(u){
 }
 
 /* ---------- 魚種を選ぶ ---------- */
-SCREENS.speciesPick = (stUuid)=>{
+SCREENS.speciesPick = (arg)=>{
+  // 文字だけ渡されたら箇所のID。{station, then} なら、選んだあとの行き先つき
+  const stUuid = (arg && arg.station) ? arg.station : arg;
+  const then   = (arg && arg.then) ? arg.then : '';
   const st = DB.liveStation(stUuid);
   if(!st) return null;
   return {
-    title:'魚種を選ぶ',
+    title: then==='individuals' ? '測る魚種を選ぶ' : '魚種を選ぶ',
     sub:[{text:st.name||''}, {text:`${SPECIES.length}種`}],
     html:`
       <div class="card">
-        <input id="spq" placeholder="和名・科名・昔の呼び名で探す" oninput="renderSpeciesList('${stUuid}')" autocomplete="off">
+        <input id="spq" placeholder="和名・科名・昔の呼び名で探す"
+          oninput="renderSpeciesList('${stUuid}','${then}')" autocomplete="off">
         <div class="dim small" style="margin-top:6px">昔の呼び名（エゾイワナ・ヤマメなど）でも探せます。保存されるのは正式な種です。</div>
       </div>
       <div id="splist"></div>
     `,
-    onMount(){ renderSpeciesList(stUuid); const q=$('#spq'); if(q) q.focus(); }
+    onMount(){ renderSpeciesList(stUuid, then); const q=$('#spq'); if(q) q.focus(); }
   };
 };
-function renderSpeciesList(stUuid){
+function renderSpeciesList(stUuid, then){
   const q = strVal('#spq');
   const list = speciesSearch(q).slice(0, 200);
   const box = $('#splist'); if(!box) return;
@@ -2306,14 +2310,25 @@ function renderSpeciesList(stUuid){
   }
   box.innerHTML = `<div class="splist">` + list.map(s=>{
     const al = speciesAliasOf(s.id);
-    return `<div class="spitem" onclick="pickSpecies('${stUuid}','${s.id}')">
+    return `<div class="spitem" onclick="pickSpecies('${stUuid}','${s.id}','${then||''}')">
       ${esc(s.ja)}<span class="fam">${esc(s.fam||'')}</span>
       ${al.length?`<div class="dim small">別名：${esc(al.join('・'))}</div>`:''}
     </div>`;
   }).join('') + `</div>`;
 }
-function pickSpecies(stUuid, spId){
-  nav('catchEdit', {station:stUuid, species:spId});
+function pickSpecies(stUuid, spId, then){
+  if(then!=='individuals'){ nav('catchEdit', {station:stUuid, species:spId}); return; }
+  // 測りながら魚種を足すとき。すでにこの箇所にある種なら、そこへ戻るだけ
+  const found = DB.catchesOf(stUuid).find(c=>c.species_id===spId);
+  if(found){ navReplace('individuals', found.uuid); return; }
+  const st = DB.liveStation(stUuid); if(!st) return;
+  const sp = speciesById(spId);
+  const rec = {uuid:uuid(), survey_uuid:st.survey_uuid, station_uuid:stUuid,
+    recorded_at:nowISO(),
+    species_id:spId||'', species_name:sp?sp.ja:'', species_family:sp?sp.fam:'',
+    count_unmeasured:'', identification_confidence:'確実', notes:''};
+  if(!DB.upsert(DB.key.ca, rec)) return;
+  navReplace('individuals', rec.uuid);
 }
 
 /* ---------- 尾数を入れる ---------- */
@@ -2719,6 +2734,14 @@ SCREENS.individuals = (caUuid)=>{
   if(!st) return null;
   const list = DB.individualsOf(caUuid);
   const ls = nums(list.map(i=>i.total_length_cm));
+  // この箇所で記録した魚種を並べ、測りながら切り替えられるようにする
+  const mates = DB.catchesOf(c.station_uuid);
+  const tabs = mates.map(m=>{
+    const n = DB.individualsOf(m.uuid).length;
+    return `<button type="button" class="${m.uuid===caUuid?'on':''}"
+      onclick="switchMeasure('${m.uuid}')">${esc(m.species_name||'(種名なし)')}`
+      + `${n?` <span class="dim small">${n}</span>`:''}</button>`;
+  }).join('');
   const rows = list.map(i=>`<tr>
       <td class="num dim">${i.individual_number}</td>
       <td class="num" style="font-weight:700">${fmtNum(numOf(i.total_length_cm),1)}</td>
@@ -2732,6 +2755,12 @@ SCREENS.individuals = (caUuid)=>{
          ls.length?{text:`${Math.min.apply(null,ls)}〜${Math.max.apply(null,ls)}cm`}:null].filter(Boolean),
     html:`
       <div class="card">
+        <div class="dim small">測っている魚種</div>
+        <div class="seg" style="margin-top:6px">${tabs}
+          <button type="button" onclick="nav('speciesPick',{station:'${c.station_uuid}',then:'individuals'})"
+            >＋魚種</button></div>
+      </div>
+      <div class="card">
         <label>全長（cm）</label>
         <input id="i_tl" inputmode="decimal" placeholder="例）8.2"
           onkeydown="if(event.key==='Enter'){event.preventDefault();addIndividual('${caUuid}');}">
@@ -2741,6 +2770,17 @@ SCREENS.individuals = (caUuid)=>{
         <button class="btn pri" onclick="addIndividual('${caUuid}')">この1尾を記録して次へ</button>
         <div class="dim small">記録すると欄が空になります。前の魚の値は残しません。</div>
       </div>
+
+      ${foldHtml('bulk', 'まとめて入れる', '<span class="fsub">読み上げを聞きながら</span>', `
+        <div class="dim small">全長の数字を、空白・カンマ・改行で区切って並べてください。
+          尾叉長は入りません（必要なときは、上の1尾ずつの欄で入れてください）。</div>
+        <textarea id="i_bulk" style="min-height:110px" placeholder="8.2 9.1 7.6
+12.4 10.2 6.8" oninput="bulkHint()"></textarea>
+        <div class="dim small" id="i_bulkInfo">数字を空白・カンマ・改行で区切って並べてください。</div>
+        <button class="btn pri" id="i_bulkBtn" disabled
+          onclick="addIndividualsBulk('${caUuid}')">まとめて追加</button>
+        <div class="dim small">1つでも読めない値があれば、1尾も入れません。
+          途中まで入って分からなくなるのを避けるためです。</div>`)}
 
       ${list.length ? `<div class="card" style="padding:4px 12px">
         <table><thead><tr>
@@ -2758,9 +2798,71 @@ SCREENS.individuals = (caUuid)=>{
 
       <button class="btn" onclick="goBack()">測り終える</button>
     `,
-    onMount(){ const el=$('#i_tl'); if(el) el.focus(); }
+    onMount(){ const el=$('#i_tl'); if(el) el.focus(); bulkHint(); }
   };
 };
+
+/* 測る魚種を切り替える。画面は積み上げず、入れ替える */
+function switchMeasure(caUuid){
+  navReplace('individuals', caUuid);
+}
+
+/* 並べて打った数字をほぐす。空白・カンマ・改行・読点・セミコロンで区切る */
+function parseLengths(text){
+  const raw = String(text||'').split(/[\s,、，;；\/]+/).filter(x=>x!=='');
+  const ok = [], bad = [];
+  raw.forEach(t=>{
+    const n = numOf(t);
+    if(n==='' || n<=0) bad.push(t); else ok.push(n);
+  });
+  return {ok, bad, n: raw.length};
+}
+/* まとめて入れる欄の下に、いま何尾ぶんか出す */
+function bulkHint(){
+  const box = $('#i_bulk'), out = $('#i_bulkInfo'), btn = $('#i_bulkBtn');
+  if(!box || !out) return;
+  const r = parseLengths(box.value);
+  out.innerHTML = r.n===0
+    ? '数字を空白・カンマ・改行で区切って並べてください。'
+    : (r.bad.length
+        ? `<span class="pill ng">読めない値 ${r.bad.length}個</span> ${esc(r.bad.slice(0,6).join(' '))}`
+          + '<br>直してから追加してください。'
+        : `${r.ok.length}尾ぶん。最小 ${fmtNum(Math.min.apply(null,r.ok),1)}／`
+          + `最大 ${fmtNum(Math.max.apply(null,r.ok),1)} cm`);
+  if(btn){
+    btn.disabled = !(r.ok.length && !r.bad.length);
+    btn.textContent = r.ok.length && !r.bad.length
+      ? `${r.ok.length}尾をまとめて追加` : 'まとめて追加';
+  }
+}
+/* まとめて追加。1つでも読めない値があれば、1尾も入れない
+   （半端に入ると、どこまで入ったか分からなくなる） */
+function addIndividualsBulk(caUuid){
+  const c = DB.getAlive(DB.key.ca, caUuid); if(!c) return;
+  const r = parseLengths(strVal('#i_bulk'));
+  if(!r.ok.length){ toast('数字を並べて入れてください'); return; }
+  if(r.bad.length){
+    toast(`読めない値があります：${r.bad.slice(0,5).join(' ')}。直してからお試しください`, 6000);
+    return;
+  }
+  let list = DB.individualsOf(caUuid);
+  let no = list.reduce((m,i)=>Math.max(m, numOf(i.individual_number)||0), 0);
+  // まとめて1回で保存する。1尾ずつ保存すると、途中で失敗したとき半端に残る
+  let all;
+  try{ all = DB.loadRaw(DB.key.ind); }
+  catch(e){ toast('保存された記録を読み取れないため、追加を中止しました', 6000); return; }
+  const at = nowISO();
+  r.ok.forEach(L=>{
+    no += 1;
+    all.push({uuid:uuid(), catch_uuid:caUuid,
+      station_uuid:c.station_uuid, survey_uuid:c.survey_uuid,
+      individual_number:no, total_length_cm:L, fork_length_cm:'',
+      recorded_at:at, created_at:at, updated_at:at});
+  });
+  if(!DB.save(DB.key.ind, all)) return;      // 保存できていないので欄も消さない
+  toast(`${r.ok.length}尾を追加しました`);
+  render();
+}
 
 function addIndividual(caUuid){
   const c = DB.getAlive(DB.key.ca, caUuid); if(!c) return;
