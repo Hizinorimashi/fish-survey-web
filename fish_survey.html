@@ -66,6 +66,17 @@ button{font-family:inherit;font-size:15px;cursor:pointer}
 .leaflet-container{background:#0d1219;font-family:inherit}
 .pinmark{border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.6)}
 .hr{height:1px;background:var(--line);margin:14px 0}
+/* 折りたたみ。ブラウザの標準の仕組みを使うので、開け閉めに手を入れなくてよい */
+details.fold{padding:0}
+details.fold>summary{list-style:none;cursor:pointer;padding:12px;
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+details.fold>summary::-webkit-details-marker{display:none}
+details.fold>summary::after{content:'ひらく';margin-left:auto;color:var(--dim);font-size:12px;
+  border:1px solid var(--line);border-radius:999px;padding:3px 10px;white-space:nowrap}
+details.fold[open]>summary::after{content:'とじる'}
+.fold .ftitle{font-weight:700}
+.fold .fsub{color:var(--dim);font-size:13px}
+.fold .fbody{padding:0 12px 12px}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{border-bottom:1px solid var(--line);padding:7px 4px;text-align:left}
 th{color:var(--dim);font-weight:600;font-size:12px}
@@ -106,7 +117,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v9';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v10';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -923,6 +934,23 @@ function render(){
       ? `<div class="ngbox">${esc(LOCK_WHY)}</div>` : '') + (v.html || '');
   window.scrollTo(0,0);
   if(v.onMount) try{ v.onMount(); }catch(e){ console.error(e); }
+}
+
+/* ---------- 折りたたみ ----------
+   開いているかどうかは端末ごとに覚える（記録ではないので門を通さない） */
+function foldOpen(key){ const f = prefs().fold || {}; return !!f[key]; }
+function foldSet(key, open){
+  const f = Object.assign({}, prefs().fold || {});
+  f[key] = !!open;
+  prefSet('fold', f);
+}
+/* head は summary の中に出す（たたんでいても見える）。inner が中身 */
+function foldHtml(key, title, head, inner){
+  return `<details class="fold card" ${foldOpen(key)?'open':''}
+      ontoggle="foldSet('${esc(key)}', this.open)">
+    <summary><span class="ftitle">${esc(title)}</span>${head||''}</summary>
+    <div class="fbody">${inner}</div>
+  </details>`;
 }
 
 /* ---------- 選ぶボタン ---------- */
@@ -2115,16 +2143,12 @@ SCREENS.station = (stUuid)=>{
         </div>
       </div>
 
-      ${detail ? '' : `<div class="card">
-        <h3 style="margin-top:0">とった労力</h3>
-        <div class="row">
-          <div class="grow">
-            <div class="dim small">電気ショッカーの通電</div>
-            <div class="big" id="effClock">${esc(fmtDur(effortSeconds(st)))}</div>
-          </div>
-          <button class="btn ${effortRunning(st)?'ng':'ok'}" style="width:auto;margin:0;padding:12px 18px"
-            onclick="toggleEffort('${stUuid}')">${effortRunning(st)?'ストップ':'スタート'}</button>
-        </div>
+      ${detail ? '' : foldHtml('effort', 'とった労力', `
+        <span class="fsub">通電 <b id="effClock">${esc(fmtDur(effortSeconds(st)))}</b></span>
+        <button class="btn ${effortRunning(st)?'ng':'ok'}"
+          style="width:auto;margin:0;padding:8px 14px;font-size:14px"
+          onclick="event.preventDefault();event.stopPropagation();toggleEffort('${stUuid}')"
+          >${effortRunning(st)?'ストップ':'スタート'}</button>`, `
         <div class="dim small">画面を移してもアプリを閉じても、時計で数えるので狂いません。</div>
 
         <label>流した回数</label>
@@ -2159,8 +2183,7 @@ SCREENS.station = (stUuid)=>{
           <div class="grow"><div class="dim small">100m²あたり</div>
             <div>${cp.per100m2===''?'—':esc(fmtNum(cp.per100m2,1))+' 尾'}</div></div>
         </div>
-        <button class="btn" onclick="saveEffort('${stUuid}')">労力を保存する</button>
-      </div>`}
+        <button class="btn" onclick="saveEffort('${stUuid}')">労力を保存する</button>`)}
 
       <div class="card tap" onclick="nav('env','${stUuid}')">
         <div class="row">
