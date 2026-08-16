@@ -106,7 +106,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v2';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v3';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -637,9 +637,13 @@ let DRAFT_KEY=null, DRAFT_GET=null, DRAFT_BASE=null;
    「どの欄なら書きかけとみなすか」を並べる方式だと、
    並べ忘れた欄（調査日・季節・同定の確からしさ など）だけを直したときに
    書きかけが消える（2026-08-16 の3回目の監査 Major） */
-function draftBind(key, get){
+/* base を渡すと、それを「元の姿」とする。
+   渡さないと、書きかけを戻した後の姿を元と勘違いし、
+   同じ値に戻したときに書きかけを消してしまう（4回目の監査 Major） */
+function draftBind(key, get, base){
   DRAFT_KEY=key; DRAFT_GET=get;
-  try{ DRAFT_BASE = JSON.stringify(get()); }catch(e){ DRAFT_BASE=null; }
+  try{ DRAFT_BASE = JSON.stringify(base!==undefined ? base : get()); }
+  catch(e){ DRAFT_BASE=null; }
 }
 function draftUnbind(){ DRAFT_KEY=null; DRAFT_GET=null; DRAFT_BASE=null; }
 function draftTouch(){
@@ -983,31 +987,47 @@ function packEstimate(poly, zmax, layers){
   const n = packTileUrls(poly, zmax, layers).length;
   return {tiles:n, mb: Math.round(n*0.02*10)/10};   // 1枚 約20KB で見積もる
 }
+/* 読むだけ。読むついでに書き換えると、閲覧のみのタブでも保存領域を触ってしまい、
+   2枚のタブが別々の印を付けて上書き合う（2026-08-16 の4回目の監査 Major） */
 function packStore(){
   let a;
   try{ a = JSON.parse(localStorage.getItem('fs_map_packs')||'[]'); }
   catch(e){ return []; }
-  if(!Array.isArray(a)) return [];
-  a = a.filter(Boolean);
-  // 昔の記録には印（id）が無い。無いまま扱うと、どの「消す」を押しても
-  // 印の無いものが全部まとめて一覧から消える。読むときに付け直す
+  return Array.isArray(a) ? a.filter(Boolean) : [];
+}
+function packSaveList(a){
+  try{ localStorage.setItem('fs_map_packs', JSON.stringify(a)); return true; }
+  catch(e){ return false; }
+}
+/* 昔の記録には印（id）が無い。無いまま扱うと、どの「消す」を押しても
+   印の無いものが全部まとめて一覧から消える。
+   付け直すのは書き込みなので、使用権を持つタブではっきり行う。
+   付け直せたかどうかを返す */
+function migratePackIds(){
+  const a = packStore();
   const seen = new Set();
   let changed = false;
   a.forEach(p=>{
     if(!p.id || seen.has(p.id)){ p.id = uuid(); changed = true; }
     seen.add(p.id);
   });
-  if(changed) packSaveList(a);
-  return a;
+  if(!changed) return true;
+  if(!ownsLock()) return false;      // 閲覧のみのタブでは触らない
+  return packSaveList(a);
 }
-function packSaveList(a){ try{ localStorage.setItem('fs_map_packs', JSON.stringify(a)); }catch(e){} }
 /* サービスワーカーに頼む（返事を待つ） */
 function swAsk(msg, timeoutMs){
   return new Promise((res,rej)=>{
     const sw = navigator.serviceWorker && navigator.serviceWorker.controller;
     if(!sw){ rej(new Error('オフライン用の仕組みが動いていません')); return; }
     const ch = new MessageChannel();
-    const t = setTimeout(()=>rej(new Error('返事がありません')), timeoutMs||120000);
+    const t = setTimeout(()=>{
+      // 返事が無いだけで、向こうはまだ動いているかもしれない。
+      // 「失敗した」とは違うので、呼び出し側が区別できるよう印を付ける
+      const err = new Error('返事がありません');
+      err.timeout = true;
+      rej(err);
+    }, timeoutMs||120000);
     ch.port1.onmessage = e=>{ clearTimeout(t); res(e.data); };
     sw.postMessage(msg, [ch.port2]);
   });
@@ -1247,6 +1267,7 @@ SCREENS.surveyEdit = (svUuid)=>{
     onMount(){
       startGps();
       const key = 'survey:'+(svUuid||'new');
+      const base = collectSurvey();     // 書きかけを戻す前の姿を控える
       const d = draftGet(key);
       if(d){
         applyVals({'#f_date':d.survey_date, '#f_river':d.river_name, '#f_site':d.site_name,
@@ -1257,7 +1278,7 @@ SCREENS.surveyEdit = (svUuid)=>{
         applySeg('formA', d.river_morphology_a); applySeg('svtype', d.survey_type_default);
         toast('書きかけを戻しました');
       }
-      draftBind(key, collectSurvey);
+      draftBind(key, collectSurvey, base);
     }
   };
 };
@@ -1442,6 +1463,7 @@ SCREENS.stationEdit = (arg)=>{
     `,
     onMount(){
       const key = 'station:'+(arg.uuid || ('new:'+svUuid));
+      const base = collectStation();    // 書きかけを戻す前の姿を控える
       const d = draftGet(key);
       if(d){
         applyVals({'#s_name':d.name, '#s_wt':d.water_temp, '#s_depth':d.depth_rep_cm,
@@ -1451,7 +1473,7 @@ SCREENS.stationEdit = (arg)=>{
         applySegMulti('method', d.survey_method);
         toast('書きかけを戻しました');
       }
-      draftBind(key, collectStation);
+      draftBind(key, collectStation, base);
     }
   };
 };
@@ -1629,13 +1651,14 @@ SCREENS.catchEdit = (arg)=>{
     `,
     onMount(){
       const key = 'catch:'+(arg.uuid || ('new:'+stUuid+':'+(spId||'')));
+      const base = collectCatch();      // 書きかけを戻す前の姿を控える
       const d = draftGet(key);
       if(d){
         applyVals({'#c_n':d.count_unmeasured, '#c_note':d.notes});
         applySeg('conf', d.identification_confidence);
         toast('書きかけを戻しました');
       }
-      draftBind(key, collectCatch);
+      draftBind(key, collectCatch, base);
       const el=$('#c_n'); if(el && isNew && !d) el.focus();
     }
   };
@@ -1733,15 +1756,93 @@ SCREENS.map = (svUuid)=>{
 /* ---------- オフライン地図 ---------- */
 let OPOLY = [];
 // 圏外用の地図をさわる処理は、いちどに1つだけ。
-// 保存と削除が重なると、一覧と実体が食い違う
+// 保存と削除が重なると、一覧と実体が食い違う。
+// 返事が返ってこなかったときは、読み込み直しても解けないよう印を残す
+// （向こうはまだ動いているかもしれない）
 let PACK_BUSY = false;
+/* 出し入れ中であることを示す札。
+   ただの「保存」「削除」という文字だと、別のタブの札を上書き・削除してしまう。
+   操作ごとに別の札（id つき）にして、自分の札だけを外す（7回目の監査 Major）。
+     {id, kind:'保存'|'削除', at, deadline, state:'進行中'|'結果不明'}  */
+function packPending(){
+  try{
+    const o = JSON.parse(localStorage.getItem('fs_pack_pending')||'null');
+    return (o && typeof o.id==='string' && o.id) ? o : null;
+  }catch(e){ return null; }
+}
+/* 札を置く。使用権があり、ほかの札が無いときだけ。置けたら id を返す。
+   置くのは「頼む前」。頼んだ後だと、返事を待つ間に読み込み直されて札が無い */
+function packPendingSet(kind, timeoutMs){
+  if(!ownsLock()) return null;
+  if(packPending()) return null;             // ほかの札があれば上書きしない
+  const rec = {id:uuid(), kind, at:Date.now(),
+               deadline:Date.now() + (timeoutMs||300000), state:'進行中'};
+  try{ localStorage.setItem('fs_pack_pending', JSON.stringify(rec)); }
+  catch(e){ return null; }
+  const back = packPending();                // 置けたことを読み直して確かめる
+  return (back && back.id===rec.id) ? rec.id : null;
+}
+/* 自分の札だけを外す */
+function packPendingDrop(id){
+  const cur = packPending();
+  if(!cur) return true;
+  if(id && cur.id!==id) return false;        // 別のタブの札は触らない
+  try{ localStorage.removeItem('fs_pack_pending'); return true; }catch(e){ return false; }
+}
+/* 返事が来なかった札に「結果不明」の印を付ける */
+function packPendingUnknown(id){
+  const cur = packPending();
+  if(!cur || cur.id!==id) return;
+  cur.state = '結果不明';
+  try{ localStorage.setItem('fs_pack_pending', JSON.stringify(cur)); }catch(e){}
+}
+/* 解除してよいか。使用権があり、かつ「結果不明」か、待ち時間を過ぎていること。
+   まだ動いている最中の札を、別のタブから外させない */
+function packPendingClearable(){
+  const cur = packPending();
+  if(!cur) return false;
+  return ownsLock() && (cur.state==='結果不明' || Date.now() > cur.deadline);
+}
+/* 「確かめたので続ける」 */
+function packPendingClear(){
+  if(!packPendingClearable()){
+    toast(ownsLock() ? 'まだ処理中かもしれません。少し待ってからもう一度押してください'
+                     : 'このタブでは解除できません。記録を入れているタブで行ってください', 6000);
+    return;
+  }
+  const cur = packPending();
+  if(!packPendingDrop(cur.id)){
+    toast('解除できませんでした。ページを読み込み直してください', 6000);
+    return;
+  }
+  PACK_BUSY = false;          // 同じ画面のまま、次の出し入れができるようにする
+  toast('解除しました');
+  render();
+}
+function packLocked(){ return PACK_BUSY || !!packPending(); }
 SCREENS.offlineMap = (svUuid)=>{
-  const sv = DB.get(DB.key.sv, svUuid);
+  const sv = DB.getAlive(DB.key.sv, svUuid);
+  if(!sv) return null;               // 消した調査からは開かせない
+  const migrated = migratePackIds();   // 古い記録に印を付ける（使用権があるときだけ）
   const packs = packStore();
+  // 同じ印が2つ以上あるものは、消すと巻き添えが出る
+  const idCount = {};
+  packs.forEach(p=>{ if(p.id) idCount[p.id] = (idCount[p.id]||0)+1; });
+  const canDrop = p => !!p.id && migrated && idCount[p.id]===1;
   OPOLY = [];
   return {
     title:'圏外用の地図',
     html:`
+      ${(()=>{ const q=packPending(); if(!q) return '';
+        const canClear = packPendingClearable();
+        return `<div class="warnbox">
+        <b>前回の「${esc(q.kind)}」が終わっていません（${esc(q.state)}）。</b><br>
+        裏でまだ処理が続いていることがあるため、新しい出し入れは止めています。<br>
+        下の一覧が思ったとおりになっているか確かめてから、次に進んでください。
+        <button class="btn sm" ${canClear?'':'disabled'}
+          onclick="packPendingClear()">確かめたので続ける</button>
+        ${canClear?'':'<div class="dim small">まだ処理中かもしれません。少し待ってください。</div>'}
+      </div>`; })()}
       <div class="card">
         <div class="dim small">地図を長押し（またはタップ）して、落としておきたい範囲を3点以上で囲ってください。</div>
         <div class="row" style="margin-top:8px">
@@ -1767,8 +1868,10 @@ SCREENS.offlineMap = (svUuid)=>{
         <div class="row"><div class="grow">
           <div>${esc(p.name||('範囲'+(i+1)))}</div>
           <div class="dim small">${p.tiles}枚　およそ${p.mb}MB　${esc((p.layers||[]).join('・'))}
-            ${p.poly?'':'　※古い記録（消しても地図の実体は残ります）'}</div>
+            ${p.poly?'':'　※古い記録（消しても地図の実体は残ります）'}
+            ${canDrop(p)?'':'　※いまは消せません（記録を入れているタブで開き直してください）'}</div>
         </div><button class="btn sm ng" style="width:auto;margin:0"
+          ${canDrop(p)?'':'disabled'}
           onclick="packDrop('${esc(p.id||'')}')">消す</button></div></div>`).join('')
         : '<div class="card dim">まだありません。</div>'}
     `,
@@ -1815,7 +1918,7 @@ function opolyEstimate(){
   el.textContent = `およそ ${e.tiles}枚・${e.mb}MB。通信できるところで保存してください。`;
 }
 function opolySave(svUuid){
-  if(PACK_BUSY){ toast('いま別の地図の出し入れを行っています。少し待ってください'); return; }
+  if(packLocked()){ toast('いま別の地図の出し入れが終わっていません。少し待ってください'); return; }
   if(!ownsLock()){
     toast('このタブでは地図を保存できません。記録を入れているタブから行ってください', 6000);
     return;
@@ -1827,18 +1930,37 @@ function opolySave(svUuid){
   const poly = OPOLY.slice();
   const urls = packTileUrls(poly, zmax, layers);
   const prog = $('#oprog');
+  const jobId = packPendingSet('保存', 600000);
+  if(!jobId){
+    toast('いま別の出し入れが終わっていないか、印を置けませんでした', 8000);
+    return;
+  }
+  // 一覧の書き換えまで終わってから札を外す。先に外すと、
+  // その間に別のタブが古い一覧をもとに書き込める
+  const done = (fn)=>{ try{ fn(); } finally { packPendingDrop(jobId); PACK_BUSY = false; } };
   if(prog) prog.textContent = `${urls.length}枚を保存しています…`;
   PACK_BUSY = true;
   swAsk({type:'savePack', urls}, 600000).then(r=>{
-    PACK_BUSY = false;
     const okN   = (r && r.ok)   || 0;
     const failN = (r && r.fail) || 0;
     if(okN===0){
       // 1枚も入っていないのに「保存しました」と言わない。
       // 圏外で地図が出ないことに現場で気づくことになる
-      if(prog) prog.textContent = `1枚も保存できませんでした（${failN}枚失敗）。`
-        + '電波の届くところでもう一度お試しください。';
-      toast('保存できませんでした', 5000);
+      done(()=>{
+        if(prog) prog.textContent = `1枚も保存できませんでした（${failN}枚失敗）。`
+          + '電波の届くところでもう一度お試しください。';
+        toast('保存できませんでした', 5000);
+      });
+      return;
+    }
+    // 保存に時間がかかる間に、使用権がほかのタブへ移っていることがある
+    if(!ownsLock()){
+      done(()=>{
+        if(prog) prog.textContent = '地図は保存できましたが、'
+          + '途中で使用権がほかのタブへ移ったため、一覧に記録できませんでした。'
+          + 'ページを読み込み直してからやり直してください。';
+        toast('一覧に記録できませんでした。読み込み直してください', 8000);
+      });
       return;
     }
     const list = packStore();
@@ -1846,34 +1968,76 @@ function opolySave(svUuid){
     // 並びが変わっても取り違えないよう、id を付ける
     list.push({id:uuid(), name:`範囲${list.length+1}`, tiles:okN, fail:failN,
                mb:Math.round(okN*0.02*10)/10, layers, zmax, poly, at:nowISO()});
-    packSaveList(list);
-    if(prog) prog.textContent = failN
-      ? `${okN}枚を保存しました（${failN}枚は取れませんでした）。`
-      : `${okN}枚を保存しました。`;
-    toast(failN ? `${okN}枚保存（${failN}枚は取れず）` : '保存しました', failN?5000:2400);
+    if(!packSaveList(list)){
+      // 実体は入ったのに一覧に残らない。「保存しました」と言うと、
+      // 消せない地図が容量を食ったまま行方不明になる
+      done(()=>{
+        if(prog) prog.textContent = '地図は保存できましたが、一覧に記録できませんでした。'
+          + '端末の空き容量を確認してください。';
+        toast('一覧に記録できませんでした。空き容量を確認してください', 8000);
+      });
+      return;
+    }
+    done(()=>{
+      if(prog) prog.textContent = failN
+        ? `${okN}枚を保存しました（${failN}枚は取れませんでした）。`
+        : `${okN}枚を保存しました。`;
+      toast(failN ? `${okN}枚保存（${failN}枚は取れず）` : '保存しました', failN?5000:2400);
+    });
     render();
   }).catch(e=>{
-    PACK_BUSY = false;
-    if(prog) prog.textContent = '保存できませんでした：'+e.message;
-    toast('保存できませんでした');
+    if(e && e.timeout){
+      // 向こうがまだ動いている可能性がある。次の出し入れを許すと食い違う。
+      // 札は残したまま「結果不明」にする
+      packPendingUnknown(jobId);
+      if(prog) prog.textContent = '保存の返事が返ってきません。'
+        + '裏でまだ動いているかもしれないので、しばらく待ってから'
+        + '保存済みの一覧を確かめてください。';
+      toast('返事がありません。一覧を確かめてください', 8000);
+      render();
+      return;                       // PACK_BUSY は立てたまま
+    }
+    done(()=>{                              // はっきり失敗したので札を外す
+      if(prog) prog.textContent = '保存できませんでした：'+e.message;
+      toast('保存できませんでした');
+    });
   });
 }
 function packDrop(id){
-  if(PACK_BUSY){ toast('いま別の地図の出し入れを行っています。少し待ってください'); return; }
+  if(packLocked()){ toast('いま別の地図の出し入れが終わっていません。少し待ってください'); return; }
   if(!ownsLock()){
     toast('このタブでは地図を消せません。記録を入れているタブから行ってください', 6000);
     return;
   }
   const list=packStore();
-  const i = list.findIndex(p=>p.id===id);
-  const target = list[i];
-  if(!target) return;
+  const hits = list.filter(p=>p.id===id);
+  if(hits.length!==1){
+    // 見つからない、または同じ印が複数ある。消すと巻き添えが出る
+    toast(hits.length===0 ? 'その範囲が見つかりません。ページを読み込み直してください'
+                          : '同じ印の記録が複数あります。ページを読み込み直してください', 8000);
+    render();
+    return;
+  }
+  const target = hits[0];
   if(!confirm('この範囲の地図を消します。よろしいですか？')) return;
 
   // 番号ではなく id で消す。並びは削除の間に変わりうる
   const dropFromList = (msg)=>{
-    const rest = packStore().filter(p=>p.id!==id);
-    packSaveList(rest);
+    if(!ownsLock()){
+      toast('書き換えの途中で使用権がほかのタブへ移りました。一覧はそのまま残します', 8000);
+      return;
+    }
+    const now = packStore();
+    if(now.filter(p=>p.id===id).length!==1){
+      toast('一覧が変わりました。ページを読み込み直して確かめてください', 8000);
+      render();
+      return;
+    }
+    const rest = now.filter(p=>p.id!==id);
+    if(!packSaveList(rest)){
+      toast('一覧を書き換えられませんでした。端末の空き容量を確認してください', 8000);
+      return;
+    }
     toast(msg, 5000); render();
   };
 
@@ -1897,25 +2061,38 @@ function packDrop(id){
     return;
   }
 
+  const jobId = packPendingSet('削除', 300000);
+  if(!jobId){
+    toast('いま別の出し入れが終わっていないか、印を置けませんでした', 8000);
+    return;
+  }
+  // 一覧の書き換えまで終わってから札を外す
+  const done = (fn)=>{ try{ fn(); } finally { packPendingDrop(jobId); PACK_BUSY = false; } };
   PACK_BUSY = true;
   toast(`${drop.length}枚を消しています…`);
   swAsk({type:'dropPack', urls:drop}, 300000).then(r=>{
-    PACK_BUSY = false;
     if(!r || r.error){
-      toast('地図の実体を消せませんでした。一覧はそのまま残します（'
-        + ((r&&r.error)||'返事がありません') + '）', 8000);
+      done(()=>toast('地図の実体を消せませんでした。一覧はそのまま残します（'
+        + ((r&&r.error)||'返事がありません') + '）', 8000));
       return;                      // 一覧を消さない。あとでやり直せる
     }
     const failed = (r.failed||[]).length;
     if(failed){
-      toast(`${r.deleted||0}枚を消しましたが、${failed}枚が残りました。`
-        + '一覧はそのまま残します。もう一度お試しください', 8000);
+      done(()=>toast(`${r.deleted||0}枚を消しましたが、${failed}枚が残りました。`
+        + '一覧はそのまま残します。もう一度お試しください', 8000));
       return;
     }
-    dropFromList(`${r.deleted||0}枚を消しました`);
+    done(()=>dropFromList(`${r.deleted||0}枚を消しました`));
   }).catch(e=>{
-    PACK_BUSY = false;
-    toast('地図の実体を消せませんでした。一覧はそのまま残します（'+e.message+'）', 8000);
+    if(e && e.timeout){
+      packPendingUnknown(jobId);   // 札は残したまま「結果不明」にする
+      toast('消した結果の返事が返ってきません。一覧はそのまま残します。'
+        + '一覧を確かめてください', 8000);
+      render();
+      return;                       // PACK_BUSY は立てたまま
+    }
+    done(()=>toast('地図の実体を消せませんでした。一覧はそのまま残します（'
+      + e.message + '）', 8000));
   });
 }
 
