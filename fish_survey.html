@@ -106,7 +106,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v1';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v2';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -134,7 +134,31 @@ function toast(msg, ms){ const t=$('#toast'); if(!t) return; t.textContent=msg; 
 function numOf(v){
   if(v===null || v===undefined) return '';
   const s=String(v).trim(); if(s==='') return '';
-  const n=parseFloat(s); return isNaN(n) ? '' : n;
+  // parseFloat は '12abc' を 12 として通してしまう。全体が数のときだけ受ける
+  if(!/^[+-]?(\d+(\.\d*)?|\.\d+)$/.test(s)) return '';
+  const n=parseFloat(s);
+  return isFinite(n) ? n : '';
+}
+/* 尾数の受け取り。空欄は ''、0以上の整数だけ数として返す。
+   それ以外（負の数・小数・'12abc'）は null を返して「おかしい」と伝える。
+   負の数を通すと、測った個体を打ち消して「尾数0」になり、
+   実在する記録が黙って書き出しから消える（2026-08-16 の監査 Major） */
+function countOf(v){
+  if(v===null || v===undefined) return '';
+  const s=String(v).trim(); if(s==='') return '';
+  if(!/^\d+$/.test(s)) return null;
+  const n=parseInt(s,10);
+  // 大きすぎる数は丸められて、入れた文字と書き出す数が食い違う
+  return Number.isSafeInteger(n) ? n : null;
+}
+/* 記録の尾数がおかしければ、その理由を返す。問題なければ '' */
+function badCount(c, inds){
+  if(countOf(c.count_unmeasured)===null){
+    return `尾数「${String(c.count_unmeasured)}」は数として読めません（0以上の整数で入れてください）`;
+  }
+  const n = catchTotal(c, inds);
+  if(!isFinite(n) || n<0 || n!==Math.floor(n)) return `尾数が正しくありません（${n}）`;
+  return '';
 }
 function numVal(sel){ const el=$(sel); return el ? numOf(el.value) : ''; }
 function strVal(sel){ const el=$(sel); return el ? String(el.value).trim() : ''; }
@@ -153,14 +177,21 @@ function fmtDur(sec){ sec=Math.max(0,Math.round(sec||0));
    起動時に使用権を取り、取れるまで・取れなければ一切書き込まない。
    ============================================================ */
 const TAB_ID    = uuid();
-const LOCK_KEY  = 'fs_lock';
-const LOCK_TTL  = 12000;   // これより古い持ち主は、閉じられたものとみなす
+const LOCK_NAME = 'fs_write_lock';   // ブラウザ標準の仕組みで使う名前
+const LOCK_KEY  = 'fs_lock';         // 標準の仕組みが無いときの控え
+const LOCK_TTL  = 12000;   // これより古い印は、閉じられたタブのものとみなす
 const LOCK_BEAT = 4000;    // 生きている印を書き直す間隔
 const LOCK_WAIT = 350;     // 取ったあと、割り込みが無かったか確かめるまでの待ち
 window.WRITE_OK   = false;
 window.READ_ONLY  = false;
-window.RECOVERY_OK= false;
-let SAVE_FATAL = false;    // 後片付けに失敗した状態。再読み込みでしか解けない
+let SAVE_FATAL = false;    // 後片付けに失敗した状態。読み込み直すまで解けない
+let LOCK_WHY   = '';
+let LOCK_MODE  = '';       // 'locks'（ブラウザ標準）か 'storage'（控え）
+let LOCK_RELEASE = null;   // ブラウザ標準の使用権を手放す関数
+let lockBeatTimer = null;
+
+const WHY_OTHER_TAB = 'ほかのタブでこのアプリが開いています。'
+  + 'そのタブを閉じてから、この画面を読み込み直してください';
 
 function lockRead(){ try{
   const o=JSON.parse(localStorage.getItem(LOCK_KEY)||'null');
@@ -171,39 +202,67 @@ function lockWrite(){ try{
   localStorage.setItem(LOCK_KEY, JSON.stringify({id:TAB_ID, at:Date.now()})); return true;
 }catch(e){ return false; } }
 
+/* いま自分が使用権を持っているか。保存の直前に必ずこれで確かめる。
+   WRITE_OK という旗だけを信じると、裏で別のタブに取られていても保存してしまい、
+   相手の記録ごと上書きする（2026-08-16 の監査 Critical） */
+function ownsLock(){
+  if(!window.WRITE_OK) return false;
+  if(LOCK_MODE==='locks') return true;   // ページの間ずっと握り続けている
+  const o = lockRead();
+  return !!o && o.id===TAB_ID;           // 控えの方式では、印の持ち主を毎回見る
+}
+
 function goReadOnly(why){
   window.WRITE_OK=false; window.READ_ONLY=true; LOCK_WHY=why;
-  clearInterval(lockBeatTimer); lockBeatTimer=null;
+  if(lockBeatTimer){ clearInterval(lockBeatTimer); lockBeatTimer=null; }
   try{ render(); }catch(e){}
 }
-let LOCK_WHY='';
-let lockBeatTimer=null;
+function openWrite(){
+  window.WRITE_OK=true; window.READ_ONLY=false; LOCK_WHY='';
+  try{ render(); }catch(e){}
+}
 
 function claimLock(){
-  const cur = lockRead();
-  if(lockAlive(cur) && cur.id!==TAB_ID){
-    goReadOnly('ほかのタブでこのアプリが開いています。そのタブを閉じてから開き直してください');
+  // ブラウザ標準の仕組みがあれば、それを使う。
+  // タブが落ちても自動で解放されるので、時間切れの当て推量が要らない
+  if(navigator.locks && navigator.locks.request){
+    LOCK_MODE='locks';
+    const held = new Promise(res=>{ LOCK_RELEASE = res; });
+    navigator.locks.request(LOCK_NAME, {mode:'exclusive', ifAvailable:true}, lock=>{
+      if(!lock){ goReadOnly(WHY_OTHER_TAB); return; }
+      openWrite();
+      return held;        // ページを離れるまで握り続ける
+    }).catch(()=>goReadOnly('使用権を確かめられませんでした。読み込み直してください'));
     return;
   }
+
+  // ここから下は、標準の仕組みが無いブラウザ用の控え
+  LOCK_MODE='storage';
+  const cur = lockRead();
+  if(lockAlive(cur) && cur.id!==TAB_ID){ goReadOnly(WHY_OTHER_TAB); return; }
   if(!lockWrite()){
     goReadOnly('このブラウザ／開き方では保存できません（保存領域が使えません）');
     return;
   }
-  // すぐに開放せず、間に別のタブが割り込まなかったか確かめてから開ける
   setTimeout(()=>{
     const c2 = lockRead();
-    if(!c2 || c2.id!==TAB_ID){
-      goReadOnly('ほかのタブでこのアプリが開かれました。どちらか一方だけにしてください');
-      return;
-    }
-    window.WRITE_OK=true; window.READ_ONLY=false; LOCK_WHY='';
-    lockBeatTimer = setInterval(()=>{ if(window.WRITE_OK) lockWrite(); }, LOCK_BEAT);
-    try{ render(); }catch(e){}
+    if(!c2 || c2.id!==TAB_ID){ goReadOnly(WHY_OTHER_TAB); return; }
+    openWrite();
+    lockBeatTimer = setInterval(()=>{
+      if(!window.WRITE_OK) return;
+      const o = lockRead();
+      // 自分の印でなければ、別のタブに取られている。上書きして奪い返さない
+      if(o && o.id!==TAB_ID){ goReadOnly(WHY_OTHER_TAB); return; }
+      lockWrite();
+    }, LOCK_BEAT);
   }, LOCK_WAIT);
 }
+
 /* このページを離れるときは使用権を手放す。
-   握ったままだと、同じタブで読み込み直しただけで「別のタブが開いている」と誤判定する */
+   握ったままだと、同じタブで読み込み直しただけで
+   「別のタブが開いている」と誤判定する */
 function releaseLock(){
+  if(LOCK_RELEASE){ try{ LOCK_RELEASE(); }catch(e){} LOCK_RELEASE=null; }
   const o = lockRead();
   if(o && o.id===TAB_ID){ try{ localStorage.removeItem(LOCK_KEY); }catch(e){} }
 }
@@ -212,19 +271,25 @@ window.addEventListener('pagehide', releaseLock);
 window.addEventListener('pageshow', e=>{ if(e.persisted){ window.WRITE_OK=false; claimLock(); } });
 
 window.addEventListener('storage', e=>{
-  if(e.key!==LOCK_KEY || !window.WRITE_OK) return;
+  if(e.key!==LOCK_KEY || !window.WRITE_OK || LOCK_MODE!=='storage') return;
   const o = lockRead();
-  if(o && o.id!==TAB_ID) goReadOnly('ほかのタブでこのアプリが開かれました。どちらか一方だけにしてください');
+  if(o && o.id!==TAB_ID) goReadOnly(WHY_OTHER_TAB);
 });
 
 /* 記録に関わる書き込みは必ずここを通す。
    端末ごとの好み（地図の種類・下書き）は記録ではないので対象外 */
 function writeAllowed(){
-  if(SAVE_FATAL && !window.RECOVERY_OK){
+  if(SAVE_FATAL){
     toast('保存の後片付けに失敗しています。ページを読み込み直してください', 6000);
     return false;
   }
-  if(window.WRITE_OK || window.RECOVERY_OK) return true;
+  // 抜け道は作らない。どの経路でも、保存の直前に使用権を確かめる
+  if(ownsLock()) return true;
+  if(window.WRITE_OK){
+    // 旗は立っているのに使用権が無い＝裏で別のタブに取られた
+    goReadOnly(WHY_OTHER_TAB);
+    return false;
+  }
   toast(window.READ_ONLY ? LOCK_WHY
     : '起動時の確認が終わるまで保存できません。数秒待ってからやり直してください', 5000);
   return false;
@@ -261,6 +326,16 @@ const DB = {
     }
   },
   get(k,u){ return this.load(k).find(x=>x.uuid===u) || null; },
+  /* 生きているものだけ返す。消したはずのものが画面に出ないよう、
+     画面はこちらを使う（get はごみ箱・復元のためのもの） */
+  getAlive(k,u){ const r=this.get(k,u); return (r && !r.deleted_at) ? r : null; },
+  /* 箇所は、親の調査も生きているときだけ返す。
+     調査を消したのに、中の箇所だけ開けてしまうのを防ぐ */
+  liveStation(u){
+    const st = this.getAlive(this.key.st, u);
+    if(!st) return null;
+    return this.getAlive(this.key.sv, st.survey_uuid) ? st : null;
+  },
   alive(k){ return this.load(k).filter(x=>!x.deleted_at); },
 
   upsert(k, rec){
@@ -294,9 +369,20 @@ const DB = {
                || String(b.created_at||'').localeCompare(String(a.created_at||''))); },
   stationsOf(sv){ return this.alive(this.key.st).filter(x=>x.survey_uuid===sv)
     .sort((a,b)=> (a.station_no||0)-(b.station_no||0)); },
-  catchesOf(st){ return this.alive(this.key.ca).filter(x=>x.station_uuid===st)
-    .sort((a,b)=> String(a.created_at||'').localeCompare(String(b.created_at||''))); },
-  catchesOfSurvey(sv){ return this.alive(this.key.ca).filter(x=>x.survey_uuid===sv); },
+  catchesOf(st){
+    // 親の箇所（とその親の調査）が消えていれば、中の記録も見せない
+    if(!this.liveStation(st)) return [];
+    return this.alive(this.key.ca).filter(x=>x.station_uuid===st)
+      .sort((a,b)=> String(a.created_at||'').localeCompare(String(b.created_at||'')));
+  },
+  /* 消した箇所にぶら下がる記録は見せない。
+     子にも印を付けて回ると、途中で保存に失敗したとき迷子の記録が残る。
+     印は親に1つだけ付け、見るときに親の生死で絞る（2026-08-16 の監査 Critical） */
+  catchesOfSurvey(sv){
+    const live = new Set(this.stationsOf(sv).map(x=>x.uuid));
+    return this.alive(this.key.ca)
+      .filter(x=>x.survey_uuid===sv && (!x.station_uuid || live.has(x.station_uuid)));
+  },
   individualsOf(ca){ return this.alive(this.key.ind).filter(x=>x.catch_uuid===ca)
     .sort((a,b)=> (a.individual_number||0)-(b.individual_number||0)); },
   notesOf(sv){ return this.alive(this.key.nt).filter(x=>x.survey_uuid===sv); },
@@ -506,14 +592,23 @@ function seasonOf(dateStr){
    10尾測った    = 個体10件 ＋ 未計測は空欄
    10尾測って残り20尾は数えただけ = 個体10件 ＋ 未計測20
    ============================================================ */
-function catchTotal(c){
+/* inds を渡すと、その一覧から数える（書き出しのときは「壊れていたら止める」読み方で
+   取った控えを渡す）。渡さないときは画面表示用の読み方 */
+function catchTotal(c, inds){
   if(!c) return 0;
-  const measured = DB.individualsOf(c.uuid).length;
-  const un = numOf(c.count_unmeasured);
-  return measured + (un==='' ? 0 : un);
+  const list = indsOf(inds, c.uuid);
+  const measured = list.length;
+  const un = countOf(c.count_unmeasured);
+  return measured + (un==='' || un===null ? 0 : un);
 }
-function catchLengths(c){
-  return nums(DB.individualsOf(c.uuid).map(i=>i.total_length_cm));
+function catchLengths(c, inds){
+  return nums(indsOf(inds, c.uuid).map(i=>i.total_length_cm));
+}
+/* 1尾ずつの記録を取り出す。控え（記録ごとにまとめたもの）があればそれを使う */
+function indsOf(inds, catchUuid){
+  if(!inds) return DB.individualsOf(catchUuid);
+  if(inds.byCatch) return inds.byCatch[catchUuid] || [];
+  return inds.filter(i=>i.catch_uuid===catchUuid && !i.deleted_at);
 }
 function stationTotal(st){ return DB.catchesOf(st.uuid).reduce((a,c)=>a+catchTotal(c), 0); }
 function surveyTotal(sv){ return DB.catchesOfSurvey(sv.uuid).reduce((a,c)=>a+catchTotal(c), 0); }
@@ -532,14 +627,51 @@ function draftSave(key, obj){
 }
 function draftGet(key){ return draftAll()[key] || null; }
 function draftClear(key){ draftSave(key, null); }
-/* ユーザーが自分で入れたものが1つでもあるか。自動で入る値（種・位置・番号）は数えない */
-function draftUserContent(d, fields){
-  if(!d) return false;
-  return (fields||[]).some(f=>{
-    const v=d[f];
-    if(v===null || v===undefined) return false;
-    if(Array.isArray(v)) return v.length>0;
-    return String(v).trim() !== '';
+
+/* 入力中の書きかけを控える。
+   画面ごとに「どこから値を集めるか」を登録し、入力のたびに保存する。
+   登録するだけで保存していなかったので、戻ったり読み込み直すと消えていた
+   （2026-08-16 の監査 Major） */
+let DRAFT_KEY=null, DRAFT_GET=null, DRAFT_BASE=null;
+/* 画面を開いた時点の中身を控えておき、そこから変わったときだけ保存する。
+   「どの欄なら書きかけとみなすか」を並べる方式だと、
+   並べ忘れた欄（調査日・季節・同定の確からしさ など）だけを直したときに
+   書きかけが消える（2026-08-16 の3回目の監査 Major） */
+function draftBind(key, get){
+  DRAFT_KEY=key; DRAFT_GET=get;
+  try{ DRAFT_BASE = JSON.stringify(get()); }catch(e){ DRAFT_BASE=null; }
+}
+function draftUnbind(){ DRAFT_KEY=null; DRAFT_GET=null; DRAFT_BASE=null; }
+function draftTouch(){
+  if(!DRAFT_KEY || !DRAFT_GET) return;
+  let d; try{ d=DRAFT_GET(); }catch(e){ return; }
+  // 開いたときのまま（＝何も触っていない）なら、書きかけを残さない
+  if(DRAFT_BASE!==null && JSON.stringify(d)===DRAFT_BASE) draftClear(DRAFT_KEY);
+  else draftSave(DRAFT_KEY, d);
+}
+// バブル段階で受ける。先回りで受けると、onchange で季節を入れ直す前の
+// 古い値を控えてしまう（2026-08-16 の再監査 Major）
+document.addEventListener('input',  draftTouch);
+document.addEventListener('change', draftTouch);
+
+/* 選ぶボタンの状態を書き戻す */
+function applySeg(field, val){
+  if(val===undefined || val===null) return;
+  const wrap=document.querySelector(`[data-seg="${field}"]`); if(!wrap) return;
+  const want = val==='' ? 'なし' : val;
+  Array.from(wrap.querySelectorAll('button')).forEach(b=>
+    b.classList.toggle('on', b.textContent===want));
+}
+function applySegMulti(field, vals){
+  if(!Array.isArray(vals)) return;
+  const wrap=document.querySelector(`[data-segmulti="${field}"]`); if(!wrap) return;
+  Array.from(wrap.querySelectorAll('button')).forEach(b=>
+    b.classList.toggle('on', vals.indexOf(b.textContent)>=0));
+}
+function applyVals(map){
+  Object.keys(map).forEach(sel=>{
+    const el=$(sel), v=map[sel];
+    if(el && v!==undefined && v!==null) el.value=v;
   });
 }
 
@@ -557,17 +689,50 @@ const SCREENS = {};
 
 function nav(name, arg){ STACK.push({name,arg}); render(); }
 function goBack(){ if(STACK.length>1){ STACK.pop(); render(); } }
+/* 履歴を丸ごと捨てる。起動時とホームへ戻すときだけに使う。
+   保存のあとにこれを使うと、前の画面へ戻れなくなる（2026-08-16 の監査 Major） */
 function reset(name,arg){ STACK=[{name:name||'home',arg:arg||null}]; render(); }
+
+/* 保存のあとの行き先。履歴を捨てず、親までの道すじを組み直す。
+   例) goTo('station', stUuid) → home > survey > station
+   こうすると「戻る」で調査ハブ、もう一度でホームへ戻れる */
+function goTo(name, arg){
+  STACK = buildChain(name, arg);
+  render();
+}
+/* 画面から親をたどって道すじを作る */
+function buildChain(name, arg){
+  const home = {name:'home', arg:null};
+  if(name==='home') return [home];
+  if(name==='survey') return [home, {name:'survey', arg:arg}];
+  if(name==='station'){
+    const st = DB.liveStation(arg);
+    // 消された箇所なら、そこへは連れて行かない。ホームへ帰す
+    return st ? [home, {name:'survey', arg:st.survey_uuid}, {name:'station', arg:arg}]
+              : [home];
+  }
+  return [home, {name, arg}];
+}
+/* いまの画面を別の画面に置き換える（積み上げない） */
+function navReplace(name, arg){
+  if(!STACK.length) STACK=[{name:'home',arg:null}];
+  STACK[STACK.length-1] = {name, arg};
+  render();
+}
 
 function render(){
   SCREEN_SEQ++;
+  draftUnbind();
   destroyMaps();
   const cur = STACK[STACK.length-1];
   const scr = SCREENS[cur.name] || SCREENS.home;
   let v;
   try{ v = scr(cur.arg); }
   catch(e){ console.error(e); toast('画面を開けませんでした'); v = SCREENS.home(); }
-  if(!v){ STACK=[{name:'home',arg:null}]; v = SCREENS.home(); }
+  if(!v){
+    // 消された記録などで画面が作れないときは、ホームへ帰す
+    STACK=[{name:'home',arg:null}]; v = SCREENS.home();
+  }
   $('#title').textContent = v.title || '魚類調査記録';
   $('#backBtn').style.display = STACK.length>1 ? '' : 'none';
   const pills = (v.sub||[]).slice();
@@ -585,6 +750,7 @@ function render(){
 function pickSeg(btn){
   btn.parentElement.querySelectorAll('button').forEach(b=>b.classList.remove('on'));
   btn.classList.add('on');
+  draftTouch();
 }
 function segHtml(field, options, current, allowEmpty){
   const opts = allowEmpty ? ['なし'].concat(options) : options;
@@ -598,7 +764,7 @@ function segVal(field){
   if(!on) return '';
   return on.textContent==='なし' ? '' : on.textContent;
 }
-function pickSegMulti(btn){ btn.classList.toggle('on'); }
+function pickSegMulti(btn){ btn.classList.toggle('on'); draftTouch(); }
 function segMultiHtml(field, options, current){
   const cur = current||[];
   return `<div class="seg" data-segmulti="${esc(field)}">` + options.map(o=>
@@ -692,7 +858,9 @@ function applyBaseMap(slot, name){
   if(!s || !s.map) return;
   const b = BASEMAPS[name] || BASEMAPS['航空写真'];
   if(s.layer){ try{ s.map.removeLayer(s.layer); }catch(e){} }
-  s.layer = L.tileLayer(b.url, {maxZoom:b.max, maxNativeZoom:b.max, attribution:b.attr})
+  // crossOrigin を付けると、中身の分かる応答で返るので保存の可否が判断できる
+  s.layer = L.tileLayer(b.url, {maxZoom:b.max, maxNativeZoom:b.max,
+                                attribution:b.attr, crossOrigin:true})
     .addTo(s.map);
 }
 function baseMapButtonsHtml(){
@@ -757,11 +925,35 @@ function pointInPoly(lat, lon, poly){
 function tx2lon(x,z){ return x/Math.pow(2,z)*360-180; }
 function ty2lat(y,z){ const n=Math.PI-2*Math.PI*y/Math.pow(2,z);
   return 180/Math.PI*Math.atan(0.5*(Math.exp(n)-Math.exp(-n))); }
-/* タイルが範囲にかかるか。四隅と中心のどれかが入っていれば拾う */
+/* 2本の線分が交わるか */
+function segCross(a1,a2,b1,b2){
+  const d=(p,q,r)=>(q[1]-p[1])*(r[0]-q[0])-(q[0]-p[0])*(r[1]-q[1]);
+  const s1=d(a1,a2,b1), s2=d(a1,a2,b2), s3=d(b1,b2,a1), s4=d(b1,b2,a2);
+  return ((s1>0)!==(s2>0)) && ((s3>0)!==(s4>0));
+}
+/* タイルが範囲にかかるか。
+   四隅と中心を見るだけだと、
+   ・囲った範囲がタイル1枚の中にすっぽり収まるとき
+   ・細長い範囲がタイルを横切るだけのとき
+   を取りこぼし、粗い倍率で地図が欠ける（2026-08-16 の監査 Major）。
+   タイルの角が範囲に入るか／範囲の角がタイルに入るか／辺どうしが交わるか、の3つで見る */
 function tileHitsPoly(x,y,z,poly){
   const w=tx2lon(x,z), e=tx2lon(x+1,z), n=ty2lat(y,z), s=ty2lat(y+1,z);
+  // 1) タイルの角か中心が、囲った範囲の中にある
   const pts=[[n,w],[n,e],[s,w],[s,e],[(n+s)/2,(w+e)/2]];
-  return pts.some(p=>pointInPoly(p[0],p[1],poly));
+  if(pts.some(p=>pointInPoly(p[0],p[1],poly))) return true;
+  // 2) 囲った範囲の角が、タイルの中にある（範囲がタイルに収まる場合）
+  const inTile=p=>p[0]>=s && p[0]<=n && p[1]>=w && p[1]<=e;
+  if(poly.some(inTile)) return true;
+  // 3) 辺どうしが交わる（横切るだけの場合）
+  const corners=[[n,w],[n,e],[s,e],[s,w]];
+  for(let i=0;i<poly.length;i++){
+    const a1=poly[i], a2=poly[(i+1)%poly.length];
+    for(let j=0;j<4;j++){
+      if(segCross(a1,a2,corners[j],corners[(j+1)%4])) return true;
+    }
+  }
+  return false;
 }
 function packTiles(poly, zmax){
   const out=[];
@@ -791,8 +983,23 @@ function packEstimate(poly, zmax, layers){
   const n = packTileUrls(poly, zmax, layers).length;
   return {tiles:n, mb: Math.round(n*0.02*10)/10};   // 1枚 約20KB で見積もる
 }
-function packStore(){ try{ return JSON.parse(localStorage.getItem('fs_map_packs')||'[]'); }
-  catch(e){ return []; } }
+function packStore(){
+  let a;
+  try{ a = JSON.parse(localStorage.getItem('fs_map_packs')||'[]'); }
+  catch(e){ return []; }
+  if(!Array.isArray(a)) return [];
+  a = a.filter(Boolean);
+  // 昔の記録には印（id）が無い。無いまま扱うと、どの「消す」を押しても
+  // 印の無いものが全部まとめて一覧から消える。読むときに付け直す
+  const seen = new Set();
+  let changed = false;
+  a.forEach(p=>{
+    if(!p.id || seen.has(p.id)){ p.id = uuid(); changed = true; }
+    seen.add(p.id);
+  });
+  if(changed) packSaveList(a);
+  return a;
+}
 function packSaveList(a){ try{ localStorage.setItem('fs_map_packs', JSON.stringify(a)); }catch(e){} }
 /* サービスワーカーに頼む（返事を待つ） */
 function swAsk(msg, timeoutMs){
@@ -849,9 +1056,41 @@ const FS_HABITAT_KEY = ['環境区分','河川形態B','水温','水深','流速
 
 /* データベース取り込み用の行を組み立てる。
    1行 = 1種の結果。落とすものは黙って落とさず、理由と件数を返す */
+/* 書き出しのための控えを取る。
+   ここは「読めない」を「空」と取り違えてはいけない場所なので、
+   壊れていたら例外にする読み方（loadRaw）を使う。
+   表示用の読み方だと、体長の記録が壊れていたとき尾数を少なく出してしまう
+   （2026-08-16 の監査 Critical） */
+function exportSnapshot(){
+  const box = {};
+  [['st', DB.key.st, '箇所'], ['ca', DB.key.ca, '魚の記録'],
+   ['ind', DB.key.ind, '1尾ずつの記録']].forEach(([k, key, label])=>{
+    try{ box[k] = DB.loadRaw(key).filter(x=>x && !x.deleted_at); }
+    catch(e){ throw new Error(label + 'を読み取れません。書き出しを中止しました'); }
+  });
+  // 1尾ずつの記録は、記録ごとにまとめておく。
+  // 毎回すべてを見に行くと、記録が増えたときに時間がかかりすぎる
+  box.byCatch = {};
+  box.ind.forEach(i=>{
+    const k = i.catch_uuid;
+    if(!k) return;
+    (box.byCatch[k] || (box.byCatch[k]=[])).push(i);
+  });
+  return box;
+}
+
 function buildDbRows(sv){
   const rows=[], excluded=[], blocked=[], warnings=[];
-  const stations = DB.stationsOf(sv.uuid);
+
+  let snap;
+  try{ snap = exportSnapshot(); }
+  catch(e){
+    // 読めないものがある。空として出すと記録を取りこぼすので、何も作らずに止める
+    return {rows:[], excluded:[], warnings:[], blocked:[e.message]};
+  }
+
+  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid)
+    .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
   const lat = fixCoord(sv.latitude), lon = fixCoord(sv.longitude);
   if(lat==='' || lon===''){
     blocked.push('調査の位置（緯度経度）が入っていません');
@@ -861,19 +1100,23 @@ function buildDbRows(sv){
     if(!st.survey_time_start){
       blocked.push(`${st.name||'箇所'}：開始時刻が入っていません`);
     }
-    DB.catchesOf(st.uuid).forEach(c=>{
-      const n = catchTotal(c);
+    snap.ca.filter(c=>c.station_uuid===st.uuid)
+      .sort((a,b)=>String(a.created_at||'').localeCompare(String(b.created_at||'')))
+      .forEach(c=>{
       const name = c.species_name || '(種名なし)';
+      const bad = badCount(c, snap);
+      if(bad){ blocked.push(`${name}：${bad}`); return; }
+      const n = catchTotal(c, snap);
       if(!c.species_id){ excluded.push(`${name}（種IDがありません）`); return; }
       if(n<=0){ excluded.push(`${name}（尾数が0です）`); return; }
-      rows.push(dbRowOf(sv, st, c));
+      rows.push(dbRowOf(sv, st, c, snap));
     });
   });
   // 別々の箇所が1つにまとめられてしまう組み合わせを探す。
   // 実際に書き出す文字で見る（画面の値ではなく、CSVに載る形で比べる）
   const seen = {};
   stations.forEach(st=>{
-    const src = dbRowOf(sv, st, null);
+    const src = dbRowOf(sv, st, null, snap);
     const k = FS_HABITAT_KEY.map(c=>String(src[c]==null?'':src[c])).join('');
     if(seen[k]) warnings.push(`${seen[k]} と ${st.name} は、取り込み側で1つの箇所にまとめられます`);
     else seen[k] = st.name;
@@ -882,8 +1125,8 @@ function buildDbRows(sv){
   return {rows, excluded, blocked, warnings};
 }
 /* CSVの1行を組み立てる。c が null なら魚の欄は空のまま（箇所の鍵を調べるときに使う） */
-function dbRowOf(sv, st, c){
-  const ls = c ? catchLengths(c) : [];
+function dbRowOf(sv, st, c, inds){
+  const ls = c ? catchLengths(c, inds) : [];
   return {
     '緯度': fixCoord(sv.latitude), '経度': fixCoord(sv.longitude),
     '調査日':sv.survey_date||'', '季節':sv.season||'', '天気':sv.weather||'',
@@ -895,7 +1138,7 @@ function dbRowOf(sv, st, c){
     '河床材料':st.substrate1||'', '礫の状況':st.gravel_condition||'',
     '環境区分':st.habitat_type||'',
     '調査区分':st.survey_type||'', '調査方法':(st.survey_method||[]).join(','),
-    '種ID': c ? (c.species_id||'') : '', '個体数': c ? catchTotal(c) : '',
+    '種ID': c ? (c.species_id||'') : '', '個体数': c ? catchTotal(c, inds) : '',
     '最大体長': ls.length ? Math.max.apply(null,ls) : '',
     '最小体長': ls.length ? Math.min.apply(null,ls) : '',
     '同定確度': c ? (c.identification_confidence||'') : '',
@@ -949,11 +1192,11 @@ SCREENS.home = ()=>{
 /* ---------- 調査の作成・編集 ---------- */
 SCREENS.surveyEdit = (svUuid)=>{
   const isNew = !svUuid;
-  const sv = isNew ? {} : (DB.get(DB.key.sv, svUuid) || {});
+  const sv = isNew ? {} : DB.getAlive(DB.key.sv, svUuid);
+  if(!isNew && !sv) return null;      // 消した調査は開かせない
   const p = prefs();
   const today = dateValue();
-  const d = isNew ? (draftGet('newSurvey')||{}) : {};
-  const g = k => (d[k]!==undefined ? d[k] : (sv[k]!==undefined ? sv[k] : ''));
+  const g = k => (sv[k]!==undefined ? sv[k] : '');
   return {
     title: isNew ? '新しい調査' : '調査の設定',
     html:`
@@ -1001,13 +1244,40 @@ SCREENS.surveyEdit = (svUuid)=>{
       <button class="btn pri" onclick="saveSurvey('${svUuid||''}')">${isNew?'この調査をつくる':'保存する'}</button>
       ${isNew?'':`<button class="btn ng" onclick="deleteSurvey('${svUuid}')">この調査を削除する</button>`}
     `,
-    onMount(){ startGps(); }
+    onMount(){
+      startGps();
+      const key = 'survey:'+(svUuid||'new');
+      const d = draftGet(key);
+      if(d){
+        applyVals({'#f_date':d.survey_date, '#f_river':d.river_name, '#f_site':d.site_name,
+          '#f_section':d.section_name, '#f_lat':d.latitude, '#f_lon':d.longitude,
+          '#f_pno':d.project_number, '#f_pname':d.project_name, '#f_inv':d.investigator,
+          '#f_memo':d.memo});
+        applySeg('season', d.season); applySeg('weather', d.weather);
+        applySeg('formA', d.river_morphology_a); applySeg('svtype', d.survey_type_default);
+        toast('書きかけを戻しました');
+      }
+      draftBind(key, collectSurvey);
+    }
   };
 };
+/* 入力欄から値を集める。下書きの保存と、保存ボタンの両方で使う */
+function collectSurvey(){
+  return {
+    survey_date: strVal('#f_date'), season: segVal('season'), weather: segVal('weather'),
+    river_name: strVal('#f_river'), site_name: strVal('#f_site'),
+    section_name: strVal('#f_section'), river_morphology_a: segVal('formA'),
+    latitude: strVal('#f_lat'), longitude: strVal('#f_lon'),
+    project_number: strVal('#f_pno'), project_name: strVal('#f_pname'),
+    investigator: strVal('#f_inv'), survey_type_default: segVal('svtype'),
+    memo: strVal('#f_memo'),
+  };
+}
 function onSurveyDate(){
   const s = seasonOf(strVal('#f_date'));
   const wrap = $('#f_season_wrap');
   if(wrap && s) wrap.innerHTML = segHtml('season', OPT.season, s, true);
+  draftTouch();      // 入れ直した季節も控える
 }
 function grabPos(){
   toast('現在地を取っています…');
@@ -1019,26 +1289,28 @@ function grabPos(){
     const el=$('#posInfo');
     if(el) el.textContent = `決め方：GPS（精度およそ${Math.round(f.acc)}m）`;
     window._posSource = 'GPS'; window._posAcc = f.acc;
+    draftTouch();      // 差し込んだ緯度経度は input が起きないので、自分で控える
     toast('現在地を入れました');
   });
 }
 function saveSurvey(svUuid){
   const rec = svUuid ? (DB.get(DB.key.sv, svUuid)||{uuid:svUuid}) : {uuid:uuid(), status:'未開始'};
-  rec.survey_date        = strVal('#f_date');
-  rec.season             = segVal('season');
-  rec.weather            = segVal('weather');
-  rec.river_name         = strVal('#f_river');
-  rec.site_name          = strVal('#f_site');
-  rec.section_name       = strVal('#f_section');
-  rec.river_morphology_a = segVal('formA');
-  rec.latitude           = numVal('#f_lat');
-  rec.longitude          = numVal('#f_lon');
+  const f = collectSurvey();
+  rec.survey_date        = f.survey_date;
+  rec.season             = f.season;
+  rec.weather            = f.weather;
+  rec.river_name         = f.river_name;
+  rec.site_name          = f.site_name;
+  rec.section_name       = f.section_name;
+  rec.river_morphology_a = f.river_morphology_a;
+  rec.latitude           = numOf(f.latitude);
+  rec.longitude          = numOf(f.longitude);
   if(window._posSource){ rec.position_source = window._posSource; rec.gps_accuracy = window._posAcc; }
-  rec.project_number     = strVal('#f_pno');
-  rec.project_name       = strVal('#f_pname');
-  rec.investigator       = strVal('#f_inv');
-  rec.survey_type_default= segVal('svtype') || '採取';
-  rec.memo               = strVal('#f_memo');
+  rec.project_number     = f.project_number;
+  rec.project_name       = f.project_name;
+  rec.investigator       = f.investigator;
+  rec.survey_type_default= f.survey_type_default || '採取';
+  rec.memo               = f.memo;
   if(!rec.river_name && !rec.site_name){ toast('河川名か地点名のどちらかは入れてください'); return; }
   const ok = DB.upsert(DB.key.sv, rec);
   if(!ok) return;                       // 保存できていないので画面も動かさない
@@ -1046,9 +1318,10 @@ function saveSurvey(svUuid){
   prefSet('project_number', rec.project_number);
   prefSet('project_name', rec.project_name);
   prefSet('investigator', rec.investigator);
-  draftClear('newSurvey');
+  draftClear('survey:'+(svUuid||'new'));
+  draftUnbind();
   toast('保存しました');
-  if(svUuid) goBack(); else reset('survey', rec.uuid);
+  if(svUuid) goBack(); else goTo('survey', rec.uuid);
 }
 function deleteSurvey(u){
   if(!confirm('この調査を削除します。よろしいですか？（ごみ箱に入ります）')) return;
@@ -1057,7 +1330,7 @@ function deleteSurvey(u){
 
 /* ---------- 調査ハブ ---------- */
 SCREENS.survey = (svUuid)=>{
-  const sv = DB.get(DB.key.sv, svUuid);
+  const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
   const stations = DB.stationsOf(svUuid);
   const running  = stations.find(s=>!s.ended_at);
@@ -1125,9 +1398,10 @@ function newStation(svUuid){
 SCREENS.stationEdit = (arg)=>{
   arg = arg||{};
   const isNew = !arg.uuid;
-  const st = isNew ? {} : (DB.get(DB.key.st, arg.uuid) || {});
+  const st = isNew ? {} : (DB.liveStation(arg.uuid) || null);
+  if(!isNew && !st) return null;
   const svUuid = isNew ? arg.survey : st.survey_uuid;
-  const sv = DB.get(DB.key.sv, svUuid);
+  const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
   const no = isNew ? (DB.stationsOf(svUuid).length + 1) : st.station_no;
   const g = k => (st[k]!==undefined && st[k]!=='' ? st[k] : '');
@@ -1165,40 +1439,70 @@ SCREENS.stationEdit = (arg)=>{
       <button class="btn pri" onclick="saveStation('${svUuid}','${arg.uuid||''}')">
         ${isNew?'この箇所をはじめる':'保存する'}</button>
       ${isNew?'':`<button class="btn ng" onclick="deleteStation('${arg.uuid}')">この箇所を削除する</button>`}
-    `};
+    `,
+    onMount(){
+      const key = 'station:'+(arg.uuid || ('new:'+svUuid));
+      const d = draftGet(key);
+      if(d){
+        applyVals({'#s_name':d.name, '#s_wt':d.water_temp, '#s_depth':d.depth_rep_cm,
+          '#s_vel':d.velocity_rep_cms, '#s_memo':d.memo});
+        applySeg('habitat', d.habitat_type); applySeg('svtype2', d.survey_type);
+        applySeg('sub1', d.substrate1); applySeg('gravel', d.gravel_condition);
+        applySegMulti('method', d.survey_method);
+        toast('書きかけを戻しました');
+      }
+      draftBind(key, collectStation);
+    }
+  };
 };
+function collectStation(){
+  return {
+    name: strVal('#s_name'), habitat_type: segVal('habitat'),
+    survey_type: segVal('svtype2'), survey_method: segMultiVal('method'),
+    water_temp: strVal('#s_wt'), substrate1: segVal('sub1'),
+    gravel_condition: segVal('gravel'), depth_rep_cm: strVal('#s_depth'),
+    velocity_rep_cms: strVal('#s_vel'), memo: strVal('#s_memo'),
+  };
+}
+
 function saveStation(svUuid, stUuid){
   const isNew = !stUuid;
   const rec = isNew
     ? {uuid:uuid(), survey_uuid:svUuid, station_no: DB.stationsOf(svUuid).length+1,
        started_at:nowISO(), survey_time_start:timeValue(), env_points:[]}
     : (DB.get(DB.key.st, stUuid)||{uuid:stUuid, survey_uuid:svUuid});
-  rec.name              = strVal('#s_name') || ('St.'+(rec.station_no||1));
-  rec.habitat_type      = segVal('habitat');
-  rec.survey_type       = segVal('svtype2') || '採取';
-  rec.survey_method     = segMultiVal('method');
-  rec.water_temp        = numVal('#s_wt');
-  rec.substrate1        = segVal('sub1');
-  rec.gravel_condition  = segVal('gravel');
-  rec.depth_rep_cm      = numVal('#s_depth');
-  rec.velocity_rep_cms  = numVal('#s_vel');
-  rec.memo              = strVal('#s_memo');
+  const f = collectStation();
+  rec.name              = f.name || ('St.'+(rec.station_no||1));
+  rec.habitat_type      = f.habitat_type;
+  rec.survey_type       = f.survey_type || '採取';
+  rec.survey_method     = f.survey_method;
+  rec.water_temp        = numOf(f.water_temp);
+  rec.substrate1        = f.substrate1;
+  rec.gravel_condition  = f.gravel_condition;
+  rec.depth_rep_cm      = numOf(f.depth_rep_cm);
+  rec.velocity_rep_cms  = numOf(f.velocity_rep_cms);
+  rec.memo              = f.memo;
   const ok = DB.upsert(DB.key.st, rec);
-  if(!ok) return;
+  if(!ok) return;                       // 保存できていないので書きかけを消さない
+  draftClear('station:'+(stUuid || ('new:'+svUuid)));
+  draftUnbind();
   toast(isNew?'箇所をはじめました':'保存しました');
-  if(isNew) reset('station', rec.uuid); else goBack();
+  if(isNew) goTo('station', rec.uuid); else goBack();
 }
 function deleteStation(u){
+  const st = DB.get(DB.key.st, u);
   const n = DB.catchesOf(u).length;
-  if(!confirm(`この箇所を削除します。${n>0?`記録${n}件も一緒に消えます。`:''}よろしいですか？`)) return;
+  if(!confirm(`この箇所を削除します。${n>0?`記録${n}件も一緒に見えなくなります。`:''}よろしいですか？`)) return;
+  // 印を付けるのは箇所1つだけ。中の記録は「親が消えている」ことで隠れる。
+  // 何件も書き込むと、途中で失敗したときに迷子の記録が残る
   if(!DB.softDelete(DB.key.st, u)) return;
-  DB.catchesOf(u).forEach(c=>DB.softDelete(DB.key.ca, c.uuid, u));
-  toast('削除しました'); goBack();
+  toast('削除しました');
+  goTo('survey', st ? st.survey_uuid : null);
 }
 
 /* ---------- 箇所ハブ ---------- */
 SCREENS.station = (stUuid)=>{
-  const st = DB.get(DB.key.st, stUuid);
+  const st = DB.liveStation(stUuid);
   if(!st) return null;
   const sv = DB.get(DB.key.sv, st.survey_uuid);
   const cs = DB.catchesOf(stUuid);
@@ -1246,7 +1550,7 @@ function endStation(u){
   const st = DB.get(DB.key.st, u); if(!st) return;
   st.ended_at = nowISO();
   st.survey_time_end = timeValue();
-  if(DB.upsert(DB.key.st, st)){ toast('箇所を終えました'); reset('survey', st.survey_uuid); }
+  if(DB.upsert(DB.key.st, st)){ toast('箇所を終えました'); goTo('survey', st.survey_uuid); }
 }
 function reopenStation(u){
   const st = DB.get(DB.key.st, u); if(!st) return;
@@ -1256,7 +1560,7 @@ function reopenStation(u){
 
 /* ---------- 魚種を選ぶ ---------- */
 SCREENS.speciesPick = (stUuid)=>{
-  const st = DB.get(DB.key.st, stUuid);
+  const st = DB.liveStation(stUuid);
   if(!st) return null;
   return {
     title:'魚種を選ぶ',
@@ -1295,9 +1599,9 @@ function pickSpecies(stUuid, spId){
 SCREENS.catchEdit = (arg)=>{
   arg = arg||{};
   const isNew = !arg.uuid;
-  const c  = isNew ? {} : (DB.get(DB.key.ca, arg.uuid)||{});
+  const c  = isNew ? {} : (DB.getAlive(DB.key.ca, arg.uuid)||{});
   const stUuid = isNew ? arg.station : c.station_uuid;
-  const st = DB.get(DB.key.st, stUuid);
+  const st = DB.liveStation(stUuid);
   if(!st) return null;
   const spId = isNew ? arg.species : c.species_id;
   const sp = speciesById(spId);
@@ -1323,9 +1627,27 @@ SCREENS.catchEdit = (arg)=>{
       <button class="btn" onclick="saveCatch('${stUuid}','${arg.uuid||''}','${spId||''}',true)">保存して次の魚種へ</button>
       ${isNew?'':`<button class="btn ng" onclick="deleteCatch('${arg.uuid}')">この記録を削除する</button>`}
     `,
-    onMount(){ const el=$('#c_n'); if(el && isNew) el.focus(); }
+    onMount(){
+      const key = 'catch:'+(arg.uuid || ('new:'+stUuid+':'+(spId||'')));
+      const d = draftGet(key);
+      if(d){
+        applyVals({'#c_n':d.count_unmeasured, '#c_note':d.notes});
+        applySeg('conf', d.identification_confidence);
+        toast('書きかけを戻しました');
+      }
+      draftBind(key, collectCatch);
+      const el=$('#c_n'); if(el && isNew && !d) el.focus();
+    }
   };
 };
+function collectCatch(){
+  return {
+    count_unmeasured: strVal('#c_n'),
+    identification_confidence: segVal('conf'),
+    notes: strVal('#c_note'),
+  };
+}
+
 function saveCatch(stUuid, caUuid, spId, next){
   const st = DB.get(DB.key.st, stUuid); if(!st) return;
   const sp = speciesById(spId);
@@ -1335,32 +1657,45 @@ function saveCatch(stUuid, caUuid, spId, next){
   rec.survey_uuid  = rec.survey_uuid  || st.survey_uuid;
   rec.station_uuid = rec.station_uuid || stUuid;
   if(spId){ rec.species_id=spId; rec.species_name=sp?sp.ja:''; rec.species_family=sp?sp.fam:''; }
-  rec.count_unmeasured        = numVal('#c_n');
+  const raw = strVal('#c_n');
+  if(countOf(raw)===null){
+    toast('尾数は0以上の整数で入れてください（小数やマイナスは入れられません）', 5000);
+    return;                       // 保存もせず、画面も動かさない
+  }
+  rec.count_unmeasured        = countOf(raw);
   rec.identification_confidence = segVal('conf');
   rec.notes                   = strVal('#c_note');
+  const draftKey = 'catch:'+(caUuid || ('new:'+stUuid+':'+(spId||'')));
   if(catchTotalOf(rec)<=0){
     toast('尾数を入れてください（0だと書き出しから除かれます）');
   }
-  if(!DB.upsert(DB.key.ca, rec)) return;
+  if(!DB.upsert(DB.key.ca, rec)) return;   // 保存できていないので書きかけを消さない
+  draftClear(draftKey);
+  draftUnbind();
   toast('保存しました');
-  if(next){ STACK.pop(); nav('speciesPick', stUuid); }
-  else { reset('station', stUuid); }
+  if(next){
+    // 「次の魚種へ」。1つ下がすでに魚種選びなら、そこへ戻るだけ。
+    // 積み上げると「戻る」で同じ画面を何度も通ることになる
+    if(STACK.length>1 && STACK[STACK.length-2].name==='speciesPick'){ STACK.pop(); render(); }
+    else navReplace('speciesPick', stUuid);
+  }
+  else { goTo('station', stUuid); }
 }
 /* まだ保存していない記録にも使える版 */
 function catchTotalOf(rec){
   const measured = rec.uuid ? DB.individualsOf(rec.uuid).length : 0;
-  const un = numOf(rec.count_unmeasured);
-  return measured + (un===''?0:un);
+  const un = countOf(rec.count_unmeasured);
+  return measured + (un==='' || un===null ? 0 : un);
 }
 function deleteCatch(u){
   if(!confirm('この記録を削除します。よろしいですか？')) return;
   const c = DB.get(DB.key.ca, u);
-  if(DB.softDelete(DB.key.ca, u)){ toast('削除しました'); reset('station', c?c.station_uuid:null); }
+  if(DB.softDelete(DB.key.ca, u)){ toast('削除しました'); goTo('station', c?c.station_uuid:null); }
 }
 
 /* ---------- 地図 ---------- */
 SCREENS.map = (svUuid)=>{
-  const sv = DB.get(DB.key.sv, svUuid);
+  const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
   return {
     title:'地図',
@@ -1397,6 +1732,9 @@ SCREENS.map = (svUuid)=>{
 
 /* ---------- オフライン地図 ---------- */
 let OPOLY = [];
+// 圏外用の地図をさわる処理は、いちどに1つだけ。
+// 保存と削除が重なると、一覧と実体が食い違う
+let PACK_BUSY = false;
 SCREENS.offlineMap = (svUuid)=>{
   const sv = DB.get(DB.key.sv, svUuid);
   const packs = packStore();
@@ -1428,9 +1766,10 @@ SCREENS.offlineMap = (svUuid)=>{
       ${packs.length ? packs.map((p,i)=>`<div class="card">
         <div class="row"><div class="grow">
           <div>${esc(p.name||('範囲'+(i+1)))}</div>
-          <div class="dim small">${p.tiles}枚　およそ${p.mb}MB　${esc((p.layers||[]).join('・'))}</div>
+          <div class="dim small">${p.tiles}枚　およそ${p.mb}MB　${esc((p.layers||[]).join('・'))}
+            ${p.poly?'':'　※古い記録（消しても地図の実体は残ります）'}</div>
         </div><button class="btn sm ng" style="width:auto;margin:0"
-          onclick="packDrop(${i})">消す</button></div></div>`).join('')
+          onclick="packDrop('${esc(p.id||'')}')">消す</button></div></div>`).join('')
         : '<div class="card dim">まだありません。</div>'}
     `,
     onMount(){
@@ -1476,35 +1815,113 @@ function opolyEstimate(){
   el.textContent = `およそ ${e.tiles}枚・${e.mb}MB。通信できるところで保存してください。`;
 }
 function opolySave(svUuid){
+  if(PACK_BUSY){ toast('いま別の地図の出し入れを行っています。少し待ってください'); return; }
+  if(!ownsLock()){
+    toast('このタブでは地図を保存できません。記録を入れているタブから行ってください', 6000);
+    return;
+  }
   if(OPOLY.length<3){ toast('まず3点以上で囲ってください'); return; }
   const layers = segMultiVal('olayers');
   if(!layers.length){ toast('落とす地図を選んでください'); return; }
-  const urls = packTileUrls(OPOLY, opolyZmax(), layers);
+  const zmax = opolyZmax();
+  const poly = OPOLY.slice();
+  const urls = packTileUrls(poly, zmax, layers);
   const prog = $('#oprog');
   if(prog) prog.textContent = `${urls.length}枚を保存しています…`;
+  PACK_BUSY = true;
   swAsk({type:'savePack', urls}, 600000).then(r=>{
-    const okN = (r && r.ok) || 0;
+    PACK_BUSY = false;
+    const okN   = (r && r.ok)   || 0;
+    const failN = (r && r.fail) || 0;
+    if(okN===0){
+      // 1枚も入っていないのに「保存しました」と言わない。
+      // 圏外で地図が出ないことに現場で気づくことになる
+      if(prog) prog.textContent = `1枚も保存できませんでした（${failN}枚失敗）。`
+        + '電波の届くところでもう一度お試しください。';
+      toast('保存できませんでした', 5000);
+      return;
+    }
     const list = packStore();
-    list.push({name:`範囲${list.length+1}`, tiles:okN, mb:Math.round(okN*0.02*10)/10,
-               layers, zmax:opolyZmax(), at:nowISO()});
+    // 消すときに実体をたどれるよう、囲った範囲そのものを覚えておく。
+    // 並びが変わっても取り違えないよう、id を付ける
+    list.push({id:uuid(), name:`範囲${list.length+1}`, tiles:okN, fail:failN,
+               mb:Math.round(okN*0.02*10)/10, layers, zmax, poly, at:nowISO()});
     packSaveList(list);
-    if(prog) prog.textContent = `${okN}枚を保存しました。`;
-    toast('保存しました'); render();
+    if(prog) prog.textContent = failN
+      ? `${okN}枚を保存しました（${failN}枚は取れませんでした）。`
+      : `${okN}枚を保存しました。`;
+    toast(failN ? `${okN}枚保存（${failN}枚は取れず）` : '保存しました', failN?5000:2400);
+    render();
   }).catch(e=>{
+    PACK_BUSY = false;
     if(prog) prog.textContent = '保存できませんでした：'+e.message;
     toast('保存できませんでした');
   });
 }
-function packDrop(i){
+function packDrop(id){
+  if(PACK_BUSY){ toast('いま別の地図の出し入れを行っています。少し待ってください'); return; }
+  if(!ownsLock()){
+    toast('このタブでは地図を消せません。記録を入れているタブから行ってください', 6000);
+    return;
+  }
   const list=packStore();
-  if(!list[i]) return;
+  const i = list.findIndex(p=>p.id===id);
+  const target = list[i];
+  if(!target) return;
   if(!confirm('この範囲の地図を消します。よろしいですか？')) return;
-  list.splice(i,1); packSaveList(list); render();
+
+  // 番号ではなく id で消す。並びは削除の間に変わりうる
+  const dropFromList = (msg)=>{
+    const rest = packStore().filter(p=>p.id!==id);
+    packSaveList(rest);
+    toast(msg, 5000); render();
+  };
+
+  // 範囲の形を覚えていない古い記録が1つでもあると、
+  // 「ほかの範囲でも使っているタイル」を数え切れない。
+  // 数え違えると、別の範囲の地図まで消してしまう
+  const others = list.filter(p=>p.id!==id);
+  if(!target.poly || others.some(p=>!p.poly)){
+    dropFromList('一覧から消しました。'
+      + '（範囲の形を覚えていない古い記録があるため、地図の実体は残します）');
+    return;
+  }
+
+  const mine = new Set(packTileUrls(target.poly, target.zmax, target.layers||[]));
+  const keep = new Set();
+  others.forEach(p=>packTileUrls(p.poly, p.zmax, p.layers||[]).forEach(u=>keep.add(u)));
+  const drop = Array.from(mine).filter(u=>!keep.has(u));
+
+  if(!drop.length){
+    dropFromList('一覧から消しました（ほかの範囲でも使っている地図は残ります）');
+    return;
+  }
+
+  PACK_BUSY = true;
+  toast(`${drop.length}枚を消しています…`);
+  swAsk({type:'dropPack', urls:drop}, 300000).then(r=>{
+    PACK_BUSY = false;
+    if(!r || r.error){
+      toast('地図の実体を消せませんでした。一覧はそのまま残します（'
+        + ((r&&r.error)||'返事がありません') + '）', 8000);
+      return;                      // 一覧を消さない。あとでやり直せる
+    }
+    const failed = (r.failed||[]).length;
+    if(failed){
+      toast(`${r.deleted||0}枚を消しましたが、${failed}枚が残りました。`
+        + '一覧はそのまま残します。もう一度お試しください', 8000);
+      return;
+    }
+    dropFromList(`${r.deleted||0}枚を消しました`);
+  }).catch(e=>{
+    PACK_BUSY = false;
+    toast('地図の実体を消せませんでした。一覧はそのまま残します（'+e.message+'）', 8000);
+  });
 }
 
 /* ---------- 書き出し ---------- */
 SCREENS.exportHub = (svUuid)=>{
-  const sv = DB.get(DB.key.sv, svUuid);
+  const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
   const r = buildDbRows(sv);
   return {
@@ -1543,14 +1960,34 @@ SCREENS.exportHub = (svUuid)=>{
     `};
 };
 function exportDbCsv(svUuid){
+  // 使用権のないタブから書き出すと、別のタブが書き換えている途中の
+  // ばらばらな中身を1つのCSVに混ぜてしまう
+  if(!ownsLock()){
+    toast('このタブでは書き出せません。記録を入れているタブから書き出してください', 6000);
+    return;
+  }
   const sv = DB.get(DB.key.sv, svUuid); if(!sv) return;
   const r = buildDbRows(sv);
   if(r.blocked.length){ toast('先に足りないところを直してください'); return; }
   if(!r.rows.length){ toast('書き出す記録がありません'); return; }
+  // 中身を全部作り終えてから、ファイルを出す直前にもう一度使用権を見る。
+  // 組み立てに時間がかかる間に、ほかのタブへ移っていることがある
   const csv = toCsv(FS_DB_COLS, r.rows);
-  download(`${exportFileBase(sv)}_DB取込用.csv`, '﻿'+csv, 'text/csv;charset=utf-8');
+  const fname = `${exportFileBase(sv)}_DB取込用.csv`;
+  if(!ownsLock()){
+    toast('書き出しの途中で、ほかのタブに使用権が移りました。'
+        + 'このタブを読み込み直してからやり直してください', 8000);
+    return;
+  }
+  download(fname, '﻿'+csv, 'text/csv;charset=utf-8');
   sv.exported_at = nowISO();
-  DB.upsert(DB.key.sv, sv);
+  if(!DB.upsert(DB.key.sv, sv)){
+    // ファイルは作れたが、書き出した記録が残らなかった。
+    // 「書き出しました」と言うと、二重に取り込む危険が上がる
+    toast('CSVは作りましたが、書き出した日時を保存できませんでした。'
+        + '端末の空き容量を確認し、ページを読み込み直してください', 8000);
+    return;
+  }
   toast(`${r.rows.length}行を書き出しました`);
   render();
 }

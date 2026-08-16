@@ -1,4 +1,4 @@
-const CACHE = 'fish-survey-v1';   // fish_survey.html の APP_VERSION と番号を揃える
+const CACHE = 'fish-survey-v2';   // fish_survey.html の APP_VERSION と番号を揃える
 // これが揃わないとアプリが成立しないもの。install時に全部そろわなければ失敗させ、
 // 中途半端なキャッシュのまま有効にしない
 const CORE = [
@@ -77,7 +77,11 @@ async function handleTile(request){
   if (cached) return cached;
   try{
     const res = await fetch(request);
-    if (res.ok){
+    // 地図タイルは中身の分からない応答(opaque)で返ることがある。
+    // ok だけを見ていると1枚も保存されず、「動かして溜まる分」が働かない。
+    // 行き先は isTile() で国土地理院に限っているので、opaque も保存してよい
+    const keep = res && (res.ok || res.type === 'opaque');
+    if (keep){
       const keys = await cache.keys();
       if (keys.length >= MAX_TILES){ for (let i=0;i<200;i++) await cache.delete(keys[i]); }
       await cache.put(request, res.clone());
@@ -89,27 +93,27 @@ async function handleTile(request){
   }
 }
 
-// 画面からの頼みごと（範囲の保存・容量の確認・削除）
+// 画面からの頼みごと（範囲の保存・容量の確認・削除）。
+// 時間のかかる処理は e.waitUntil() で押さえる。押さえないと、
+// 途中でこの仕組みが休止させられ、保存が尻切れになる
 self.addEventListener('message', e => {
   const m = e.data || {};
   const reply = r => { try{ e.ports[0] && e.ports[0].postMessage(r); }catch(err){} };
-  if (m.type === 'savePack'){
-    (async () => {
+  const run = async () => {
+    if (m.type === 'savePack'){
       const pack = await caches.open(PACK_CACHE);
-      let ok=0, fail=0;
+      let ok=0, fail=0, already=0;
       for (const url of (m.urls||[])){
         try{
-          if (await pack.match(url)){ ok++; continue; }
+          if (await pack.match(url)){ already++; ok++; continue; }
           const res = await fetch(url, { mode:'cors' });
-          // 中身の分からない応答（opaque）は保存しても圏外で使えないので数えない
+          // 中身の分からない応答は圏外で使えないので、保存したことにしない
           if (res.ok && res.type !== 'opaque'){ await pack.put(url, res.clone()); ok++; }
           else fail++;
         }catch(err){ fail++; }
       }
-      reply({ ok, fail });
-    })();
-  } else if (m.type === 'packStats'){
-    (async () => {
+      reply({ ok, fail, already, total:(m.urls||[]).length });
+    } else if (m.type === 'packStats'){
       const pack = await caches.open(PACK_CACHE);
       const keys = await pack.keys();
       let bytes=0;
@@ -118,10 +122,29 @@ self.addEventListener('message', e => {
         try{ bytes += (await r.clone().blob()).size; }catch(err){}
       }
       reply({ count: keys.length, bytes });
-    })();
-  } else if (m.type === 'clearPacks'){
-    caches.delete(PACK_CACHE).then(()=>reply({ ok:true }));
-  }
+    } else if (m.type === 'dropPack'){
+      // 消してよいURLだけを受け取り、実体を消す。
+      // 一覧から消すだけだと、容量を食ったままになる。
+      // 消せなかったものは黙って数から外さず、URLごと返す
+      const pack = await caches.open(PACK_CACHE);
+      let deleted=0; const failed=[];
+      for (const url of (m.urls||[])){
+        try{
+          if (await pack.delete(url)) { deleted++; continue; }
+          // もともと入っていなければ、消えているのと同じ
+          if (!(await pack.match(url))) { deleted++; continue; }
+          failed.push(url);
+        }catch(err){ failed.push(url); }
+      }
+      reply({ deleted, failed, asked:(m.urls||[]).length });
+    } else if (m.type === 'clearPacks'){
+      await caches.delete(PACK_CACHE);
+      reply({ ok:true });
+    } else {
+      reply({ error:'unknown message type' });
+    }
+  };
+  e.waitUntil(run().catch(err => reply({ error: String(err && err.message || err) })));
 });
 
 async function networkFirst(request){
