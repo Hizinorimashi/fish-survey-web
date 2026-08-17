@@ -117,7 +117,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v14';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v15';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1173,7 +1173,35 @@ function stWordOf(st){
 }
 
 function isLiveNow(sv){
-  return !!sv && sv.status==='調査中' && sv.survey_date===dateValue();
+  if(!sv || sv.status!=='調査中') return false;
+  return surveyDays(sv).indexOf(dateValue()) >= 0;
+}
+
+/* 調査の期間。終了日が無ければ1日だけ */
+function surveyDays(sv){
+  const a = String(sv && sv.survey_date || '').slice(0,10);
+  const b = String(sv && sv.survey_date_end || '').slice(0,10) || a;
+  if(!a) return [];
+  const out = [];
+  const d0 = new Date(a+'T00:00:00'), d1 = new Date((b<a?a:b)+'T00:00:00');
+  if(isNaN(d0) || isNaN(d1)) return a ? [a] : [];
+  for(let d=new Date(d0); d<=d1 && out.length<62; d.setDate(d.getDate()+1)){
+    out.push(dateValue(d));
+  }
+  return out.length ? out : [a];
+}
+function surveyIsMultiDay(sv){ return surveyDays(sv).length > 1; }
+/* 期間の見せ方 */
+function surveyPeriodText(sv){
+  const days = surveyDays(sv);
+  if(!days.length) return '—';
+  if(days.length===1) return days[0];
+  return `${days[0]} 〜 ${days[days.length-1]}（${days.length}日）`;
+}
+/* その箇所の日付。入っていなければ調査の開始日 */
+function stationDate(st, sv){
+  const d = String(st && st.survey_date || '').slice(0,10);
+  return d || String(sv && sv.survey_date || '').slice(0,10);
 }
 
 function seasonOf(dateStr){
@@ -1959,7 +1987,9 @@ function dbRowOf(sv, st, c, inds){
   const ls = c ? catchLengths(c, inds) : [];
   return {
     '緯度': fixCoord(sv.latitude), '経度': fixCoord(sv.longitude),
-    '調査日':sv.survey_date||'', '季節':sv.season||'', '天気':sv.weather||'',
+    // 何日かにわたる調査では、その箇所の日付を使う。
+    // 取り込み側は調査日で調査を分けるので、日ごとに別の調査として入る
+    '調査日': stationDate(st, sv), '季節':sv.season||'', '天気':sv.weather||'',
     '水温': numOf(st.water_temp),
     // 代表値は「手入力があればそれ、無ければ測点の平均」
     '水深': cmToM(depthStats(st).rep),
@@ -1991,7 +2021,7 @@ function buildIndRows(sv, snap){
         .slice().sort((a,b)=>(a.individual_number||0)-(b.individual_number||0))
         .forEach(i=>{
           rows.push({
-            '調査日':sv.survey_date||'', '河川名':sv.river_name||'', '地点名':sv.site_name||'',
+            '調査日': stationDate(st, sv), '河川名':sv.river_name||'', '地点名':sv.site_name||'',
             '箇所':st.name||'', '種ID':c.species_id||'', '種名':c.species_name||'',
             '個体番号': numOf(i.individual_number),
             '全長cm': numOf(i.total_length_cm),
@@ -2016,7 +2046,7 @@ function buildPointRows(sv, snap){
     .forEach(st=>{
       envPoints(st).forEach((pt,i)=>{
         rows.push({
-          '調査日':sv.survey_date||'', '河川名':sv.river_name||'', '地点名':sv.site_name||'',
+          '調査日': stationDate(st, sv), '河川名':sv.river_name||'', '地点名':sv.site_name||'',
           '箇所':st.name||'', '測点番号': i+1,
           '水深cm': numOf(pt.depth_cm), '流速cms': numOf(pt.velocity_cms),
           '河床材料': pt.substrate||'', '備考': pt.note||'',
@@ -2045,7 +2075,7 @@ function buildStationRows(sv, snap){
       per100m2: (area.used!=='' && area.used>0) ? n/area.used*100 : '',
     };
     return {
-      '調査日':sv.survey_date||'', '河川名':sv.river_name||'', '地点名':sv.site_name||'',
+      '調査日': stationDate(st, sv), '河川名':sv.river_name||'', '地点名':sv.site_name||'',
       '箇所':st.name||'', '記録のしかた':sv.detail_level||'一般',
       '緯度': fixCoord(st.latitude), '経度': fixCoord(st.longitude),
       'GPS精度m': numOf(st.gps_accuracy), '位置の決め方': st.position_source||'',
@@ -2098,7 +2128,9 @@ function buildSurveyRow(sv, snap){
   const measured = cs.reduce((a,c)=>a+indsOf(snap, c.uuid).length, 0);
   const len = surveyLengths(sv), area = surveyAreas(sv);
   return [{
-    '調査日':sv.survey_date||'', '季節':sv.season||'', '天気':sv.weather||'',
+    '調査日':sv.survey_date||'', '終了日':sv.survey_date_end||'',
+    '日数': surveyDays(sv).length,
+    '季節':sv.season||'', '天気':sv.weather||'',
     '河川名':sv.river_name||'', '地点名':sv.site_name||'', '区間名':sv.section_name||'',
     '河川形態A':sv.river_morphology_a||'', '記録のしかた':sv.detail_level||'一般',
     '緯度': fixCoord(sv.latitude), '経度': fixCoord(sv.longitude),
@@ -2154,7 +2186,7 @@ const FS_STATION_COLS = ['調査日','河川名','地点名','箇所','記録の
   '種数','尾数','100秒あたり尾数','100m2あたり尾数',
   'メモ','調査ID','箇所ID'];
 
-const FS_SURVEY_COLS = ['調査日','季節','天気','河川名','地点名','区間名','河川形態A','記録のしかた',
+const FS_SURVEY_COLS = ['調査日','終了日','日数','季節','天気','河川名','地点名','区間名','河川形態A','記録のしかた',
   '緯度','経度','GPS精度m','位置の決め方','調査者','業務番号','業務名',
   '箇所数','種数','尾数','測った尾数',
   '通電秒数_合計','距離_合計m','距離_手入力m','距離_使う値m',
@@ -2180,7 +2212,7 @@ SCREENS.home = ()=>{
       <div class="row">
         <div class="grow">
           <div style="font-weight:700">${esc(s.river_name||'(河川名なし)')} ${esc(s.site_name||'')}</div>
-          <div class="dim small">${esc(fmtDate(s.survey_date))}　箇所${nSt}　${nSp}種　${surveyTotal(s)}尾</div>
+          <div class="dim small">${esc(surveyPeriodText(s))}　箇所${nSt}　${nSp}種　${surveyTotal(s)}尾</div>
         </div>
         <span class="pill ${cls}">${esc(s.status||'未開始')}</span>
       </div></div>`;
@@ -2223,8 +2255,11 @@ SCREENS.surveyEdit = (svUuid)=>{
     title: isNew ? '新しい調査' : '調査の設定',
     html:`
       <div class="card">
-        <label>調査日</label>
+        <label>調査日（はじめの日）</label>
         <input id="f_date" type="date" value="${esc(g('survey_date')||today)}" onchange="onSurveyDate()">
+        <label>終わりの日　<span class="dim small">何日かにわたるときだけ</span></label>
+        <input id="f_date2" type="date" value="${esc(g('survey_date_end'))}" onchange="onSurveyDate()">
+        <div class="dim small" id="f_daysInfo"></div>
         <label>季節（調査日から自動で入ります）</label>
         <div id="f_season_wrap">${segHtml('season', OPT.season, g('season')||seasonOf(g('survey_date')||today), true)}</div>
         <label>天気</label>
@@ -2293,11 +2328,13 @@ SCREENS.surveyEdit = (svUuid)=>{
     onMount(){
       startGps();
       window._siteUuid = g('site_uuid') || '';
+      onSurveyDate();
       const key = 'survey:'+(svUuid||'new');
       const base = collectSurvey();     // 書きかけを戻す前の姿を控える
       const d = draftGet(key);
       if(d){
-        applyVals({'#f_date':d.survey_date, '#f_river':d.river_name, '#f_site':d.site_name,
+        applyVals({'#f_date':d.survey_date, '#f_date2':d.survey_date_end,
+          '#f_river':d.river_name, '#f_site':d.site_name,
           '#f_section':d.section_name, '#f_lat':d.latitude, '#f_lon':d.longitude,
           '#f_pno':d.project_number, '#f_pname':d.project_name, '#f_inv':d.investigator,
           '#f_memo':d.memo});
@@ -2338,7 +2375,8 @@ SCREENS.surveyEdit = (svUuid)=>{
 /* 入力欄から値を集める。下書きの保存と、保存ボタンの両方で使う */
 function collectSurvey(){
   return {
-    survey_date: strVal('#f_date'), season: segVal('season'), weather: segVal('weather'),
+    survey_date: strVal('#f_date'), survey_date_end: strVal('#f_date2'),
+    season: segVal('season'), weather: segVal('weather'),
     river_name: strVal('#f_river'), site_name: strVal('#f_site'),
     section_name: strVal('#f_section'), river_morphology_a: segVal('formA'),
     latitude: strVal('#f_lat'), longitude: strVal('#f_lon'),
@@ -2427,6 +2465,14 @@ function onSurveyDate(){
   const s = seasonOf(strVal('#f_date'));
   const wrap = $('#f_season_wrap');
   if(wrap && s) wrap.innerHTML = segHtml('season', OPT.season, s, true);
+  const info = $('#f_daysInfo');
+  if(info){
+    const days = surveyDays({survey_date:strVal('#f_date'), survey_date_end:strVal('#f_date2')});
+    info.textContent = days.length>1
+      ? `${days.length}日にわたる調査です。箇所（地点）ごとに日付を選べます。`
+        + `データベースには日ごとに分かれて入ります。`
+      : '';
+  }
   draftTouch();      // 入れ直した季節も控える
 }
 function grabPos(){
@@ -2447,6 +2493,10 @@ function saveSurvey(svUuid){
   const rec = svUuid ? (DB.get(DB.key.sv, svUuid)||{uuid:svUuid}) : {uuid:uuid(), status:'未開始'};
   const f = collectSurvey();
   rec.survey_date        = f.survey_date;
+  rec.survey_date_end    = f.survey_date_end;
+  if(rec.survey_date_end && rec.survey_date_end < rec.survey_date){
+    toast('終わりの日が、はじめの日より前になっています'); return;
+  }
   rec.season             = f.season;
   rec.weather            = f.weather;
   rec.river_name         = f.river_name;
@@ -2501,7 +2551,8 @@ SCREENS.survey = (svUuid)=>{
       <div class="row">
         <div class="grow">
           <div style="font-weight:700">${esc(st.name)}　<span class="dim small">${esc(st.habitat_type||'区分なし')}</span></div>
-          <div class="dim small">${st.survey_time_start
+          <div class="dim small">${surveyIsMultiDay(sv)
+            ? esc(String(stationDate(st, sv)).slice(5))+'　' : ''}${st.survey_time_start
             ? esc(st.survey_time_start)+'〜'+esc(st.survey_time_end||'')
             : '<span class="pill ng">時刻なし</span>'}　${sp}種 ${n}尾${
             effortSeconds(st)>0 ? '　通電'+esc(fmtDur(effortSeconds(st))) : ''}${
@@ -2514,7 +2565,7 @@ SCREENS.survey = (svUuid)=>{
   }).join('');
   return {
     title: `${sv.river_name||''} ${sv.site_name||''}`.trim() || '調査',
-    sub:[{text:fmtDate(sv.survey_date)}, {text:sv.status||'未開始', cls: sv.status==='調査中'?'ok':''},
+    sub:[{text:surveyPeriodText(sv)}, {text:sv.status||'未開始', cls: sv.status==='調査中'?'ok':''},
          {text:`${nSp}種 ${surveyTotal(sv)}尾`}],
     html:`
       ${running
@@ -2637,7 +2688,17 @@ SCREENS.stationEdit = (arg)=>{
       </div>`}
 
       <div class="card">
-        <h3 style="margin-top:0">時刻</h3>
+        <h3 style="margin-top:0">日付と時刻</h3>
+        ${(()=>{ const days = surveyDays(sv);
+          if(days.length<=1) return `<div class="dim small">調査日 ${esc(days[0]||'—')}</div>`;
+          const cur = stationDate(st, sv);
+          return `<label>この${stWord(sv)}の日付</label>
+            ${days.length<=10
+              ? segHtml('stdate', days, cur)
+              : `<input id="s_date" type="date" value="${esc(cur)}"
+                   min="${esc(days[0])}" max="${esc(days[days.length-1])}">`}
+            <div class="dim small">調査は ${esc(surveyPeriodText(sv))}。
+              日付ごとに、別々の調査としてデータベースに入ります。</div>`; })()}
         <div class="row">
           <div class="grow">
             <label>開始</label>
@@ -2683,6 +2744,14 @@ SCREENS.stationEdit = (arg)=>{
           box.textContent = gpsHint();
         }, 2000);
       }
+      // 何日かにわたる調査で、今日が期間の中なら、今日をあらかじめ選んでおく
+      if(isNew && surveyIsMultiDay(sv)){
+        const days = surveyDays(sv);
+        const today = dateValue();
+        const pick = days.indexOf(today)>=0 ? today : days[0];
+        applySeg('stdate', pick);
+        const el = $('#s_date'); if(el && !el.value) el.value = pick;
+      }
       // いま現場にいるなら、開始の時刻をあらかじめ入れておく
       if(isNew && isLiveNow(sv)){
         const el = $('#s_t1');
@@ -2695,7 +2764,9 @@ SCREENS.stationEdit = (arg)=>{
         applyVals({'#s_name':d.name, '#s_wt':d.water_temp,
           '#s_memo':d.memo, '#s_lat':d.latitude, '#s_lon':d.longitude,
           '#s_depth':d.depth_rep_cm, '#s_vel':d.velocity_rep_cms,
-          '#s_t1':d.survey_time_start, '#s_t2':d.survey_time_end});
+          '#s_t1':d.survey_time_start, '#s_t2':d.survey_time_end,
+          '#s_date':d.survey_date});
+        applySeg('stdate', d.survey_date);
         applySeg('habitat', d.habitat_type); applySeg('svtype2', d.survey_type);
         applySeg('sub1', d.substrate1); applySeg('gravel', d.gravel_condition);
         applySegMulti('method', d.survey_method);
@@ -2709,6 +2780,7 @@ function collectStation(){
   return {
     name: strVal('#s_name'), habitat_type: segVal('habitat'),
     survey_time_start: strVal('#s_t1'), survey_time_end: strVal('#s_t2'),
+    survey_date: (segVal('stdate') || strVal('#s_date')),
     survey_type: segVal('svtype2'), survey_method: segMultiVal('method'),
     latitude: strVal('#s_lat'), longitude: strVal('#s_lon'),
     depth_rep_cm: strVal('#s_depth'), velocity_rep_cms: strVal('#s_vel'),
@@ -2747,6 +2819,10 @@ function saveStation(svUuid, stUuid){
   rec.name              = f.name || ((isDetail(sv)?'P.':'St.')+(rec.station_no||1));
   rec.survey_time_start = f.survey_time_start;
   rec.survey_time_end   = f.survey_time_end;
+  if(surveyIsMultiDay(sv)){
+    // 何日かにわたる調査では、その箇所がどの日か覚えておく
+    rec.survey_date = f.survey_date || stationDate(rec, sv);
+  }
   // いま現場にいる調査で、開始の時刻が空のままなら、いまの時刻を入れる。
   // 調査日が今日でないときは入れない（あとから書き起こしている最中なので、
   // 今の時刻を入れると実際の調査時刻と食い違う）
@@ -2831,15 +2907,16 @@ SCREENS.station = (stUuid)=>{
     html:`
       <button class="btn pri" onclick="nav('speciesPick','${stUuid}')">魚を記録する</button>
       ${foldHtml('stinfo', `この${W}のこと`, `
-        <span class="fsub">${st.survey_time_start
+        <span class="fsub">${surveyIsMultiDay(sv)
+          ? esc(String(stationDate(st, sv)).slice(5))+'　' : ''}${st.survey_time_start
           ? esc(st.survey_time_start) : '<span class="pill ng">時刻なし</span>'}${
           detail
             ? (numOf(st.latitude)==='' ? '　<span class="pill ng">位置なし</span>'
                                        : '　±'+fmtNum(numOf(st.gps_accuracy),0)+'m')
             : (numOf(st.water_temp)==='' ? '' : '　'+fmtNum(numOf(st.water_temp),1)+'℃')}</span>`, `
         <div class="row">
-          <div class="grow"><div class="dim small">時刻</div>
-            <div>${st.survey_time_start
+          <div class="grow"><div class="dim small">${surveyIsMultiDay(sv)?'日付と時刻':'時刻'}</div>
+            <div>${surveyIsMultiDay(sv) ? esc(stationDate(st, sv))+'　' : ''}${st.survey_time_start
               ? esc(st.survey_time_start)+' 〜 '+esc(st.survey_time_end||'（未入力）')
               : '<span class="pill ng">未入力</span>'}</div></div>
           <div class="grow"><div class="dim small">調査方法</div>
@@ -4217,6 +4294,12 @@ SCREENS.exportHub = (svUuid)=>{
       <div class="card">
         <div class="big">${r.rows.length} 行</div>
         <div class="dim small">データベース取り込み用のCSV（31列）</div>
+        ${(()=>{ const ds = Array.from(new Set(r.rows.map(x=>x['調査日']))).filter(Boolean).sort();
+          if(ds.length<=1) return '';
+          return `<div class="warnbox">この調査は <b>${ds.length}日</b>にわたります
+            （${esc(ds.join('・'))}）。<br>
+            取り込み側は調査日ごとに分けるので、データベースには
+            <b>${ds.length}件の調査</b>として入ります。</div>`; })()}
         ${r.excluded.length ? `<div class="warnbox">除外 ${r.excluded.length}件<br>
           ${r.excluded.slice(0,10).map(e=>esc(e)).join('<br>')}
           ${r.excluded.length>10?`<br>ほか ${r.excluded.length-10}件`:''}</div>` : ''}
