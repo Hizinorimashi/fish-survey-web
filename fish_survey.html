@@ -125,7 +125,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v20';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v21';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1571,6 +1571,75 @@ function cmToMDisp(v){
   return Math.round(n*1000)/100000;
 }
 
+/* 色分けの基準。地図の上で、どの項目で色を変えるか選べる */
+const ENV_COLOR_BY = ['なし','環境区分','河床材料','礫の状況','流速','水深'];
+function envColorBy(){ return prefs().env_color_by || 'なし'; }
+function envSetColorBy(v){ prefSet('env_color_by', v); render(); }
+/* 区分ごとの色。数が多くないので、見分けやすい色を並べる */
+const ENV_CAT_COLORS = ['#4aa3ff','#3fb950','#f0883e','#d29922','#a371f7',
+                        '#f778ba','#56d4dd','#8b949e'];
+function envCatColor(list, v){
+  const i = list.indexOf(v);
+  return i < 0 ? '#8b949e' : ENV_CAT_COLORS[i % ENV_CAT_COLORS.length];
+}
+/* 数の大小を色にする。青（小）→黄→赤（大） */
+function envRampColor(v, lo, hi){
+  const n = numOf(v);
+  if(n==='' || !(hi > lo)) return '#8b949e';
+  const t = Math.max(0, Math.min(1, (n - lo) / (hi - lo)));
+  const stops = [[74,163,255],[63,185,80],[210,153,34],[240,136,62],[248,81,73]];
+  const x = t * (stops.length - 1);
+  const i = Math.min(stops.length - 2, Math.floor(x));
+  const f = x - i;
+  const c = [0,1,2].map(k => Math.round(stops[i][k] + (stops[i+1][k]-stops[i][k]) * f));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+/* いまの基準で、その記録の色を決める */
+function envColorOf(st, range){
+  const by = envColorBy();
+  if(by === '環境区分')  return envCatColor(OPT.habitat, st.habitat_type);
+  if(by === '河床材料')  return envCatColor(OPT.substrate, st.substrate1);
+  if(by === '礫の状況')  return envCatColor(OPT.gravel, st.gravel_condition);
+  if(by === '流速')      return envRampColor(st.velocity_rep_cms, range.vLo, range.vHi);
+  if(by === '水深')      return envRampColor(st.depth_rep_cm, range.dLo, range.dHi);
+  return null;             // 「なし」なら、これまでどおり種類で色を変える
+}
+/* 色の幅を決めるための、いちばん小さい値と大きい値 */
+function envColorRange(svUuid){
+  const list = DB.stationsOf(svUuid).filter(x=>!isMesh(x));
+  const v = nums(list.map(x=>x.velocity_rep_cms));
+  const d = nums(list.map(x=>x.depth_rep_cm));
+  return {vLo: v.length?Math.min.apply(null,v):0, vHi: v.length?Math.max.apply(null,v):0,
+          dLo: d.length?Math.min.apply(null,d):0, dHi: d.length?Math.max.apply(null,d):0};
+}
+/* 何色が何を指すか。地図の下に出す */
+function envLegendHtml(svUuid){
+  const by = envColorBy();
+  if(by === 'なし') return '';
+  const wrap = (inner)=>`<div id="envLegend">${inner}</div>`;
+  const chip = (col, label)=>`<span style="display:inline-flex;align-items:center;
+    gap:4px;margin:0 8px 4px 0"><span style="width:12px;height:12px;border-radius:6px;
+    background:${col};display:inline-block"></span>${esc(label)}</span>`;
+  if(by === '流速' || by === '水深'){
+    const r = envColorRange(svUuid);
+    const lo = by==='流速' ? r.vLo : r.dLo, hi = by==='流速' ? r.vHi : r.dHi;
+    if(!(hi > lo)) return wrap(`<div class="dim small">${esc(by)}：値が1つだけなので、色は分かれません</div>`);
+    return wrap(`<div class="dim small">${esc(by)}　`
+      + [0,0.25,0.5,0.75,1].map(t=>{
+          const v = lo + (hi-lo)*t;
+          return chip(envRampColor(v, lo, hi), fmtNum(cmToMDisp(v),3)+(by==='流速'?' m/s':' m'));
+        }).join('') + '</div>');
+  }
+  const list = by==='環境区分' ? OPT.habitat : (by==='河床材料' ? OPT.substrate : OPT.gravel);
+  return wrap(`<div class="dim small">${esc(by)}　`
+    + list.map(o=>chip(envCatColor(list, o), o)).join('')
+    + chip('#8b949e','未記入') + '</div>');
+}
+
+/* 地図の大きさ。大きくしても、下の入力はそのまま使える */
+function envMapBig(){ return !!prefs().env_map_big; }
+function envToggleBig(){ prefSet('env_map_big', !envMapBig()); render(); }
+
 /* その箇所が点か線か。物理環境の調査だけで使う */
 function envKindOf(st){
   if(isMesh(st)) return 'M';        // メッシュはこの画面では扱わない
@@ -1584,7 +1653,9 @@ function envPendingLine(svUuid){
 }
 /* P1 / L1 の採番。種類ごとに数える */
 function envAutoName(svUuid, kind){
-  const used = DB.stationsOf(svUuid)
+  // 消したものも数える。消した番号を使い回すと、
+  // 先に書き出したCSVの P2 と、あとから作った P2 が別物になる
+  const used = DB.load(DB.key.st).filter(st=>st.survey_uuid===svUuid)
     .filter(st=>envKindOf(st)===kind)
     .map(st=>{
       const m = String(st.name||'').match(new RegExp('^'+kind+'(\\d+)$'));
@@ -1596,19 +1667,54 @@ function envAutoName(svUuid, kind){
 
 /* つぎに足すもの。LS のあとは LE、LE のあとは LS、と自動で入れ替わる。
    同じものを続けて押すか、P を押すと、その入れ替えをやめる */
-let ENV_NEXT = {kind:'P', auto:false};
+let ENV_NEXT = {kind:'P', auto:false, line:'', survey:''};
+/* つなげる：ラインを閉じたら、その場所を次のラインの始まりにする。
+   縦断で歩くとき、境目を1回たたくだけで次の区間が始まる */
+function envChain(){ const v = prefs().env_chain; return v===undefined ? true : !!v; }
+function envSetChain(on){ prefSet('env_chain', !!on); render(); }
+/* 別の調査を開いたら、持ち越さずに最初から。
+   持ち越すと、開いた早々のタップで別の調査のラインを閉じてしまう
+   （2026-08-17 の監査 Major） */
+function envUseSurvey(svUuid){
+  if(ENV_NEXT.survey !== svUuid){
+    ENV_NEXT = {kind:'P', auto:false, line:'', survey:svUuid};
+    ENV_SEL = null;
+  }
+}
 function envSetKind(k){
+  const sv = ENV_NEXT.survey;
   // 同じものをもう一度押したら、入れ替えをやめる（同じものを続けて足したいとき）
-  if(ENV_NEXT.kind === k) ENV_NEXT = {kind:k, auto:false};
-  else if(k === 'P')       ENV_NEXT = {kind:'P', auto:false};
-  else                     ENV_NEXT = {kind:k, auto:true};
+  if(ENV_NEXT.kind === k) ENV_NEXT = {kind:k, auto:false, line:ENV_NEXT.line, survey:sv};
+  else if(k === 'P')       ENV_NEXT = {kind:'P', auto:false, line:'', survey:sv};
+  else                     ENV_NEXT = {kind:k, auto:true, line:ENV_NEXT.line, survey:sv};
   render();
 }
-/* 足したあとに、つぎを決める */
-function envAdvance(added){
-  if(!ENV_NEXT.auto) return;
-  if(added === 'LS') ENV_NEXT = {kind:'LE', auto:true};
-  else if(added === 'LE') ENV_NEXT = {kind:'LS', auto:true};
+/* 足したあとに、つぎを決める。LS のときは「どのラインを閉じるか」も覚える */
+function envAdvance(added, lineUuid){
+  const sv = ENV_NEXT.survey;
+  if(added === 'LS'){
+    ENV_NEXT = {kind: ENV_NEXT.auto ? 'LE' : ENV_NEXT.kind, auto:ENV_NEXT.auto,
+                line: lineUuid || '', survey:sv};
+  }else if(added === 'LE'){
+    ENV_NEXT = {kind: ENV_NEXT.auto ? 'LS' : ENV_NEXT.kind, auto:ENV_NEXT.auto,
+                line:'', survey:sv};
+  }
+}
+/* LE でつなぐ相手を決める。
+   末尾を機械的に閉じると、L1 を選んでいるのに L2 が閉じる（監査 Major） */
+function envLineTarget(svUuid){
+  const 未完 = st => st && isLine(st) && linePt(st,'start') && !linePt(st,'end');
+  // 1) 直前に置いた LS
+  if(ENV_NEXT.line){
+    const st = DB.getAlive(DB.key.st, ENV_NEXT.line);
+    if(未完(st) && st.survey_uuid===svUuid) return st;
+  }
+  // 2) いま選んでいる記録
+  const sel = ENV_SEL ? DB.getAlive(DB.key.st, ENV_SEL) : null;
+  if(未完(sel) && sel.survey_uuid===svUuid) return sel;
+  // 3) 未完がちょうど1つならそれ。2つ以上なら決めない（当て推量で閉じない）
+  const list = DB.stationsOf(svUuid).filter(未完);
+  return list.length===1 ? list[0] : null;
 }
 
 /* いまの種類で1件足す。時刻はここで自動的に刻む */
@@ -1625,9 +1731,14 @@ function envAddAt(svUuid, lat, lon, acc){
 
   if(k === 'LE'){
     // 開始だけのラインにつなぐ。無ければ足さない（勝手に線を作らない）
-    const st = envPendingLine(svUuid);
+    const st = envLineTarget(svUuid);
     if(!st){
-      toast('つなぐラインがありません。先に LS（ラインのスタート）を足してください', 7000);
+      const 未完 = DB.stationsOf(svUuid).filter(x=>isLine(x)
+        && linePt(x,'start') && !linePt(x,'end'));
+      toast(未完.length > 1
+        ? `終わっていないラインが${未完.length}本あります。`
+          + 'どれにつなぐか、下のボタンで先に選んでください'
+        : 'つなぐラインがありません。先に LS（ラインのスタート）を足してください', 8000);
       return null;
     }
     st.line_end_lat = la; st.line_end_lon = lo;
@@ -1636,7 +1747,30 @@ function envAddAt(svUuid, lat, lon, acc){
     st.ended_at = st.ended_at || nowISO();
     if(!DB.upsert(DB.key.st, st)) return null;
     envAdvance('LE');
-    toast(`${st.name} の終わりを置きました（${fmtDist(lineDist(st))}）`);
+    // つなげる：閉じた場所を、次のラインの始まりにする。
+    // いま閉じたほうを選んだままにする（さっき歩いた区間の中身を入れるため）
+    let 続き = '';
+    if(envChain() && ENV_NEXT.auto){
+      const nx = {
+        uuid: uuid(), survey_uuid: svUuid,
+        station_no: DB.stationsOf(svUuid).length + 1,
+        started_at: nowISO(), env_points: [],
+        survey_time_start: now,
+        survey_type: sv.survey_type_default || '目視',
+        env_method: 'ライン', name: envAutoName(svUuid, 'L'),
+        line_direction: st.line_direction || '上流→下流',
+        line_start_lat: la, line_start_lon: lo,
+        line_start_acc: (acc===undefined || acc===null) ? '' : Math.round(acc),
+        chained_from: st.uuid,
+      };
+      if(DB.upsert(DB.key.st, nx)){
+        ENV_NEXT = {kind:'LE', auto:true, line:nx.uuid, survey:svUuid};
+        続き = `　つづけて ${nx.name} が始まりました`;
+      }
+    }
+    ENV_SEL = st.uuid;          // いま閉じたものを選ぶ（前の記録に書き込ませない）
+    toast(`${st.name} の終わりを置きました（${fmtDist(lineDist(st))}）${続き}`,
+      続き ? 5000 : 3000);
     return st.uuid;
   }
 
@@ -1663,7 +1797,10 @@ function envAddAt(svUuid, lat, lon, acc){
     rec.ended_at = nowISO();
   }
   if(!DB.upsert(DB.key.st, rec)) return null;
-  envAdvance(k);
+  envAdvance(k, rec.uuid);
+  // 置いたものをそのまま選ぶ。選ばないと、前の記録の入力欄が出たままになり、
+  // 新しい点のつもりで前の記録に書き込んでしまう（監査 Major）
+  ENV_SEL = rec.uuid;
   toast(`${rec.name} を置きました`);
   return rec.uuid;
 }
@@ -2115,10 +2252,13 @@ function destroyMaps(){
   });
   OPOLYLAYER=null; SITEMARK=null; SVMARK=null; SVSITES=[];
 }
+/* 地図を寄せられる上限。タイルは18までなので、その先は引き伸ばして見せる */
+const MAP_MAX_ZOOM = 22;
 function makeMap(elId, center, zoom){
   const el = document.getElementById(elId);
   if(!el || !window.L) return null;
-  const m = L.map(el, {zoomControl:true, attributionControl:true})
+  const m = L.map(el, {zoomControl:true, attributionControl:true,
+                       maxZoom:MAP_MAX_ZOOM})
              .setView(center||[43.06,141.35], zoom||14);
   return m;
 }
@@ -2128,7 +2268,9 @@ function applyBaseMap(slot, name){
   const b = BASEMAPS[name] || BASEMAPS['航空写真'];
   if(s.layer){ try{ s.map.removeLayer(s.layer); }catch(e){} }
   // crossOrigin を付けると、中身の分かる応答で返るので保存の可否が判断できる
-  s.layer = L.tileLayer(b.url, {maxZoom:b.max, maxNativeZoom:b.max,
+  // 地理院タイルは18までしか無い。そこから先は引き伸ばして寄れるようにする
+  // （川の中では、18では足りないことがある）
+  s.layer = L.tileLayer(b.url, {maxZoom:MAP_MAX_ZOOM, maxNativeZoom:b.max,
                                 attribution:b.attr, crossOrigin:true})
     .addTo(s.map);
 }
@@ -4254,6 +4396,7 @@ let ENV_SEL = null;          // いま選んでいる記録のID
 SCREENS.envMap = (svUuid)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
+  envUseSurvey(svUuid);        // 別の調査から持ち越さない
   const all = DB.stationsOf(svUuid);
   // メッシュの範囲は位置の持ち方が違うので、点・線の並びに混ぜない。
   // 混ぜると、位置の無い点として並んでしまう
@@ -4283,7 +4426,22 @@ SCREENS.envMap = (svUuid)=>{
          {text:`${list.length}件`}],
     html:`
       ${baseMapButtonsHtml()}
-      <div id="envmap" class="map" style="height:46vh;min-height:260px"></div>
+      <div id="envmap" class="map"
+        style="height:${envMapBig()?'80vh':'46vh'};min-height:260px"></div>
+      <div class="row" style="margin-top:6px">
+        <button class="btn sm" style="width:auto;margin:0"
+          onclick="envToggleBig()">地図を${envMapBig()?'小さく':'大きく'}</button>
+        <div class="grow dim small" style="padding-left:8px">
+          大きくしても、下の入力はそのまま使えます。</div>
+      </div>
+
+      <div class="card">
+        <label>色分け</label>
+        <div onclick="setTimeout(()=>envSetColorBy(segVal('envcolor')||'なし'),0)">
+          ${segHtml('envcolor', ENV_COLOR_BY, envColorBy())}</div>
+        ${envLegendHtml(svUuid)}
+        <div class="dim small">選んだ項目で、地図の点と線の色が変わります。</div>
+      </div>
 
       <div class="card">
         <div class="row" style="align-items:flex-start">
@@ -4300,6 +4458,12 @@ SCREENS.envMap = (svUuid)=>{
           </div>
         </div>
         <button class="btn ok" onclick="envAddHere('${svUuid}')">いまここに追加</button>
+        <div class="row">
+          <div class="grow dim small">ラインをつなげる<br>
+            <span class="fsub">閉じた場所を、つぎのラインの始まりにします</span></div>
+          <button class="btn sm ${envChain()?'ok':''}" style="width:auto;margin:0"
+            onclick="envSetChain(${envChain()?'false':'true'})">${envChain()?'つなげる':'つなげない'}</button>
+        </div>
         <div class="dim small">地図をタップしても追加できます。
           ${ENV_NEXT.auto ? 'LS と LE が交互に入れ替わります。'
             : '同じものを続けて足せます（交互にしたいときは LS か LE を押してください）。'}</div>
@@ -4436,7 +4600,9 @@ SCREENS.envMap = (svUuid)=>{
         const key = 'envitem:'+cur.uuid;
         SCREENS._photos = ((cur.photos)||[]).slice();
         const base = collectEnvItem();
-        const d = draftGet(key);
+        // 見ているだけのタブでは、書きかけを持たない。
+        // 持つと、記録を入れているタブの書きかけを上書きしてしまう（監査 Major）
+        const d = ownsLock() ? draftGet(key) : null;
         if(d){
           applySels(d);
           applySegRaw('envhab', d.__hab);
@@ -4444,7 +4610,7 @@ SCREENS.envMap = (svUuid)=>{
           toast('書きかけを戻しました');
         }
         photosBegin(cur, d);
-        draftBind(key, collectEnvItem, base);
+        if(ownsLock()) draftBind(key, collectEnvItem, base);
       }
 
       // 地図。選んでいるものがあればそこへ、無ければ調査の位置へ
@@ -4483,9 +4649,12 @@ function envDrawAll(svUuid){
   try{ ENVLAYER.forEach(x=>map.removeLayer(x)); }catch(e){}
   ENVLAYER = [];
   const pts = [];
+  const range = envColorRange(svUuid);
   DB.stationsOf(svUuid).filter(x=>!isMesh(x)).forEach(st=>{
     const on = st.uuid === ENV_SEL;
-    const col = on ? '#f0883e' : (envKindOf(st)==='L' ? '#4aa3ff' : '#3fb950');
+    const byCol = envColorOf(st, range);
+    // 色分けを選んでいるときは、選んでいるものは太さで見せる（色は基準のまま）
+    const col = byCol || (on ? '#f0883e' : (envKindOf(st)==='L' ? '#4aa3ff' : '#3fb950'));
     const label = (pt)=>{
       ENVLAYER.push(L.marker(pt, {icon:L.divIcon({className:'',
         html:`<div style="color:${col};font-weight:700;font-size:12px;
@@ -4496,21 +4665,26 @@ function envDrawAll(svUuid){
       const a = linePt(st,'start'), b = linePt(st,'end');
       if(a){
         ENVLAYER.push(L.marker(a, {icon:dotIcon(col, on?15:12)})
-          .on('click', ()=>envSelect(st.uuid)).addTo(map));
+          .on('click', e=>{ L.DomEvent.stop(e); envSelect(st.uuid); }).addTo(map));
         pts.push(a); label(a);
       }
       if(b){
         ENVLAYER.push(L.marker(b, {icon:dotIcon(col, on?15:12)})
-          .on('click', ()=>envSelect(st.uuid)).addTo(map));
+          .on('click', e=>{ L.DomEvent.stop(e); envSelect(st.uuid); }).addTo(map));
         pts.push(b);
       }
       if(a && b) ENVLAYER.push(L.polyline([a,b],
-        {color:col, weight:on?5:3, opacity:.9}).addTo(map));
+        {color:col, weight:on?5:3, opacity:.9, bubblingMouseEvents:false})
+        .on('click', e=>{ L.DomEvent.stop(e); envSelect(st.uuid); }).addTo(map));
     }else{
       const pt = numOf(st.latitude)==='' ? null : [+st.latitude, +st.longitude];
       if(pt){
+        // bubblingMouseEvents を切らないと、選ぶための1タップが
+        // 地図のタップとしても伝わり、同じ場所に点がもう1つ増える
+        // （2026-08-17 の監査 Critical）
         ENVLAYER.push(L.circleMarker(pt, {radius:on?9:7, color:col, weight:2,
-          fillOpacity:.6}).on('click', ()=>envSelect(st.uuid)).addTo(map));
+          fillOpacity:.6, bubblingMouseEvents:false})
+          .on('click', e=>{ L.DomEvent.stop(e); envSelect(st.uuid); }).addTo(map));
         pts.push(pt); label(pt);
       }
     }
