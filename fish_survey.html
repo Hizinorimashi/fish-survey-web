@@ -125,7 +125,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v18';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v19';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -324,7 +324,8 @@ function writeAllowed(){
    ============================================================ */
 const DB = {
   key:{ sv:'fs_surveys', st:'fs_stations', ca:'fs_catches',
-        ind:'fs_individuals', nt:'fs_notes', si:'fs_sites' },
+        ind:'fs_individuals', nt:'fs_notes', si:'fs_sites',
+        mc:'fs_meshcells' },
 
   /* 壊れていても空配列を返す。表示用 */
   load(k){ try{ const a=JSON.parse(localStorage.getItem(k)||'[]'); return Array.isArray(a)?a:[]; }
@@ -396,6 +397,17 @@ const DB = {
     if(!this.liveStation(st)) return [];
     return this.alive(this.key.ca).filter(x=>x.station_uuid===st)
       .sort((a,b)=> String(a.created_at||'').localeCompare(String(b.created_at||'')));
+  },
+  /* メッシュのマス。親の箇所（とその親の調査）が生きているときだけ返す */
+  meshCellsOf(st){
+    if(!this.liveStation(st)) return [];
+    return this.alive(this.key.mc).filter(x=>x.station_uuid===st)
+      .sort((a,b)=> (a.row-b.row) || (a.col-b.col));
+  },
+  meshCellsOfSurvey(sv){
+    const live = new Set(this.stationsOf(sv).map(x=>x.uuid));
+    return this.alive(this.key.mc).filter(x=>live.has(x.station_uuid))
+      .sort((a,b)=> (a.row-b.row) || (a.col-b.col));
   },
   /* 消した箇所にぶら下がる記録は見せない。
      子にも印を付けて回ると、途中で保存に失敗したとき迷子の記録が残る。
@@ -1363,6 +1375,179 @@ function effortRunning(st){ return !!(st && st.effort_started_at); }
    同じ50mを3往復して150mになる。面積が3倍、単位努力量あたりの尾数が
    3分の1になり、労力を記録する意味が消える。
    だから既定は「始点から終点までの直線」。軌跡も残して、後から確かめられるようにする */
+/* ===== メッシュ =====
+   四隅を押さえて、縦の間隔と横の分割数からマスを作る。
+   マスの位置は四隅から計算で出す（1マスずつGPSを取ると、
+   誤差で格子から外れてしまう）。
+   四隅の順番は 上流左岸 → 上流右岸 → 下流右岸 → 下流左岸 */
+const MESH_MAX_CELLS = 2000;      // これを超える格子は作らない
+const MESH_MIN_EDGE_M = 0.5;      // これより短い辺は、押し間違いとみなす
+const MESH_MAX_SPAN_DEG = 1;      // 1つの範囲が緯度経度で1度を超えることはない
+/* 四隅の形を確かめる。おかしければ理由を返す（正しければ空文字）。
+   validPt は isFinite で見るので、null や数字の文字列も通ってしまう。
+   ここでは本物の数だけを受ける（2026-08-17 の監査 Major） */
+function meshCornerError(c){
+  if(!Array.isArray(c) || c.length!==4) return '四隅を4つとも押さえてください';
+  for(const p of c){
+    if(!Array.isArray(p) || p.length!==2) return '四隅の形がおかしいです';
+    if(typeof p[0]!=='number' || typeof p[1]!=='number'
+       || !isFinite(p[0]) || !isFinite(p[1])) return '四隅に数でないものが入っています';
+    if(Math.abs(p[0])>90 || Math.abs(p[1])>180) return '四隅の位置が地球の外にあります';
+  }
+  const lats = c.map(p=>p[0]), lons = c.map(p=>p[1]);
+  const span = Math.max(Math.max.apply(null,lats)-Math.min.apply(null,lats),
+                        Math.max.apply(null,lons)-Math.min.apply(null,lons));
+  // ここが広すぎるときは、押し間違いか、日付変更線をまたいでいる。どちらも受けない
+  if(span > MESH_MAX_SPAN_DEG) return '四隅が離れすぎています。押し間違いかもしれません';
+  // 辺の長さ。同じ点を2回押した・一直線に並んだ、を弾く
+  for(let i=0;i<4;i++){
+    const d = distMeters(c[i], c[(i+1)%4]);
+    if(!(d >= MESH_MIN_EDGE_M)) return '四隅のうち2つが近すぎます（同じ場所を押していませんか）';
+  }
+  // 平らな面として見たときの向き。4つとも同じ向きに曲がっていれば、
+  // ねじれても凹んでもいない（＝ふつうの四角）
+  const x = c.map(p=>p[1]*Math.cos(c[0][0]*Math.PI/180)), y = c.map(p=>p[0]);
+  let plus=0, minus=0, area=0;
+  for(let i=0;i<4;i++){
+    const a=i, b=(i+1)%4, d=(i+2)%4;
+    const cr = (x[b]-x[a])*(y[d]-y[b]) - (y[b]-y[a])*(x[d]-x[b]);
+    if(cr > 0) plus++; else if(cr < 0) minus++;
+    area += x[a]*y[b] - x[b]*y[a];
+  }
+  if(plus && minus) return '四隅がねじれています。押した順番をご確認ください';
+  if(Math.abs(area)/2 < 1e-12) return '四隅が一直線に並んでいます';
+  return '';
+}
+function meshCorners(st){
+  const c = st && st.mesh_corners;
+  return meshCornerError(c) ? null : c;
+}
+/* 縦の長さ（上流の辺の中点から、下流の辺の中点まで）。
+   左岸側と右岸側で長さが違うので、真ん中で測る */
+function meshLength(st){
+  const c = meshCorners(st); if(!c) return '';
+  const up  = [(c[0][0]+c[1][0])/2, (c[0][1]+c[1][1])/2];
+  const dn  = [(c[3][0]+c[2][0])/2, (c[3][1]+c[2][1])/2];
+  return distMeters(up, dn);
+}
+/* 横の幅（上流の辺と下流の辺の平均） */
+function meshWidth(st){
+  const c = meshCorners(st); if(!c) return '';
+  return (distMeters(c[0], c[1]) + distMeters(c[3], c[2])) / 2;
+}
+/* 縦に何行できるか。間隔で割って、1行未満なら1行 */
+function meshRowsOf(st){
+  const manual = countOf(st && st.mesh_rows);
+  if(manual!==null && manual!=='' && manual>0) return manual;
+  const L = meshLength(st), gap = numOf(st && st.mesh_row_m);
+  if(L==='' || gap==='' || !(gap>0)) return 0;
+  return Math.max(1, Math.round(L/gap));
+}
+function meshColsOf(st){
+  const n = countOf(st && st.mesh_cols);
+  return (n===null || n==='' || n<=0) ? 0 : n;
+}
+/* 四隅の中を、行と列で分けたときのマスの中心。
+   4つの角を「上下」「左右」で混ぜる（双線形内挿）。
+   狭い範囲なので、緯度経度をそのまま混ぜてよい */
+function meshCellCenter(c, rows, cols, row, col){
+  const u = (col + 0.5) / cols;         // 左岸から右岸へ
+  const v = (row + 0.5) / rows;         // 上流から下流へ
+  const up = [c[0][0] + (c[1][0]-c[0][0])*u, c[0][1] + (c[1][1]-c[0][1])*u];
+  const dn = [c[3][0] + (c[2][0]-c[3][0])*u, c[3][1] + (c[2][1]-c[3][1])*u];
+  return [up[0] + (dn[0]-up[0])*v, up[1] + (dn[1]-up[1])*v];
+}
+/* 1マスの四隅（地図に描くため） */
+function meshCellPoly(c, rows, cols, row, col){
+  const at = (u,v)=>{
+    const up = [c[0][0] + (c[1][0]-c[0][0])*u, c[0][1] + (c[1][1]-c[0][1])*u];
+    const dn = [c[3][0] + (c[2][0]-c[3][0])*u, c[3][1] + (c[2][1]-c[3][1])*u];
+    return [up[0] + (dn[0]-up[0])*v, up[1] + (dn[1]-up[1])*v];
+  };
+  const u0=col/cols, u1=(col+1)/cols, v0=row/rows, v1=(row+1)/rows;
+  return [at(u0,v0), at(u1,v0), at(u1,v1), at(u0,v1)];
+}
+/* 格子の見積り。決める前に「何マスになるか」を見せるためのもの。
+   上限を超えていても、超えた数のまま返す */
+function meshPlan(st){
+  const c = meshCorners(st);
+  if(!c) return null;
+  const rows = meshRowsOf(st), cols = meshColsOf(st);
+  if(!(rows>0) || !(cols>0)) return null;
+  return {corners:c, rows, cols, n: rows*cols,
+          length: meshLength(st), width: meshWidth(st)};
+}
+/* 実際に使う格子。上限を超えていたら作らない。
+   保存のときだけ止めていると、壊れた記録や古い記録で画面が固まる
+   （2026-08-17 の監査 Major） */
+function meshGeom(st){
+  const g = meshPlan(st);
+  if(!g) return null;
+  if(!Number.isInteger(g.rows) || !Number.isInteger(g.cols)) return null;
+  if(g.n > MESH_MAX_CELLS) return null;
+  return g;
+}
+/* マスの位置。格子が決まっていなければ空 */
+function meshCellPos(st, row, col){
+  const g = meshGeom(st);
+  if(!g || row<0 || col<0 || row>=g.rows || col>=g.cols) return null;
+  return meshCellCenter(g.corners, g.rows, g.cols, row, col);
+}
+function meshCellsOf(stUuid){ return DB.meshCellsOf(stUuid); }
+/* 格子には版がある。四隅や細かさを変えると、同じ「3行2列」でも
+   川の別の場所を指すことになる。版を持たないと、古いマスが
+   新しい格子のマスとして表示され、位置と集計が静かに壊れる
+   （2026-08-17 の監査 Critical） */
+function meshGridId(st){ return String((st && st.mesh_grid_id) || ''); }
+/* その格子の定義を、文字にしたもの。同じなら版を変えない */
+function meshGridSig(st){
+  const c = (st && st.mesh_corners) || [];
+  return JSON.stringify([c, numOf(st && st.mesh_row_m), countOf(st && st.mesh_cols)]);
+}
+function meshIsCurrent(st, cell){
+  return String((cell && cell.grid_id) || '') === meshGridId(st);
+}
+/* いまの格子のマスだけ */
+function meshCurrentCells(st, cells){
+  return (cells || meshCellsOf(st.uuid)).filter(c=>meshIsCurrent(st, c));
+}
+/* 前の格子で入れたマス。記録としては残すが、一覧や集計には混ぜない */
+function meshOldCells(st, cells){
+  return (cells || meshCellsOf(st.uuid)).filter(c=>!meshIsCurrent(st, c));
+}
+/* 入力済みのマスを、行×列で引けるようにする */
+function meshCellMap(cells){
+  const m = {};
+  (cells||[]).forEach(x=>{ m[x.row+'_'+x.col] = x; });
+  return m;
+}
+/* マスから水深・流速の最小・最大・代表を出す。0を落とさない */
+function meshStats(cells, field, manual){
+  const v = nums((cells||[]).map(x=>x[field]));
+  const man = numOf(manual);
+  if(!v.length) return {n:0, min:'', max:'', avg:'', manual:man, rep:man};
+  const sum = v.reduce((a,b)=>a+b, 0);
+  const avg = sum/v.length;
+  return {n:v.length, min:Math.min.apply(null,v), max:Math.max.apply(null,v),
+          avg, manual:man, rep: man!=='' ? man : avg};
+}
+
+/* その箇所の水深・流速。メッシュならマスから、それ以外は測点から。
+   どちらも「手で入れた代表値があればそちらを使う」は同じ */
+function stationDepth(st, snap){
+  if(!isMesh(st)) return depthStats(st);
+  return meshStats(meshCurrentCells(st, snapCells(st, snap)), 'depth_cm', st.depth_rep_cm);
+}
+function stationVelocity(st, snap){
+  if(!isMesh(st)) return velocityStats(st);
+  return meshStats(meshCurrentCells(st, snapCells(st, snap)), 'velocity_cms', st.velocity_rep_cms);
+}
+/* 書き出しの控えがあればそこから、無ければ保存から読む */
+function snapCells(st, snap){
+  if(snap && Array.isArray(snap.mc)) return snap.mc.filter(x=>x.station_uuid===st.uuid);
+  return meshCellsOf(st.uuid);
+}
+
 /* ラインの始点・終点。両方そろっていなければ距離は出さない */
 function linePt(st, which){
   const la = numOf(st && st['line_'+which+'_lat']);
@@ -1564,6 +1749,15 @@ function applySeg(field, val){
   Array.from(wrap.querySelectorAll('button')).forEach(b=>
     b.classList.toggle('on', b.textContent===want));
 }
+/* 「なし」が選択肢として実在する欄のための書き戻し。
+   applySeg は空欄を「なし」に読み替えるので、
+   選んでいないものが「なし」と記録されてしまう（2026-08-17 の監査 Critical） */
+function applySegRaw(field, val){
+  if(val===undefined || val===null) return;
+  const wrap=document.querySelector(`[data-seg="${field}"]`); if(!wrap) return;
+  Array.from(wrap.querySelectorAll('button')).forEach(b=>
+    b.classList.toggle('on', val!=='' && b.textContent===val));
+}
 function applySegMulti(field, vals){
   if(!Array.isArray(vals)) return;
   const wrap=document.querySelector(`[data-segmulti="${field}"]`); if(!wrap) return;
@@ -1611,6 +1805,20 @@ function buildChain(name, arg){
     const st = DB.liveStation(arg);
     // 消された箇所なら、そこへは連れて行かない。ホームへ帰す
     return st ? [home, {name:'survey', arg:st.survey_uuid}, {name:'station', arg:arg}]
+              : [home];
+  }
+  // メッシュの画面は箇所にぶら下がる。戻る道を箇所まで組み直す
+  if(name==='mesh' || name==='meshSetup'){
+    const st = DB.liveStation(arg);
+    return st ? [home, {name:'survey', arg:st.survey_uuid},
+                 {name:'station', arg:arg}, {name, arg}]
+              : [home];
+  }
+  if(name==='meshCell'){
+    const st = arg && DB.liveStation(arg.station);
+    return st ? [home, {name:'survey', arg:st.survey_uuid},
+                 {name:'station', arg:arg.station},
+                 {name:'mesh', arg:arg.station}, {name, arg}]
               : [home];
   }
   return [home, {name, arg}];
@@ -1777,6 +1985,7 @@ function baseMapName(){ const v=prefs().basemap; return BASEMAPS[v] ? v : '航�
    別のものになり、画面を離れても地図が残る（同じ場所に2つ目を作れず壊れる） */
 const MAPS = { main:{map:null, layer:null}, off:{map:null, layer:null} };
 function destroyMaps(){
+  MESHLAYER = [];
   Object.keys(MAPS).forEach(k=>{
     const s = MAPS[k];
     if(s.map){ try{ s.map.remove(); }catch(e){} }
@@ -2364,7 +2573,8 @@ const FS_EVENT_KEY = ['業務番号','業務名','河川名','地点名','区間
 function exportSnapshot(){
   const box = {};
   [['st', DB.key.st, '箇所'], ['ca', DB.key.ca, '魚の記録'],
-   ['ind', DB.key.ind, '1尾ずつの記録']].forEach(([k, key, label])=>{
+   ['ind', DB.key.ind, '1尾ずつの記録'],
+   ['mc', DB.key.mc, 'メッシュのマス']].forEach(([k, key, label])=>{
     try{ box[k] = DB.loadRaw(key).filter(x=>x && !x.deleted_at); }
     catch(e){ throw new Error(label + 'を読み取れません。書き出しを中止しました'); }
   });
@@ -2448,8 +2658,8 @@ function dbRowOf(sv, st, c, inds){
     '調査日': stationDate(st, sv), '季節':sv.season||'', '天気':sv.weather||'',
     '水温': numOf(st.water_temp),
     // 代表値は「手入力があればそれ、無ければ測点の平均」
-    '水深': cmToM(depthStats(st).rep),
-    '流速': cmToM(velocityStats(st).rep),
+    '水深': cmToM(stationDepth(st, inds).rep),
+    '流速': cmToM(stationVelocity(st, inds).rep),
     '河川名':sv.river_name||'', '地点名':sv.site_name||'', '区間名':sv.section_name||'',
     '河川形態A':sv.river_morphology_a||'', '河川形態B':st.river_morphology_b||'',
     '河床材料':st.substrate1||'', '礫の状況':st.gravel_condition||'',
@@ -2521,7 +2731,9 @@ function buildStationRows(sv, snap){
     .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
   return stations.map(st=>{
     const len = stationLengths(st), area = stationAreas(st);
-    const d = depthStats(st), v = velocityStats(st);
+    // メッシュのときは、マスから水深・流速をまとめる
+    const d = stationDepth(st, snap), v = stationVelocity(st, snap);
+    const mg = meshGeom(st);
     const pct = substratePct(st);
     const L = coverList(st,'left'), R = coverList(st,'right');
     const cs = snap.ca.filter(c=>c.station_uuid===st.uuid);
@@ -2541,6 +2753,12 @@ function buildStationRows(sv, snap){
       '終点GPS精度m': numOf(st.line_end_acc),
       '距離_始終点直線m': round1(stationLengths(st).line),
       '流量': numOf(st.flow_rate),
+      'メッシュ縦間隔m': numOf(st.mesh_row_m), 'メッシュ横分割数': countOf(st.mesh_cols),
+      'メッシュ行数': mg ? mg.rows : '', 'メッシュ列数': mg ? mg.cols : '',
+      'メッシュ入力済み数': isMesh(st) ? meshCurrentCells(st, snapCells(st, snap)).length : '',
+      'メッシュ前の格子のマス数': meshOldCells(st, snapCells(st, snap)).length,
+      'メッシュ格子ID': meshGridId(st),
+      'メッシュ縦m': mg ? round1(mg.length) : '', 'メッシュ横m': mg ? round1(mg.width) : '',
       '緯度': fixCoord(st.latitude), '経度': fixCoord(st.longitude),
       'GPS精度m': numOf(st.gps_accuracy), '位置の決め方': st.position_source||'',
       '環境区分':st.habitat_type||'',
@@ -2676,6 +2894,8 @@ const FS_STATION_COLS = ['調査日','河川名','地点名','箇所','記録の
   '調べたもの','環境の取り方','向き',
   '始点緯度','始点経度','始点GPS精度m','終点緯度','終点経度','終点GPS精度m',
   '距離_始終点直線m','流量',
+  'メッシュ縦間隔m','メッシュ横分割数','メッシュ行数','メッシュ列数','メッシュ入力済み数',
+  'メッシュ前の格子のマス数','メッシュ格子ID','メッシュ縦m','メッシュ横m',
   '緯度','経度','GPS精度m','位置の決め方',
   '環境区分','河川形態B','調査区分','調査方法','開始時刻','終了時刻','水温',
   '測点数','位置つき測点数',
@@ -2693,6 +2913,46 @@ const FS_STATION_COLS = ['調査日','河川名','地点名','箇所','記録の
   '面積_計算m2','面積_手入力m2','面積_使う値m2',
   '種数','尾数','100秒あたり尾数','100m2あたり尾数',
   'メモ','調査ID','箇所ID'];
+
+/* メッシュのマス。1行＝1マス。
+   データベースには、いまマスを入れる表が無い（Phase 5 で作る）。
+   列名は、あとで表を作るときそのまま使えるようにしてある */
+const FS_MESH_COLS = ['調査日','河川名','地点名','範囲','行','列','いまの格子か',
+  '緯度','経度','水深cm','流速cms','河床材料','環境区分','礫の状況','カバー',
+  '河床材_砂泥%','河床材_小礫%','河床材_中礫%','河床材_大礫%','河床材_巨礫%',
+  '河床材_岩盤%','河床材_コンクリート%',
+  '備考','記録した時刻','調査ID','箇所ID','マスID','格子ID'];
+
+function buildMeshRows(sv, snap){
+  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid);
+  const byId = {};
+  stations.forEach(st=>{ byId[st.uuid] = st; });
+  const out = [];
+  (snap.mc||[]).forEach(c=>{
+    const st = byId[c.station_uuid];
+    if(!st) return;                       // 消した箇所のマスは出さない
+    const pct = (c.substrate_pct && typeof c.substrate_pct==='object') ? c.substrate_pct : {};
+    const row = {
+      '調査日': stationDate(st, sv), '河川名':sv.river_name||'',
+      '地点名':sv.site_name||'', '範囲':st.name||'',
+      '行': countOf(c.row)===null ? '' : c.row+1,
+      '列': countOf(c.col)===null ? '' : c.col+1,
+      // 前の格子で入れたマスも残す。ただし、いまの格子の分と混ぜて集計されないよう印を付ける
+      'いまの格子か': meshIsCurrent(st, c) ? 'はい' : 'いいえ（前の格子）',
+      '緯度': fixCoord(c.latitude), '経度': fixCoord(c.longitude),
+      '水深cm': numOf(c.depth_cm), '流速cms': numOf(c.velocity_cms),
+      '河床材料': c.substrate||'', '環境区分': c.habitat_type||'',
+      '礫の状況': c.gravel_condition||'', 'カバー': c.cover||'',
+      '備考': c.note||'', '記録した時刻': c.measured_at ? fmtTime(c.measured_at) : '',
+      '調査ID': sv.uuid, '箇所ID': st.uuid, 'マスID': c.uuid,
+      '格子ID': c.grid_id || '',
+    };
+    OPT.substrate.forEach(k=>{ row['河床材_'+k+'%'] = numOf(pct[k]); });
+    out.push(row);
+  });
+  return out.sort((a,b)=> String(a['範囲']).localeCompare(String(b['範囲']))
+                       || (a['行']-b['行']) || (a['列']-b['列']));
+}
 
 const FS_SURVEY_COLS = ['調査日','終了日','日数','季節','天気','河川名','地点名','区間名','河川形態A',
   '調べたもの','記録のしかた','環境の取り方',
@@ -3326,6 +3586,25 @@ SCREENS.stationEdit = (arg)=>{
           <b>メッシュ</b>＝格子を切る</div>
       </div>
 
+      <div class="card" id="s_meshCard">
+        <h3 style="margin-top:0">範囲と格子</h3>
+        ${(()=>{ const g = meshGeom(st);
+          return g
+            ? `<div class="row">
+                 <div class="grow"><div class="dim small">縦</div>
+                   <div>${esc(fmtDist(g.length))}／${g.rows}行</div></div>
+                 <div class="grow"><div class="dim small">横</div>
+                   <div>${esc(fmtDist(g.width))}／${g.cols}列</div></div>
+                 <div class="grow"><div class="dim small">マスの数</div>
+                   <div style="font-weight:700">${g.n}</div></div>
+               </div>`
+            : '<div class="warnbox">まだ格子を決めていません。'
+              + '四隅を押さえて、縦の間隔と横の分割数を決めてください。</div>'; })()}
+        <button class="btn" onclick="toMeshSetup('${svUuid}','${arg.uuid||''}')">
+          範囲と格子を決める</button>
+        <div class="dim small">先にこの${stWord(sv)}を保存してから開きます。</div>
+      </div>
+
       <div class="card" id="s_lineCard">
         <h3 style="margin-top:0">区間の始点と終点</h3>
         <label>歩いた向き</label>
@@ -3527,7 +3806,7 @@ function nowInto(sel){
   draftTouch();
   toast('いまの時刻を入れました');
 }
-function saveStation(svUuid, stUuid){
+function saveStation(svUuid, stUuid, opt){
   const isNew = !stUuid;
   const sv = DB.getAlive(DB.key.sv, svUuid);
   const rec = isNew
@@ -3604,6 +3883,8 @@ function saveStation(svUuid, stUuid){
   draftClear('station:'+(stUuid || ('new:'+svUuid)));
   draftUnbind();
   toast(isNew ? (stWord(sv)+'をはじめました') : '保存しました');
+  // 保存したあとで別の画面へ行きたいことがある（格子を決めるなど）
+  if(opt && opt.then){ goTo(opt.then, rec.uuid); return; }
   if(isNew) goTo('station', rec.uuid); else goBack();
 }
 function deleteStation(u){
@@ -3625,7 +3906,7 @@ SCREENS.station = (stUuid)=>{
   const sv = DB.get(DB.key.sv, st.survey_uuid);
   const cs = DB.catchesOf(stUuid);
   const len = stationLengths(st), area = stationAreas(st), cp = cpue(st);
-  const dep = depthStats(st), vel = velocityStats(st);
+  const dep = stationDepth(st), vel = stationVelocity(st);
   const detail = isDetail(sv), W = stWordOf(st);
   const rows = cs.map(c=>{
     const ls = catchLengths(c);
@@ -3833,6 +4114,516 @@ function reopenStation(u){
   const st = DB.get(DB.key.st, u); if(!st) return;
   delete st.ended_at;   // 入れた終了時刻は消さない（手で入れたものかもしれない）
   if(DB.upsert(DB.key.st, st)){ render(); }
+}
+
+/* ---------- メッシュ：範囲と格子を決める ---------- */
+let MESHLAYER = [];
+SCREENS.meshSetup = (stUuid)=>{
+  const st = DB.liveStation(stUuid);
+  if(!st) return null;
+  const sv = DB.get(DB.key.sv, st.survey_uuid);
+  const c = meshCorners(st);
+  const pr = prefs();
+  const gapDef = st.mesh_row_m!==undefined && st.mesh_row_m!=='' ? st.mesh_row_m
+               : (pr.mesh_row_m!==undefined ? pr.mesh_row_m : '');
+  const colDef = st.mesh_cols!==undefined && st.mesh_cols!=='' ? st.mesh_cols
+               : (pr.mesh_cols!==undefined ? pr.mesh_cols : '');
+  const cells = meshCellsOf(stUuid).length;
+  return {
+    title:'範囲と格子',
+    sub:[{text:st.name||''}, {text:`${cells}マス入力済み`}],
+    html:`
+      <div class="card">
+        <div class="dim small">川の四隅を、この順で押さえてください。
+          地図をタップしても決められます。</div>
+        <table><tbody>
+          ${['上流の左岸','上流の右岸','下流の右岸','下流の左岸'].map((nm,i)=>`
+            <tr>
+              <td class="dim">${i+1}. ${nm}</td>
+              <td class="num small" id="mc_${i}">${c ? esc(c[i][0].toFixed(6)+', '+c[i][1].toFixed(6))
+                : '<span class="pill ng">まだ</span>'}</td>
+              <td style="text-align:right">
+                <button class="btn ok sm" style="width:auto;margin:0;padding:4px 10px"
+                  onclick="grabMeshCorner(${i})">いまここ</button></td>
+            </tr>`).join('')}
+        </tbody></table>
+        <div class="dim small" id="mesh_gps"></div>
+        <button class="btn sm" onclick="clearMeshCorners()">四隅を消してやり直す</button>
+      </div>
+
+      ${baseMapButtonsHtml()}
+      <div id="meshmap" class="map"></div>
+      <div class="dim small" style="margin-top:8px">地図をタップすると、
+        1→2→3→4 の順で四隅が決まります。</div>
+
+      <div class="card">
+        <h3 style="margin-top:0">格子の細かさ</h3>
+        <label>縦の間隔（m）</label>
+        <input id="mesh_gap" inputmode="decimal" value="${esc(gapDef)}"
+          oninput="showMeshPlan()" placeholder="例）5">
+        <label>横の分割数</label>
+        <input id="mesh_cols" inputmode="numeric" value="${esc(colDef)}"
+          oninput="showMeshPlan()" placeholder="例）5">
+        <div class="dim small" style="margin-top:8px" id="mesh_plan"></div>
+        <div class="dim small">前に使った値を初期値にしています。現場に合わせて変えてください。</div>
+      </div>
+
+      <button class="btn pri" onclick="saveMesh('${stUuid}')">この格子で決める</button>
+      ${cells ? `<div class="warnbox">すでに <b>${cells}マス</b> 入力しています。<br>
+        四隅や細かさを変えると、同じ「3行2列」でも川の別の場所を指すことになります。
+        そのため<b>前の格子で入れたマスは、新しい格子の一覧・まとめには混ぜません</b>。<br>
+        記録は消えません。CSVには「前の格子のマス」として出ます。</div>` : ''}
+    `,
+    onMount(){
+      startGps();
+      const box = $('#mesh_gps');
+      if(box) ENV_GPS_TIMER = setInterval(()=>{
+        if(!document.body.contains(box)){ clearInterval(ENV_GPS_TIMER); ENV_GPS_TIMER=null; return; }
+        box.textContent = gpsHint();
+      }, 2000);
+      window._meshCorners = (meshCorners(st)||[]).slice();
+      showMeshPlan();
+      const first = (window._meshCorners[0]) ||
+        (numOf(st.latitude)!=='' ? [+st.latitude, +st.longitude] : null) ||
+        (sv && numOf(sv.latitude)!=='' ? [+sv.latitude, +sv.longitude] : [43.06, 141.35]);
+      MAPS.main.map = makeMap('meshmap', first, 17);
+      const map = MAPS.main.map;
+      if(!map) return;
+      applyBaseMap('main', baseMapName());
+      addLocateControl(map);
+      drawMeshSetup();
+      map.on('click', e=>{
+        const list = window._meshCorners || [];
+        if(list.length>=4) list.length = 0;      // 4つそろっていたら、押し直しで作り直す
+        list.push([+e.latlng.lat.toFixed(6), +e.latlng.lng.toFixed(6)]);
+        window._meshCorners = list;
+        drawMeshSetup();
+        showMeshPlan();
+      });
+    }
+  };
+};
+/* いまいる場所を四隅の1つとして押さえる */
+function grabMeshCorner(i){
+  toast('現在地を取っています…');
+  getFixOnce(f=>{
+    if(!f){ toast('現在地を取れませんでした'); return; }
+    if(f.acc > GPS_MAX_ACC){
+      toast(`いまの位置は ±${Math.round(f.acc)}m と粗いので押さえていません`, 8000);
+      return;
+    }
+    const list = (window._meshCorners||[]).slice();
+    while(list.length < i) list.push(null);
+    list[i] = [+f.lat.toFixed(6), +f.lon.toFixed(6)];
+    window._meshCorners = list;
+    drawMeshSetup();
+    showMeshPlan();
+    toast(`${i+1}つ目を押さえました`);
+  });
+}
+function clearMeshCorners(){
+  if(!confirm('押さえた四隅を消します。よろしいですか？')) return;
+  window._meshCorners = [];
+  drawMeshSetup();
+  showMeshPlan();
+}
+/* 四隅と格子を地図に描く */
+function drawMeshSetup(){
+  const map = MAPS.main.map; if(!map) return;
+  try{ MESHLAYER.forEach(x=>map.removeLayer(x)); }catch(e){}
+  MESHLAYER = [];
+  const list = (window._meshCorners||[]).filter(Boolean);
+  list.forEach((pt,i)=>{
+    if(!validPt(pt)) return;
+    MESHLAYER.push(L.marker(pt, {icon:dotIcon('#4aa3ff',13)}).addTo(map));
+    MESHLAYER.push(L.marker(pt, {icon:L.divIcon({className:'',
+      html:`<div style="color:#4aa3ff;font-weight:700;text-shadow:0 0 3px #000">${i+1}</div>`,
+      iconSize:[16,16], iconAnchor:[-6,16]})}).addTo(map));
+  });
+  const tmp = tmpMeshStation();
+  const g = meshPlan(tmp);
+  if(g){
+    MESHLAYER.push(L.polygon(g.corners, {color:'#4aa3ff', weight:2, fillOpacity:.06}).addTo(map));
+    // 細かすぎるとぼやけるので、線は最大30本ずつ。
+    // ただし引く場所は本当の境目にする（間引いた本数で割ると、線が実際とずれる）
+    const pickLines = (total)=>{
+      const out = [];
+      const step = Math.max(1, Math.ceil((total-1)/30));
+      for(let i=step;i<total;i+=step) out.push(i);
+      return out;
+    };
+    pickLines(g.rows).forEach(r=>{
+      const v = r/g.rows;
+      const p1 = [g.corners[0][0]+(g.corners[3][0]-g.corners[0][0])*v,
+                  g.corners[0][1]+(g.corners[3][1]-g.corners[0][1])*v];
+      const p2 = [g.corners[1][0]+(g.corners[2][0]-g.corners[1][0])*v,
+                  g.corners[1][1]+(g.corners[2][1]-g.corners[1][1])*v];
+      MESHLAYER.push(L.polyline([p1,p2], {color:'#4aa3ff', weight:1, opacity:.5}).addTo(map));
+    });
+    pickLines(g.cols).forEach(c2=>{
+      const u = c2/g.cols;
+      const p1 = [g.corners[0][0]+(g.corners[1][0]-g.corners[0][0])*u,
+                  g.corners[0][1]+(g.corners[1][1]-g.corners[0][1])*u];
+      const p2 = [g.corners[3][0]+(g.corners[2][0]-g.corners[3][0])*u,
+                  g.corners[3][1]+(g.corners[2][1]-g.corners[3][1])*u];
+      MESHLAYER.push(L.polyline([p1,p2], {color:'#4aa3ff', weight:1, opacity:.5}).addTo(map));
+    });
+    try{ map.fitBounds(L.latLngBounds(g.corners).pad(0.25), {animate:false}); }catch(e){}
+  }
+  // 押さえた分だけ画面の表にも書き戻す
+  [0,1,2,3].forEach(i=>{
+    const el = $('#mc_'+i); if(!el) return;
+    const pt = list[i] || (window._meshCorners||[])[i];
+    el.innerHTML = (pt && validPt(pt))
+      ? esc(pt[0].toFixed(6)+', '+pt[1].toFixed(6))
+      : '<span class="pill ng">まだ</span>';
+  });
+}
+/* いま画面にある値だけで作った、仮の箇所 */
+function tmpMeshStation(){
+  return {
+    mesh_corners: (window._meshCorners||[]).filter(Boolean),
+    mesh_row_m: strVal('#mesh_gap'), mesh_cols: strVal('#mesh_cols'),
+  };
+}
+/* 何マスになるかを、決める前に見せる */
+function showMeshPlan(){
+  const box = $('#mesh_plan'); if(!box) return;
+  const tmp = tmpMeshStation();
+  const list = (window._meshCorners||[]).filter(Boolean);
+  const cerr = list.length===4 ? meshCornerError(list) : '';
+  if(cerr){ box.textContent = cerr; drawMeshSetup(); return; }
+  const c = meshCorners(tmp);
+  if(!c){ box.textContent = '四隅を4つとも押さえると、マスの数が出ます。'; drawMeshSetup(); return; }
+  const g = meshPlan(tmp);
+  if(!g){ box.textContent = `縦 ${fmtDist(meshLength(tmp))}／横 ${fmtDist(meshWidth(tmp))}。`
+    + '縦の間隔と横の分割数を入れてください。'; drawMeshSetup(); return; }
+  box.textContent = `縦 ${fmtDist(g.length)}（${g.rows}行）× 横 ${fmtDist(g.width)}（${g.cols}列）`
+    + ` ＝ ${g.n}マス`
+    + (g.n > MESH_MAX_CELLS ? `　※${MESH_MAX_CELLS}マスを超えるので決められません` : '');
+  drawMeshSetup();
+}
+/* 格子を決めて保存する */
+function saveMesh(stUuid){
+  const st = DB.liveStation(stUuid); if(!st) return;
+  const tmp = tmpMeshStation();
+  const cerr = meshCornerError((window._meshCorners||[]).filter(Boolean));
+  if(cerr){ toast(cerr, 6000); return; }
+  const c = meshCorners(tmp);
+  if(!c){ toast('四隅を4つとも押さえてください', 5000); return; }
+  const err = rangeCheck([['縦の間隔', strVal('#mesh_gap'), 0.1, 1000],
+                          ['横の分割数', strVal('#mesh_cols'), 1, 200]]);
+  if(err){ toast(err, 6000); return; }
+  const g = meshPlan(tmp);
+  if(!g){ toast('縦の間隔と横の分割数を入れてください', 5000); return; }
+  if(g.n > MESH_MAX_CELLS){
+    toast(`${g.n}マスは多すぎます（${MESH_MAX_CELLS}マスまで）。`
+      + '間隔を広げるか、範囲を分けてください', 8000);
+    return;
+  }
+  const before = meshGridSig(st);
+  st.mesh_corners = c;
+  st.mesh_row_m   = numOf(strVal('#mesh_gap'));
+  st.mesh_cols    = countOf(strVal('#mesh_cols'));
+  delete st.mesh_rows;                    // 間隔から数え直す
+  // 中身が変わったときだけ版を新しくする。
+  // 版が変われば、前の格子で入れたマスは一覧にも集計にも混ざらない
+  if(!st.mesh_grid_id || meshGridSig(st)!==before) st.mesh_grid_id = uuid();
+  if(!DB.upsert(DB.key.st, st)) return;
+  // 次に作るときの初期値として覚えておく（この端末だけ）
+  prefSet('mesh_row_m', st.mesh_row_m);
+  prefSet('mesh_cols', st.mesh_cols);
+  toast(`${g.rows}行 × ${g.cols}列 ＝ ${g.n}マスにしました`);
+  goTo('mesh', stUuid);
+}
+/* 箇所を保存してから格子の画面へ。保存できなければ動かない */
+function toMeshSetup(svUuid, stUuid){
+  if(stUuid){ nav('meshSetup', stUuid); return; }
+  toast('先にこの記録を保存します…');
+  saveStation(svUuid, '', {then:'meshSetup'});
+}
+
+/* ---------- メッシュ：格子の一覧 ---------- */
+SCREENS.mesh = (stUuid)=>{
+  const st = DB.liveStation(stUuid);
+  if(!st) return null;
+  const sv = DB.get(DB.key.sv, st.survey_uuid);
+  const g = meshGeom(st);
+  const all = meshCellsOf(stUuid);
+  const cells = meshCurrentCells(st, all);
+  const map = meshCellMap(cells);
+  const dep = meshStats(cells, 'depth_cm', st.depth_rep_cm);
+  const vel = meshStats(cells, 'velocity_cms', st.velocity_rep_cms);
+  // 前の格子のマスと、いまの格子からはみ出したマス
+  const 前の格子 = meshOldCells(st, all).length;
+  const 外 = cells.filter(x=> !g || x.row>=g.rows || x.col>=g.cols).length;
+
+  const grid = g ? `<div style="overflow-x:auto"><table style="min-width:100%">
+    <thead><tr><th class="dim small">行＼列</th>
+      ${Array.from({length:g.cols},(_,c)=>`<th class="num dim small">${c+1}</th>`).join('')}
+    </tr></thead><tbody>
+    ${Array.from({length:g.rows},(_,r)=>`<tr>
+      <td class="dim small">${r+1}</td>
+      ${Array.from({length:g.cols},(_,c)=>{
+        const cell = map[r+'_'+c];
+        const on = !!cell;
+        return `<td style="text-align:center;padding:2px">
+          <button class="btn sm" style="width:auto;margin:0;padding:6px 8px;min-width:44px;
+            ${on?'background:#1b3a24;border-color:#2ea043;color:#7ee787':''}"
+            onclick="nav('meshCell',{station:'${stUuid}',row:${r},col:${c}})">
+            ${on ? (numOf(cell.depth_cm)===''?'●':esc(fmtNum(numOf(cell.depth_cm),0))) : '＋'}
+          </button></td>`;
+      }).join('')}
+    </tr>`).join('')}
+    </tbody></table></div>` : '';
+
+  return {
+    title:'メッシュ',
+    sub:[{text:st.name||''}, {text:`${cells.length}マス`},
+         前の格子 ? {text:`前の格子 ${前の格子}`, cls:'warn'} : null].filter(Boolean),
+    html:`
+      ${g ? `<div class="card">
+        <div class="row">
+          <div class="grow"><div class="dim small">格子</div>
+            <div>${g.rows}行 × ${g.cols}列 ＝ ${g.n}マス</div></div>
+          <div class="grow"><div class="dim small">入力済み</div>
+            <div style="font-weight:700">${cells.length}マス</div></div>
+          <div class="grow"><div class="dim small">大きさ</div>
+            <div>${esc(fmtDist(g.length))} × ${esc(fmtDist(g.width))}</div></div>
+        </div>
+      </div>`
+      : `<div class="ngbox">まだ格子を決めていません。<br>
+          下の「範囲と格子を決める」から、四隅を押さえてください。</div>`}
+
+      ${前の格子 ? `<div class="warnbox">前の格子で入れたマスが <b>${前の格子}件</b> あります。
+        四隅か細かさを変えたためです。同じ行・列でも川の別の場所を指すので、
+        下の表とまとめには混ぜていません。<br>
+        記録は消えていません。CSVには「前の格子のマス」として出ます。</div>` : ''}
+      ${外 ? `<div class="warnbox">いまの格子からはみ出したマスが ${外}件 あります。</div>` : ''}
+
+      ${g ? `<div class="card">
+        <h3 style="margin-top:0">マス（数字は水深cm）</h3>
+        <div class="dim small">緑は入力済み。タップで開きます。
+          左が左岸、上が上流です。</div>
+        ${grid}
+      </div>` : ''}
+
+      ${cells.length ? `<div class="card">
+        <h3 style="margin-top:0">マスからのまとめ</h3>
+        <table><tbody>
+          <tr><td class="dim">水深</td><td class="num">${dep.n
+            ? esc(fmtNum(dep.min,1)+'〜'+fmtNum(dep.max,1)+' cm（平均 '+fmtNum(dep.avg,1)+'）') : '—'}</td></tr>
+          <tr><td class="dim">流速</td><td class="num">${vel.n
+            ? esc(fmtNum(vel.min,1)+'〜'+fmtNum(vel.max,1)+' cm/s（平均 '+fmtNum(vel.avg,1)+'）') : '—'}</td></tr>
+        </tbody></table>
+        <div class="dim small">この値が、箇所の代表値としてCSVに出ます。</div>
+      </div>` : ''}
+
+      ${baseMapButtonsHtml()}
+      <div id="meshmap2" class="map"></div>
+
+      <button class="btn" onclick="nav('meshSetup','${stUuid}')">範囲と格子を決める</button>
+    `,
+    onMount(){
+      const g2 = meshGeom(st);
+      const c = (g2 ? g2.corners[0] : null)
+        || (numOf(st.latitude)!=='' ? [+st.latitude, +st.longitude] : [43.06, 141.35]);
+      MAPS.main.map = makeMap('meshmap2', c, 17);
+      const map = MAPS.main.map;
+      if(!map || !g2) return;
+      applyBaseMap('main', baseMapName());
+      addLocateControl(map);
+      try{ MESHLAYER.forEach(x=>map.removeLayer(x)); }catch(e){}
+      MESHLAYER = [];
+      const cm = meshCellMap(cells);
+      // マスが多いと重いので、描くのは400マスまで
+      const draw = Math.min(g2.n, 400);
+      let k = 0;
+      for(let r=0;r<g2.rows && k<draw;r++){
+        for(let cc=0;cc<g2.cols && k<draw;cc++,k++){
+          const on = !!cm[r+'_'+cc];
+          MESHLAYER.push(L.polygon(meshCellPoly(g2.corners, g2.rows, g2.cols, r, cc),
+            {color: on ? '#2ea043' : '#4aa3ff', weight:1,
+             fillOpacity: on ? .35 : .05}).addTo(map));
+        }
+      }
+      try{ map.fitBounds(L.latLngBounds(g2.corners).pad(0.2), {animate:false}); }catch(e){}
+    }
+  };
+};
+
+/* ---------- メッシュ：1マスの入力 ---------- */
+SCREENS.meshCell = (arg)=>{
+  arg = arg||{};
+  const st = DB.liveStation(arg.station);
+  if(!st) return null;
+  const g = meshGeom(st);
+  if(!g) return null;
+  const row = +arg.row, col = +arg.col;
+  if(!(row>=0 && col>=0 && row<g.rows && col<g.cols)) return null;
+  const cells = meshCurrentCells(st);
+  const cur = meshCellMap(cells)[row+'_'+col] || {};
+  const pos = meshCellCenter(g.corners, g.rows, g.cols, row, col);
+  const pct = (cur.substrate_pct && typeof cur.substrate_pct==='object') ? cur.substrate_pct : {};
+  const gv = k => (cur[k]!==undefined && cur[k]!=='' ? cur[k] : '');
+  return {
+    title:`${row+1}行 ${col+1}列`,
+    sub:[{text:st.name||''}, cur.uuid ? {text:'入力済み', cls:'ok'} : null].filter(Boolean),
+    html:`
+      <div class="card">
+        <div class="dim small">位置（四隅から計算）
+          ${esc(pos[0].toFixed(6)+', '+pos[1].toFixed(6))}</div>
+        <label>水深（cm）</label>
+        <input id="mx_d" inputmode="decimal" value="${esc(gv('depth_cm'))}"
+          placeholder="干出していれば 0">
+        <label>流速（cm/s）</label>
+        <input id="mx_v" inputmode="decimal" value="${esc(gv('velocity_cms'))}"
+          placeholder="淀んでいれば 0">
+        <label>河床材料（いちばん多いもの）</label>
+        ${segHtml('mx_sub', OPT.substrate, gv('substrate'), true)}
+      </div>
+
+      ${foldHtml('mxmore', '詳しく入れる', '<span class="fsub">環境区分・礫・カバー・割合</span>', `
+        <label>環境区分</label>
+        ${segHtml('mx_hab', OPT.habitat, gv('habitat_type'), true)}
+        <label>礫の埋もれ度</label>
+        ${segHtml('mx_gr', OPT.gravel, gv('gravel_condition'), true)}
+        <label>カバー</label>
+        ${segHtml('mx_cov', OPT.cover, gv('cover'))}
+        <div class="dim small">「なし」は選択肢のひとつです（岸にカバーが無い、という記録）。</div>
+        <h3>河床材料の割合（％）</h3>
+        <div class="dim small">分かるときだけ。合計100％が目安です。</div>
+        ${OPT.substrate.map(k=>`
+          <div class="row" style="margin-top:6px">
+            <div class="grow dim">${esc(k)}
+              <span class="small">${esc(SUBSTRATE_NOTE[k]||'')}</span></div>
+            <div style="width:92px">
+              <input id="mxp_${SUBSTRATE_NO[k]}" inputmode="decimal"
+                value="${esc(pct[k]!==undefined?pct[k]:'')}"></div>
+          </div>`).join('')}
+        <label>備考</label>
+        <input id="mx_note" value="${esc(gv('note'))}">`)}
+
+      <button class="btn pri" onclick="saveMeshCell('${arg.station}',${row},${col},false)">
+        保存する</button>
+      <button class="btn ok" onclick="saveMeshCell('${arg.station}',${row},${col},true)">
+        保存して次のマスへ</button>
+      ${cells.length ? `<button class="btn" onclick="copyPrevMeshCell('${arg.station}',${row},${col})">
+        1つ前のマスと同じにする</button>` : ''}
+      ${cur.uuid ? `<button class="btn ng" onclick="delMeshCell('${cur.uuid}')">
+        このマスの記録を消す</button>` : ''}
+    `,
+    onMount(){
+      const key = 'meshcell:'+arg.station+':'+row+':'+col;
+      const base = collectMeshCell();
+      const d = draftGet(key);
+      if(d){
+        applySels(d);
+        applySeg('mx_sub', d.__sub); applySeg('mx_hab', d.__hab);
+        applySeg('mx_gr', d.__gr); applySegRaw('mx_cov', d.__cov);
+        toast('書きかけを戻しました');
+      }
+      draftBind(key, collectMeshCell, base);
+      const el=$('#mx_d'); if(el) el.focus();
+    }
+  };
+};
+function meshCellSels(){
+  const sels = ['#mx_d','#mx_v','#mx_note'];
+  OPT.substrate.forEach(k=>sels.push('#mxp_'+SUBSTRATE_NO[k]));
+  return sels;
+}
+function collectMeshCell(){
+  const o = collectSels(meshCellSels());
+  o.__sub = segVal('mx_sub'); o.__hab = segVal('mx_hab');
+  o.__gr  = segVal('mx_gr');  o.__cov = segRaw('mx_cov');
+  return o;
+}
+function saveMeshCell(stUuid, row, col, next){
+  const st = DB.liveStation(stUuid); if(!st) return;
+  const g = meshGeom(st); if(!g) return;
+  const checks = [['水深', strVal('#mx_d'), 0, 2000], ['流速', strVal('#mx_v'), 0, 1000]];
+  OPT.substrate.forEach(k=>checks.push([k+'の割合', strVal('#mxp_'+SUBSTRATE_NO[k]), 0, 100]));
+  const err = rangeCheck(checks);
+  if(err){ toast(err, 6000); return; }
+
+  // いまの格子のマスだけを「同じマス」とみなす。
+  // 前の格子の同じ行・列に上書きすると、別の場所の記録を書き換えてしまう
+  const cells = meshCurrentCells(st);
+  const cur = meshCellMap(cells)[row+'_'+col];
+  const rec = cur ? (DB.get(DB.key.mc, cur.uuid) || {uuid:cur.uuid})
+                  : {uuid:uuid(), survey_uuid:st.survey_uuid, station_uuid:stUuid,
+                     row, col, measured_at:nowISO()};
+  rec.grid_id = meshGridId(st);
+  rec.survey_uuid = rec.survey_uuid || st.survey_uuid;
+  rec.station_uuid = rec.station_uuid || stUuid;
+  rec.row = row; rec.col = col;
+  const pos = meshCellCenter(g.corners, g.rows, g.cols, row, col);
+  rec.latitude = +pos[0].toFixed(6);
+  rec.longitude = +pos[1].toFixed(6);
+  rec.depth_cm = numVal('#mx_d');
+  rec.velocity_cms = numVal('#mx_v');
+  // 「なし」は空欄の合図。ただしカバーだけは正本の一覧に「なし」が実在するので、
+  // そのまま受ける（2026-08-16 の監査で同じ取り違えがあった）
+  rec.substrate = segVal('mx_sub');
+  rec.habitat_type = segVal('mx_hab');
+  rec.gravel_condition = segVal('mx_gr');
+  rec.cover = segRaw('mx_cov');
+  rec.note = strVal('#mx_note');
+  const pct = {};
+  OPT.substrate.forEach(k=>{ pct[k] = numVal('#mxp_'+SUBSTRATE_NO[k]); });
+  rec.substrate_pct = pct;
+  // 何も入っていないマスは作らない（開いただけで増えないように）
+  if(!cur && rec.depth_cm==='' && rec.velocity_cms==='' && !rec.substrate
+     && !rec.habitat_type && !rec.gravel_condition && !rec.cover && !rec.note
+     && !Object.keys(pct).some(k=>pct[k]!=='')){
+    toast('何か入れてから保存してください');
+    return;
+  }
+  if(!DB.upsert(DB.key.mc, rec)) return;
+  draftClear('meshcell:'+stUuid+':'+row+':'+col);
+  draftUnbind();
+  toast('保存しました');
+  if(next){
+    // 右へ。行の終わりなら次の行の左へ。最後なら一覧へ戻る
+    let r = row, c = col + 1;
+    if(c >= g.cols){ c = 0; r += 1; }
+    if(r >= g.rows){ goTo('mesh', stUuid); return; }
+    navReplace('meshCell', {station:stUuid, row:r, col:c});
+  }else{
+    goTo('mesh', stUuid);
+  }
+}
+/* 1つ前のマス（左どなり。行の頭なら前の行の右端）の中身を写す */
+function copyPrevMeshCell(stUuid, row, col){
+  const st = DB.liveStation(stUuid); if(!st) return;
+  const g = meshGeom(st); if(!g) return;
+  let r = row, c = col - 1;
+  if(c < 0){ r = row - 1; c = g.cols - 1; }
+  if(r < 0){ toast('1つ前のマスがありません'); return; }
+  const prev = meshCellMap(meshCurrentCells(st))[r+'_'+c];
+  if(!prev){ toast('1つ前のマスは、まだ入力されていません'); return; }
+  applyVals({'#mx_d': prev.depth_cm!==undefined?prev.depth_cm:'',
+             '#mx_v': prev.velocity_cms!==undefined?prev.velocity_cms:'',
+             '#mx_note': prev.note||''});
+  applySeg('mx_sub', prev.substrate); applySeg('mx_hab', prev.habitat_type);
+  applySeg('mx_gr', prev.gravel_condition); applySegRaw('mx_cov', prev.cover);
+  const pct = (prev.substrate_pct && typeof prev.substrate_pct==='object') ? prev.substrate_pct : {};
+  OPT.substrate.forEach(k=>{
+    const el = $('#mxp_'+SUBSTRATE_NO[k]);
+    if(el) el.value = (pct[k]!==undefined ? pct[k] : '');
+  });
+  draftTouch();
+  toast(`${r+1}行 ${c+1}列 の中身を写しました`);
+}
+function delMeshCell(uu){
+  if(!confirm('このマスの記録を消します。よろしいですか？')) return;
+  const rec = DB.get(DB.key.mc, uu);
+  if(DB.softDelete(DB.key.mc, uu)){
+    draftClear('meshcell:'+(rec?rec.station_uuid:'')+':'+(rec?rec.row:'')+':'+(rec?rec.col:''));
+    toast('消しました');
+    if(rec) goTo('mesh', rec.station_uuid); else goBack();
+  }
 }
 
 /* ---------- 魚種を選ぶ ---------- */
@@ -5136,11 +5927,11 @@ SCREENS.exportHub = (svUuid)=>{
   if(!sv) return null;
   const envOnly = isEnvSurvey(sv);
   const r = buildDbRows(sv);
-  let extra = {ind:0, st:0, pt:0};
+  let extra = {ind:0, st:0, pt:0, mesh:0};
   try{
     const snap = exportSnapshot();
     extra = {ind: buildIndRows(sv, snap).length, st: buildStationRows(sv, snap).length,
-             pt: buildPointRows(sv, snap).length};
+             pt: buildPointRows(sv, snap).length, mesh: buildMeshRows(sv, snap).length};
   }catch(e){}
   const ph = photoStats(sv);
   return {
@@ -5189,6 +5980,8 @@ SCREENS.exportHub = (svUuid)=>{
             <div class="big">${extra.pt} 点</div></div>
           <div class="grow"><div class="dim small">箇所</div>
             <div class="big">${extra.st} 件</div></div>
+          ${extra.mesh ? `<div class="grow"><div class="dim small">メッシュ</div>
+            <div class="big">${extra.mesh} マス</div></div>` : ''}
         </div>
         <div class="dim small">通電秒数・距離・面積・1尾ずつの体長は、こちらに出ます。
           いまはデータベースに取り込む口がないので、Excelで開いて使ってください。</div>
@@ -5198,6 +5991,9 @@ SCREENS.exportHub = (svUuid)=>{
           onclick="exportExtraCsv('${svUuid}','測点')">測点ごとの水深・流速を書き出す</button>
         <button class="btn" onclick="exportExtraCsv('${svUuid}','箇所')">箇所ごとの記録を書き出す</button>
         <button class="btn" onclick="exportExtraCsv('${svUuid}','調査')">調査のまとめを書き出す</button>
+        ${extra.mesh ? `<button class="btn"
+          onclick="exportExtraCsv('${svUuid}','メッシュ')">メッシュのマスを書き出す（${extra.mesh}マス）</button>`
+          : ''}
       </div>
 
       <div class="card">
@@ -5391,6 +6187,7 @@ function exportExtraCsv(svUuid, kind){
     '箇所': [FS_STATION_COLS, buildStationRows(sv, snap)],
     '調査': [FS_SURVEY_COLS,  buildSurveyRow(sv, snap)],
     '測点': [FS_POINT_COLS,   buildPointRows(sv, snap)],
+    'メッシュ': [FS_MESH_COLS, buildMeshRows(sv, snap)],
   }[kind];
   if(!table){ toast('書き出せません'); return; }
   const [cols, rows] = table;
