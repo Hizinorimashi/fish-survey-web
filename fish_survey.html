@@ -125,7 +125,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v21';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v22';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1636,6 +1636,51 @@ function envLegendHtml(svUuid){
     + chip('#8b949e','未記入') + '</div>');
 }
 
+/* 地図に置く記号。鳥アプリと同じ、白フチのバッジに文字を入れる形。
+   ただの丸だと、どれがどれだか地図の上で分からない */
+function envBadge(txt, bg, size, strong, square){
+  const fs = size <= 22 ? 10 : 12;
+  return L.divIcon({className:'', iconSize:[size,size], iconAnchor:[size/2,size/2],
+    html:`<div style="background:${bg};border:${strong?3:2}px solid #fff;
+      border-radius:${square?'5px':'50%'};width:${size}px;height:${size}px;
+      display:flex;align-items:center;justify-content:center;
+      font-size:${fs}px;line-height:1;color:#fff;font-weight:700;
+      box-shadow:0 1px 4px rgba(0,0,0,.5);white-space:nowrap">${esc(txt)}</div>`});
+}
+
+/* 地図の見えている場所を、調査ごとに覚えておく。
+   点を置くたびに全体表示へ戻ると、寄って作業しているときに邪魔になる */
+const ENV_VIEW = {};
+let ENV_MAP_SV = '';        // いま地図を出している調査
+function envRememberView(svUuid){
+  const map = MAPS.main.map; if(!map) return;
+  try{
+    const c = map.getCenter();
+    ENV_VIEW[svUuid] = {lat:c.lat, lon:c.lng, zoom:map.getZoom()};
+  }catch(e){}
+}
+/* 全体が入るように動かす。押したときだけ */
+function envFitAll(svUuid){
+  const map = MAPS.main.map; if(!map) return;
+  const pts = envAllPoints(svUuid);
+  if(!pts.length){ toast('まだ何も置かれていません'); return; }
+  try{ map.fitBounds(L.latLngBounds(pts).pad(0.3), {animate:false}); }catch(e){}
+  envRememberView(svUuid);
+}
+function envAllPoints(svUuid){
+  const pts = [];
+  DB.stationsOf(svUuid).filter(x=>!isMesh(x)).forEach(st=>{
+    if(envKindOf(st)==='L'){
+      const a = linePt(st,'start'), b = linePt(st,'end');
+      if(a) pts.push(a);
+      if(b) pts.push(b);
+    }else{
+      if(numOf(st.latitude)!=='') pts.push([+st.latitude, +st.longitude]);
+    }
+  });
+  return pts;
+}
+
 /* 地図の大きさ。大きくしても、下の入力はそのまま使える */
 function envMapBig(){ return !!prefs().env_map_big; }
 function envToggleBig(){ prefSet('env_map_big', !envMapBig()); render(); }
@@ -2243,6 +2288,12 @@ function baseMapName(){ const v=prefs().basemap; return BASEMAPS[v] ? v : '航�
    別のものになり、画面を離れても地図が残る（同じ場所に2つ目を作れず壊れる） */
 const MAPS = { main:{map:null, layer:null}, off:{map:null, layer:null} };
 function destroyMaps(){
+  // 片付ける前に、見ている場所を覚えておく。
+  // 地図の合図（moveend）で覚えると、片付けの最中に走って落ちることがある
+  if(ENV_MAP_SV && MAPS.main && MAPS.main.map){
+    try{ envRememberView(ENV_MAP_SV); }catch(e){}
+  }
+  ENV_MAP_SV = '';
   MESHLAYER = [];
   ENVLAYER = [];
   Object.keys(MAPS).forEach(k=>{
@@ -2333,6 +2384,25 @@ function drawPastSites(map, name){
   return out;
 }
 
+/* 地図の上に置くボタン。画像を使わない自前のコントロール */
+function addMapButton(map, label, title, onTap, pos){
+  const C = L.Control.extend({
+    options:{position: pos || 'topright'},
+    onAdd(){
+      const d = L.DomUtil.create('div','leaflet-bar');
+      const a = L.DomUtil.create('a','',d);
+      a.href='#'; a.title=title; a.textContent=label;
+      a.style.cssText='font-weight:700;text-align:center;width:34px';
+      L.DomEvent.on(a,'click',ev=>{ L.DomEvent.stop(ev); onTap(); });
+      L.DomEvent.disableClickPropagation(d);
+      return d;
+    }
+  });
+  const c = new C();
+  c.addTo(map);
+  return c;
+}
+
 /* 現在地ボタン。画像を使わない自前のコントロール */
 function addLocateControl(map){
   const C = L.Control.extend({
@@ -2346,7 +2416,8 @@ function addLocateControl(map){
         L.DomEvent.stop(ev);
         getFixOnce(f=>{
           if(!f){ toast('現在地を取れませんでした'); return; }
-          map.setView([f.lat,f.lon], Math.max(map.getZoom(),16));
+          // 動かしている途中で画面を移ると、片付けと重なって落ちることがある
+          map.setView([f.lat,f.lon], Math.max(map.getZoom(),16), {animate:false});
         });
       });
       return d;
@@ -4428,20 +4499,13 @@ SCREENS.envMap = (svUuid)=>{
       ${baseMapButtonsHtml()}
       <div id="envmap" class="map"
         style="height:${envMapBig()?'80vh':'46vh'};min-height:260px"></div>
-      <div class="row" style="margin-top:6px">
-        <button class="btn sm" style="width:auto;margin:0"
-          onclick="envToggleBig()">地図を${envMapBig()?'小さく':'大きく'}</button>
-        <div class="grow dim small" style="padding-left:8px">
-          大きくしても、下の入力はそのまま使えます。</div>
-      </div>
 
-      <div class="card">
-        <label>色分け</label>
+      ${foldHtml('envcolorfold', '色分け',
+        `<span class="fsub">${esc(envColorBy())}</span>`, `
         <div onclick="setTimeout(()=>envSetColorBy(segVal('envcolor')||'なし'),0)">
           ${segHtml('envcolor', ENV_COLOR_BY, envColorBy())}</div>
         ${envLegendHtml(svUuid)}
-        <div class="dim small">選んだ項目で、地図の点と線の色が変わります。</div>
-      </div>
+        <div class="dim small">選んだ項目で、地図の点と線の色が変わります。</div>`, false)}
 
       <div class="card">
         <div class="row" style="align-items:flex-start">
@@ -4613,15 +4677,28 @@ SCREENS.envMap = (svUuid)=>{
         if(ownsLock()) draftBind(key, collectEnvItem, base);
       }
 
-      // 地図。選んでいるものがあればそこへ、無ければ調査の位置へ
-      const c = envMapCenter(sv, cur);
-      MAPS.main.map = makeMap('envmap', c, 17);
+      // 地図。前に見ていた場所があればそこへ戻す（勝手に動かさない）
+      const v = ENV_VIEW[svUuid];
+      const c = v ? [v.lat, v.lon] : envMapCenter(sv, cur);
+      MAPS.main.map = makeMap('envmap', c, v ? v.zoom : 17);
       const map = MAPS.main.map;
       if(!map) return;
       applyBaseMap('main', baseMapName());
       addLocateControl(map);
+      addMapButton(map, envMapBig()?'小':'大',
+        envMapBig()?'地図を小さく':'地図を大きく', ()=>envToggleBig());
+      addMapButton(map, '全', '置いたものが全部入るように', ()=>envFitAll(svUuid));
       envDrawAll(svUuid);
+      ENV_MAP_SV = svUuid;      // 片付ける直前に、見ている場所を覚えるため
       map.on('click', e=>{ envAddAt(svUuid, e.latlng.lat, e.latlng.lng, null); render(); });
+      // はじめて開いたときだけ、置いてあるものが入るようにする
+      if(!v){
+        const pts = envAllPoints(svUuid);
+        if(pts.length>1){
+          try{ map.fitBounds(L.latLngBounds(pts).pad(0.3), {animate:false}); }catch(e){}
+        }
+        envRememberView(svUuid);
+      }
     }
   };
 };
@@ -4653,45 +4730,30 @@ function envDrawAll(svUuid){
   DB.stationsOf(svUuid).filter(x=>!isMesh(x)).forEach(st=>{
     const on = st.uuid === ENV_SEL;
     const byCol = envColorOf(st, range);
-    // 色分けを選んでいるときは、選んでいるものは太さで見せる（色は基準のまま）
+    // 色分けを選んでいるときは、選んでいるものは大きさで見せる（色は基準のまま）
     const col = byCol || (on ? '#f0883e' : (envKindOf(st)==='L' ? '#4aa3ff' : '#3fb950'));
-    const label = (pt)=>{
-      ENVLAYER.push(L.marker(pt, {icon:L.divIcon({className:'',
-        html:`<div style="color:${col};font-weight:700;font-size:12px;
-          text-shadow:0 0 3px #000,0 0 3px #000">${esc(st.name||'')}</div>`,
-        iconSize:[10,10], iconAnchor:[-8,14]})}).addTo(map));
+    const nm = st.name || '';
+    const put = (pt, txt, square)=>{
+      // 記号は L.marker。図形とちがって、クリックが地図に伝わらない
+      ENVLAYER.push(L.marker(pt, {icon:envBadge(txt, col, on?30:24, on, square),
+        zIndexOffset: on ? 1000 : 0})
+        .on('click', e=>{ L.DomEvent.stop(e); envSelect(st.uuid); }).addTo(map));
+      pts.push(pt);
     };
     if(envKindOf(st)==='L'){
       const a = linePt(st,'start'), b = linePt(st,'end');
-      if(a){
-        ENVLAYER.push(L.marker(a, {icon:dotIcon(col, on?15:12)})
-          .on('click', e=>{ L.DomEvent.stop(e); envSelect(st.uuid); }).addTo(map));
-        pts.push(a); label(a);
-      }
-      if(b){
-        ENVLAYER.push(L.marker(b, {icon:dotIcon(col, on?15:12)})
-          .on('click', e=>{ L.DomEvent.stop(e); envSelect(st.uuid); }).addTo(map));
-        pts.push(b);
-      }
+      if(a) put(a, nm, false);
+      if(b) put(b, '終', true);
       if(a && b) ENVLAYER.push(L.polyline([a,b],
-        {color:col, weight:on?5:3, opacity:.9, bubblingMouseEvents:false})
+        {color:col, weight:on?6:4, opacity:.9, bubblingMouseEvents:false})
         .on('click', e=>{ L.DomEvent.stop(e); envSelect(st.uuid); }).addTo(map));
     }else{
       const pt = numOf(st.latitude)==='' ? null : [+st.latitude, +st.longitude];
-      if(pt){
-        // bubblingMouseEvents を切らないと、選ぶための1タップが
-        // 地図のタップとしても伝わり、同じ場所に点がもう1つ増える
-        // （2026-08-17 の監査 Critical）
-        ENVLAYER.push(L.circleMarker(pt, {radius:on?9:7, color:col, weight:2,
-          fillOpacity:.6, bubblingMouseEvents:false})
-          .on('click', e=>{ L.DomEvent.stop(e); envSelect(st.uuid); }).addTo(map));
-        pts.push(pt); label(pt);
-      }
+      if(pt) put(pt, nm, false);
     }
   });
-  if(pts.length>1){
-    try{ map.fitBounds(L.latLngBounds(pts).pad(0.3), {animate:false}); }catch(e){}
-  }
+  // ここでは地図を動かさない。
+  // 点を置くたびに全体表示へ戻ると、寄って作業しているときに邪魔になる
 }
 
 /* いまいる場所に足す */
