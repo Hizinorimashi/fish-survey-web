@@ -125,7 +125,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v23';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v24';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1610,7 +1610,8 @@ function envColorRange(svUuid){
   const v = nums(list.map(x=>x.velocity_rep_cms));
   const d = nums(list.map(x=>x.depth_rep_cm));
   return {vLo: v.length?Math.min.apply(null,v):0, vHi: v.length?Math.max.apply(null,v):0,
-          dLo: d.length?Math.min.apply(null,d):0, dHi: d.length?Math.max.apply(null,d):0};
+          dLo: d.length?Math.min.apply(null,d):0, dHi: d.length?Math.max.apply(null,d):0,
+          vN: v.length, dN: d.length};
 }
 /* 何色が何を指すか。地図の下に出す */
 function envLegendHtml(svUuid){
@@ -1623,7 +1624,16 @@ function envLegendHtml(svUuid){
   if(by === '流速' || by === '水深'){
     const r = envColorRange(svUuid);
     const lo = by==='流速' ? r.vLo : r.dLo, hi = by==='流速' ? r.vHi : r.dHi;
-    if(!(hi > lo)) return wrap(`<div class="dim small">${esc(by)}：値が1つだけなので、色は分かれません</div>`);
+    const n  = by==='流速' ? r.vN : r.dN;
+    if(!(hi > lo)){
+      const why = n===0 ? 'まだ入っていないので、色は分かれません'
+                : n===1 ? '値が1つだけなので、色は分かれません'
+                        : 'どれも同じ値なので、色は分かれません';
+      return wrap(`<div class="dim small">${esc(by)}：${why}
+        <span style="display:inline-flex;align-items:center;gap:4px;margin-left:8px">
+        <span style="width:12px;height:12px;border-radius:6px;background:#8b949e;
+        display:inline-block"></span>未記入</span></div>`);
+    }
     return wrap(`<div class="dim small">${esc(by)}　`
       + [0,0.25,0.5,0.75,1].map(t=>{
           const v = lo + (hi-lo)*t;
@@ -1749,14 +1759,16 @@ function envAdvance(added, lineUuid){
    末尾を機械的に閉じると、L1 を選んでいるのに L2 が閉じる（監査 Major） */
 function envLineTarget(svUuid){
   const 未完 = st => st && isLine(st) && linePt(st,'start') && !linePt(st,'end');
-  // 1) 直前に置いた LS
+  // 1) いま選んでいる記録。人が選んだものを、いちばん先に見る。
+  //    自動で始まったラインを優先すると、古いラインを選んでも別のほうが閉じる
+  //    （2026-08-17 の監査 Critical）
+  const sel = ENV_SEL ? DB.getAlive(DB.key.st, ENV_SEL) : null;
+  if(未完(sel) && sel.survey_uuid===svUuid) return sel;
+  // 2) 直前に置いた LS
   if(ENV_NEXT.line){
     const st = DB.getAlive(DB.key.st, ENV_NEXT.line);
     if(未完(st) && st.survey_uuid===svUuid) return st;
   }
-  // 2) いま選んでいる記録
-  const sel = ENV_SEL ? DB.getAlive(DB.key.st, ENV_SEL) : null;
-  if(未完(sel) && sel.survey_uuid===svUuid) return sel;
   // 3) 未完がちょうど1つならそれ。2つ以上なら決めない（当て推量で閉じない）
   const list = DB.stationsOf(svUuid).filter(未完);
   return list.length===1 ? list[0] : null;
@@ -1791,28 +1803,41 @@ function envAddAt(svUuid, lat, lon, acc){
     st.line_end_acc = (acc===undefined || acc===null) ? '' : Math.round(acc);
     if(!st.survey_time_end) st.survey_time_end = now;
     st.ended_at = st.ended_at || nowISO();
-    if(!DB.upsert(DB.key.st, st)) return null;
-    envAdvance('LE');
+
     // つなげる：閉じた場所を、次のラインの始まりにする。
-    // いま閉じたほうを選んだままにする（さっき歩いた区間の中身を入れるため）
+    // 「閉じる」と「次を始める」を別々に保存すると、片方だけ成功したときに
+    // 閉じたのに次が始まっていない半端な状態が残る（2026-08-17 の監査 Major）。
+    // 1回の保存でまとめて書く
+    const つなぐ = envChain() && ENV_NEXT.auto;
+    const nx = つなぐ ? {
+      uuid: uuid(), survey_uuid: svUuid,
+      // まだ保存していないので、いまの件数＋1でよい（+2 にすると番号がぶつかる）
+      station_no: DB.stationsOf(svUuid).length + 1,
+      started_at: nowISO(), env_points: [],
+      survey_time_start: now,
+      survey_type: sv.survey_type_default || '目視',
+      env_method: 'ライン', name: envAutoName(svUuid, 'L'),
+      line_direction: st.line_direction || '上流→下流',
+      line_start_lat: la, line_start_lon: lo,
+      line_start_acc: (acc===undefined || acc===null) ? '' : Math.round(acc),
+      chained_from: st.uuid,
+    } : null;
+
+    let all;
+    try{ all = DB.loadRaw(DB.key.st); }
+    catch(e){ toast('保存された記録を読み取れないため、置けませんでした', 7000); return null; }
+    const i = all.findIndex(x=>x.uuid===st.uuid);
+    if(i < 0){ toast('この区間が見つかりません'); return null; }
+    st.updated_at = nowISO();
+    all[i] = st;
+    if(nx){ nx.created_at = nowISO(); nx.updated_at = nx.created_at; all.push(nx); }
+    if(!DB.save(DB.key.st, all)) return null;   // 保存できていないので、何も変えない
+
+    envAdvance('LE');
     let 続き = '';
-    if(envChain() && ENV_NEXT.auto){
-      const nx = {
-        uuid: uuid(), survey_uuid: svUuid,
-        station_no: DB.stationsOf(svUuid).length + 1,
-        started_at: nowISO(), env_points: [],
-        survey_time_start: now,
-        survey_type: sv.survey_type_default || '目視',
-        env_method: 'ライン', name: envAutoName(svUuid, 'L'),
-        line_direction: st.line_direction || '上流→下流',
-        line_start_lat: la, line_start_lon: lo,
-        line_start_acc: (acc===undefined || acc===null) ? '' : Math.round(acc),
-        chained_from: st.uuid,
-      };
-      if(DB.upsert(DB.key.st, nx)){
-        ENV_NEXT = {kind:'LE', auto:true, line:nx.uuid, survey:svUuid};
-        続き = `　つづけて ${nx.name} が始まりました`;
-      }
+    if(nx){
+      ENV_NEXT = {kind:'LE', auto:true, line:nx.uuid, survey:svUuid};
+      続き = `　つづけて ${nx.name} が始まりました`;
     }
     ENV_SEL = st.uuid;          // いま閉じたものを選ぶ（前の記録に書き込ませない）
     toast(`${st.name} の終わりを置きました（${fmtDist(lineDist(st))}）${続き}`,
@@ -2300,6 +2325,7 @@ function destroyMaps(){
   ENV_MAP_SV = '';
   MESHLAYER = [];
   ENVLAYER = [];
+  MEMARK = [];
   Object.keys(MAPS).forEach(k=>{
     const s = MAPS[k];
     if(s.map){ try{ s.map.remove(); }catch(e){} }
@@ -2388,6 +2414,37 @@ function drawPastSites(map, name){
   return out;
 }
 
+/* いまいる場所の印。青い丸と、どれくらい確かかの輪。
+   記録の記号（白フチのバッジ）とは別物に見えるようにする */
+let MEMARK = [];
+const ME_MAX_ACC = 500;      // これより粗い位置は、輪を描いても意味がない
+function meIcon(){
+  return L.divIcon({className:'', iconSize:[20,20], iconAnchor:[10,10],
+    html:`<div style="width:14px;height:14px;border-radius:50%;background:#2f81f7;
+      border:3px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.45),0 1px 4px rgba(0,0,0,.6)"
+      ></div>`});
+}
+/* いまいる場所を描き直す。位置が取れていなければ、何も描かない */
+function drawMe(slot){
+  const sl = MAPS[slot || 'main'];
+  if(!sl || !sl.map) return false;
+  const map = sl.map;
+  try{ MEMARK.forEach(x=>map.removeLayer(x)); }catch(e){}
+  MEMARK = [];
+  const f = freshFix(20000);
+  if(!f) return false;
+  const pt = [f.lat, f.lon];
+  if(!validPt(pt)) return false;
+  // どれくらい確かか。粗すぎるときは輪を出さない（画面が青一色になる）
+  if(f.acc > 0 && f.acc <= ME_MAX_ACC){
+    MEMARK.push(L.circle(pt, {radius:f.acc, color:'#2f81f7', weight:1,
+      fillColor:'#2f81f7', fillOpacity:.08, interactive:false}).addTo(map));
+  }
+  MEMARK.push(L.marker(pt, {icon:meIcon(), interactive:false,
+    zIndexOffset:2000}).addTo(map));
+  return true;
+}
+
 /* 地図の上に置くボタン。画像を使わない自前のコントロール */
 function addMapButton(map, label, title, onTap, pos){
   const C = L.Control.extend({
@@ -2414,14 +2471,19 @@ function addLocateControl(map){
     onAdd(){
       const d = L.DomUtil.create('div','leaflet-bar');
       const a = L.DomUtil.create('a','',d);
-      a.href='#'; a.title='現在地へ'; a.textContent='現';
-      a.style.cssText='font-weight:700;text-align:center';
+      // ◎ は「いまいる場所へ」の印。絵文字は使わない（端末で「？」になる）
+      a.href='#'; a.title='いまいる場所へ'; a.textContent='◎';
+      a.style.cssText='font-weight:700;text-align:center;font-size:18px';
       L.DomEvent.on(a,'click',ev=>{
         L.DomEvent.stop(ev);
         getFixOnce(f=>{
-          if(!f){ toast('現在地を取れませんでした'); return; }
+          if(!f){ toast('いまいる場所を取れませんでした。空の見えるところでお試しください', 6000); return; }
           // 動かしている途中で画面を移ると、片付けと重なって落ちることがある
           map.setView([f.lat,f.lon], Math.max(map.getZoom(),16), {animate:false});
+          drawMe('main');
+          if(f.acc > GPS_MAX_ACC){
+            toast(`いまの位置は ±${Math.round(f.acc)}m と粗いです`, 5000);
+          }
         });
       });
       return d;
@@ -2701,7 +2763,7 @@ function fileExt(f){
 
 /* ---------- 写真パネル（魚の記録・箇所・メモで共用） ----------
    SCREENS._photos = いま開いている記録の写真の並び */
-function photoPanelHtml(label){
+function photoPanelHtml(label, auto){
   return `<div class="card">
     <h3 style="margin-top:0">写真<span class="dim small" id="photoCount"></span></h3>
     <div class="dim small">${esc(label||'')}</div>
@@ -2710,7 +2772,9 @@ function photoPanelHtml(label){
     <button class="btn" onclick="document.getElementById('fPhotoIn').click()">
       写真を撮る／端末から選ぶ</button>
     <div class="mediagrid" id="photoGrid"></div>
-    <div class="dim small">保存を押すまで、この記録には結びつきません。</div>
+    <div class="dim small">${auto
+      ? '入れたそばから、この記録に付きます。'
+      : '保存を押すまで、この記録には結びつきません。'}</div>
   </div>`;
 }
 async function pickPhotos(input){
@@ -2748,6 +2812,9 @@ async function pickPhotos(input){
       // 1枚ごとに控える。全部終えてからだと、2枚目の変換中に画面が変わったとき
       // 1枚目まで消える（2026-08-17 の監査 Critical）
       draftTouch();
+      // 物理環境の画面では、1枚ごとにその記録へ保存する。
+      // 全部終えてからだと、2枚目の途中で画面が変わったとき1枚目が記録に付かない
+      try{ if(typeof envAutoSave==='function' && ENV_FORM) envAutoSave(ENV_FORM); }catch(e){}
       ok++;
     }catch(e){
       ng++;
@@ -2758,8 +2825,6 @@ async function pickPhotos(input){
   }
   if(screenStale(gen)) return;
   renderPhotoPanel();
-  // 物理環境の画面では、写真も入れたそばから保存する
-  try{ if(typeof envAutoSave==='function' && ENV_FORM) envAutoSave(ENV_FORM); }catch(e){}
   if(lost){
     toast((ok ? `写真 ${ok}枚を追加しました。残りは、` : '')
       + '別のタブで記録が開かれたため追加できませんでした。'
@@ -2777,7 +2842,10 @@ async function pickPhotos(input){
 /* 写真そのものはここでは消さない。保存せずに戻った場合に、記録が
    「無い写真」を指してしまうため。実体は使われなくなった時点で gc() が片付ける */
 function delPhoto(id){
-  if(!confirm('この写真を外しますか？（保存を押すと反映されます）')) return;
+  // 物理環境の画面は入れたそばから保存されるので、案内を分ける
+  const auto = (typeof ENV_FORM!=='undefined') && ENV_FORM;
+  if(!confirm(auto ? 'この写真を外しますか？'
+                   : 'この写真を外しますか？（保存を押すと反映されます）')) return;
   SCREENS._photos = (SCREENS._photos||[]).filter(pp=>pp.id!==id);
   draftTouch();
   try{ if(typeof envAutoSave==='function' && ENV_FORM) envAutoSave(ENV_FORM); }catch(e){}
@@ -4643,7 +4711,7 @@ SCREENS.envMap = (svUuid)=>{
         <div id="ev_err"></div>
       </div>
 
-      ${photoPanelHtml('この点・区間のようす。')}
+      ${photoPanelHtml('この点・区間のようす。', true)}
       </div>
       <div class="dim small" id="ev_saved">入れたそばから、自動で保存されます。</div>
       <button class="btn pri" onclick="saveEnvItem('${cur.uuid}')">保存する</button>
@@ -4669,6 +4737,7 @@ SCREENS.envMap = (svUuid)=>{
       if(box) ENV_GPS_TIMER = setInterval(()=>{
         if(!document.body.contains(box)){ clearInterval(ENV_GPS_TIMER); ENV_GPS_TIMER=null; return; }
         box.textContent = gpsHint();
+        drawMe('main');          // いる場所を追いかける
       }, 2000);
 
       ENV_FORM = cur ? cur.uuid : '';
@@ -4694,6 +4763,14 @@ SCREENS.envMap = (svUuid)=>{
         if(box && ownsLock()){
           box.addEventListener('input',  ()=>envAutoSave(cur.uuid));
           box.addEventListener('change', ()=>envAutoSave(cur.uuid));
+          // 選ぶボタン（環境区分・河床材料・礫の状況）は input も change も出さない。
+          // 拾わないと、押したのに記録にも書き出しにも入らない
+          // （2026-08-17 の監査 Critical）
+          box.addEventListener('click', e=>{
+            if(e.target && e.target.closest && e.target.closest('[data-seg]')){
+              setTimeout(()=>envAutoSave(cur.uuid), 0);   // 選び終わってから
+            }
+          });
         }
       }
 
@@ -4709,6 +4786,7 @@ SCREENS.envMap = (svUuid)=>{
         envMapBig()?'地図を小さく':'地図を大きく', ()=>envToggleBig());
       addMapButton(map, '全', '置いたものが全部入るように', ()=>envFitAll(svUuid));
       envDrawAll(svUuid);
+      drawMe('main');            // 開いた時点でも、いる場所を出す
       ENV_MAP_SV = svUuid;      // 片付ける直前に、見ている場所を覚えるため
       map.on('click', e=>{ envAddAt(svUuid, e.latlng.lat, e.latlng.lng, null); render(); });
       // はじめて開いたときだけ、置いてあるものが入るようにする
