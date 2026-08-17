@@ -83,6 +83,14 @@ th{color:var(--dim);font-weight:600;font-size:12px}
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .warnbox{background:#2a2110;border:1px solid #4d3f16;color:#f0d48a;border-radius:8px;padding:10px;font-size:13px;margin:10px 0}
 .ngbox{background:#2a1414;border:1px solid #5c2626;color:#ffb4ad;border-radius:8px;padding:10px;font-size:13px;margin:10px 0}
+.mediagrid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px}
+.mediathumb{position:relative;aspect-ratio:1/1;border-radius:8px;overflow:hidden;background:#1a1d22}
+.mediathumb img{width:100%;height:100%;object-fit:cover;display:block}
+.mediadel{position:absolute;top:2px;right:2px;width:26px;height:26px;border:0;border-radius:13px;
+  background:rgba(0,0,0,.62);color:#fff;font-size:16px;line-height:1;cursor:pointer}
+.photoview{position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:80;display:flex;
+  align-items:center;justify-content:center;flex-direction:column;gap:12px;padding:12px}
+.photoview img{max-width:100%;max-height:82vh;object-fit:contain}
 .okbox{background:#12271a;border:1px solid #264d31;color:#9be0aa;border-radius:8px;padding:10px;font-size:13px;margin:10px 0}
 .chip{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:6px;
   padding:2px 7px;font-size:12px;color:var(--dim);margin:2px 4px 2px 0}
@@ -117,7 +125,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v16';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v17';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1573,6 +1581,8 @@ let ENV_GPS_TIMER = null;
 function render(){
   SCREEN_SEQ++;
   draftUnbind();
+  closePhotoView();           // 大きく見ていた写真は、画面が変わったら閉じる
+  revokePhotoUrls();          // 前の画面で開いた写真を、いつまでも抱えない
   if(EFFORT_TIMER){ clearInterval(EFFORT_TIMER); EFFORT_TIMER=null; }
   if(ENV_GPS_TIMER){ clearInterval(ENV_GPS_TIMER); ENV_GPS_TIMER=null; }
   destroyMaps();
@@ -1963,6 +1973,307 @@ const FS_DB_COLS = ['緯度','経度','調査日','季節','天気','水温','�
   '調査区分','調査方法','種ID','個体数','最大体長','最小体長','同定確度',
   'コピー数','在不在','流量','開始時刻','終了時刻','備考','業務番号','業務名'];
 
+/* ============================================================
+   写真の保存（IndexedDB）
+   写真そのものは localStorage に入らないので IndexedDB に置き、
+   記録側には「どの写真か」を示す小さな情報だけを持たせる。
+   置き場の名前は魚アプリ専用にする（同じ場所に鳥・産卵床のアプリが並ぶため）
+   ============================================================ */
+const MEDIA_DB_NAME='fish_survey_media', MEDIA_DB_VER=1, MEDIA_STORE='photo';
+let _mediaDB=null;
+function openMediaDB(){
+  if(_mediaDB) return Promise.resolve(_mediaDB);
+  return new Promise((res,rej)=>{
+    if(!window.indexedDB){ rej(new Error('この端末では写真を保存できません')); return; }
+    let q; try{ q=indexedDB.open(MEDIA_DB_NAME, MEDIA_DB_VER); }catch(e){ rej(e); return; }
+    q.onupgradeneeded=()=>{ const db=q.result;
+      if(!db.objectStoreNames.contains(MEDIA_STORE)) db.createObjectStore(MEDIA_STORE,{keyPath:'id'}); };
+    q.onsuccess=()=>{ _mediaDB=q.result; res(_mediaDB); };
+    q.onerror=()=>rej(q.error);
+  });
+}
+// 書き込みは tx.oncomplete まで待つ。ここで待たないと「保存したのに無い」が起きる
+function idbDo(mode, fn){
+  return openMediaDB().then(db=>new Promise((res,rej)=>{
+    const tx=db.transaction(MEDIA_STORE, mode);
+    let out;
+    const r=fn(tx.objectStore(MEDIA_STORE));
+    if(r && r.onsuccess!==undefined) r.onsuccess=()=>{ out=r.result; };
+    tx.oncomplete=()=>res(out);
+    tx.onerror=()=>rej(tx.error);
+    tx.onabort=()=>rej(tx.error);
+  }));
+}
+const PhotoDB = {
+  put(rec){ return idbDo('readwrite', st=>st.put(rec)); },
+  get(id){ return idbDo('readonly', st=>st.get(id)); },
+  del(id){ return idbDo('readwrite', st=>st.delete(id)); },
+  allIds(){ return idbDo('readonly', st=>st.getAllKeys()); },
+  all(){ return idbDo('readonly', st=>st.getAll()); },
+  /* どこからも使われていない写真を片付ける。
+     「まだ保存していない写真」（いま開いている画面の分と、書きかけの分）も
+     使っている数に入れる。入れないと、保存を押す前に消える。
+
+     片付けは時間がかかるので、その間に新しい写真が入ってくる。
+     一覧を取った時点の判断で消すと、間に入った写真を巻き添えにする
+     （2026-08-17 の監査 Critical）。そこで
+       ・取り込み中の写真（PHOTO_PENDING）は触らない
+       ・入れたばかりの写真（PHOTO_GRACE_MS 以内）は触らない
+       ・1枚消すごとに、使用権と参照を取り直す
+     の3つで守る */
+  async gc(){
+    if(!ownsLock()) return 0;        // 見ているだけのタブでは消さない
+    let refs = photoRefs();
+    if(!refs) return 0;              // 1つでも読めなければ何もしない（消しすぎ防止）
+    let recs; try{ recs = await this.all(); }catch(e){ return 0; }
+    const cut = Date.now() - PHOTO_GRACE_MS;
+    let n=0;
+    for(const r of recs){
+      if(!r || !r.id) continue;
+      if(refs.has(r.id) || PHOTO_PENDING.has(r.id)) continue;
+      const at = Date.parse(r.added_at||'');
+      if(isFinite(at) && at > cut) continue;   // 入れたばかりのものは残す
+      if(!ownsLock()) return n;                // 途中で使用権を渡していたら止める
+      const now = photoRefs();                 // 消す直前に、もう一度確かめる
+      if(!now) return n;
+      if(now.has(r.id) || PHOTO_PENDING.has(r.id)) continue;
+      try{ await this.del(r.id); n++; }catch(e){}
+    }
+    return n;
+  },
+};
+/* いま取り込んでいる最中の写真。片付けの対象から外す */
+const PHOTO_PENDING = new Set();
+/* 入れたばかりの写真は片付けない。取り込みと片付けが重なっても巻き添えにしない */
+const PHOTO_GRACE_MS = 30*60*1000;
+/* いま使われている写真のID。1つでも読めなければ null を返す（消しすぎ防止） */
+function photoRefs(){
+  try{
+    const refs = new Set();
+    // 写真を持ちうる入れ物を数え漏らすと、その写真が消える。
+    // 個別に並べず、保存している入れ物を全部見る
+    Object.keys(DB.key).forEach(kk=>{
+      DB.loadRaw(DB.key[kk]).forEach(x=>photoIdsOf(x).forEach(id=>refs.add(id)));
+    });
+    draftAllPhotoIds().forEach(id=>refs.add(id));
+    (SCREENS._photos||[]).forEach(pp=>pp && pp.id && refs.add(pp.id));
+    return refs;
+  }catch(e){ return null; }
+}
+function photoIdsOf(rec){
+  return ((rec && rec.photos) || []).map(pp=>pp && pp.id).filter(Boolean);
+}
+/* 書きかけに控えてある写真のID。保存を押す前に消えないようにするため */
+function draftAllPhotoIds(){
+  const out = [];
+  const all = draftAll();
+  Object.keys(all).forEach(k=>photoIdsOf(all[k]).forEach(id=>out.push(id)));
+  return out;
+}
+
+// 現場写真はそのままだと1枚数MBあり端末を圧迫するので、長辺1600pxのJPEGに縮める
+const PHOTO_MAX_PX = 1600;
+async function shrinkImage(file){
+  if(!/^image\//.test(file.type||'')) return file;
+  try{
+    const bmp = await createImageBitmap(file);
+    const scale = Math.min(1, PHOTO_MAX_PX/Math.max(bmp.width, bmp.height));
+    if(scale>=1 && file.size < 1.5*1024*1024){ if(bmp.close) bmp.close(); return file; }
+    const w=Math.max(1,Math.round(bmp.width*scale)), h=Math.max(1,Math.round(bmp.height*scale));
+    const c=document.createElement('canvas'); c.width=w; c.height=h;
+    c.getContext('2d').drawImage(bmp,0,0,w,h);
+    if(bmp.close) bmp.close();
+    const blob = await new Promise(r=>c.toBlob(r,'image/jpeg',0.85));
+    return (blob && blob.size < file.size) ? blob : file;
+  }catch(e){ return file; }   // 変換できない端末では元のまま保存する
+}
+/* 実際の中身に合った拡張子を付ける。中身がPNGなのに .jpg だと開けないソフトがある。
+   縮小できなかった形式（GIF・BMPなど）を一律に .jpg と名づけると、
+   書き出したZIPの中身と名前が食い違う（2026-08-17 の監査 Major） */
+const PHOTO_EXT = [['jpeg','jpg'], ['jpg','jpg'], ['png','png'], ['webp','webp'],
+  ['heic','heic'], ['heif','heic'], ['avif','avif'], ['gif','gif'],
+  ['bmp','bmp'], ['tiff','tif'], ['svg','svg']];
+function blobExt(blob){
+  const t=((blob&&blob.type)||'').toLowerCase();
+  for(const [key, ext] of PHOTO_EXT){ if(t.indexOf(key)>=0) return ext; }
+  return '';
+}
+/* 受け取ってよいファイルか。分からない形式は入れない
+   （名前と中身が食い違うくらいなら、その場で断るほうがよい） */
+function fileExt(f){
+  if(!f || !/^image\//.test(f.type||'')) return '';
+  return blobExt(f);
+}
+
+/* ---------- 写真パネル（魚の記録・箇所・メモで共用） ----------
+   SCREENS._photos = いま開いている記録の写真の並び */
+function photoPanelHtml(label){
+  return `<div class="card">
+    <h3 style="margin-top:0">写真<span class="dim small" id="photoCount"></span></h3>
+    <div class="dim small">${esc(label||'')}</div>
+    <input type="file" id="fPhotoIn" accept="image/*" capture="environment" multiple
+      style="display:none" onchange="pickPhotos(this)">
+    <button class="btn" onclick="document.getElementById('fPhotoIn').click()">
+      写真を撮る／端末から選ぶ</button>
+    <div class="mediagrid" id="photoGrid"></div>
+    <div class="dim small">保存を押すまで、この記録には結びつきません。</div>
+  </div>`;
+}
+async function pickPhotos(input){
+  const files = Array.from(input.files||[]);
+  input.value='';
+  if(!files.length) return;
+  if(!writeAllowed()){
+    toast('このタブでは写真を追加できません。記録を入れているタブでお試しください', 6000);
+    return;
+  }
+  const gen = screenGen();          // 取り込み中に別の記録へ移ったら、そちらには足さない
+  toast('写真を取り込んでいます…');
+  let ok=0, ng=0, lost=false;
+  const badType=[];
+  for(const f of files){
+    const ext = fileExt(f);
+    if(!ext){ badType.push(f.name||'(名前なし)'); ng++; continue; }
+    const id = uuid();
+    PHOTO_PENDING.add(id);           // 入れ終わるまで、片付けの対象にしない
+    try{
+      const blob = await shrinkImage(f);
+      const useExt = blobExt(blob) || ext;
+      // 縮めている間に画面が変わったり、別のタブへ使用権を渡していることがある。
+      // 待つたびに確かめないと、書いてはいけないタブが書きかけを上書きする
+      // （2026-08-17 の再監査 Critical）
+      if(screenStale(gen) || !ownsLock()){ if(!ownsLock()) lost=true; continue; }
+      await PhotoDB.put({ id, blob, ext:useExt, size:blob.size, added_at:nowISO() });
+      if(screenStale(gen) || !ownsLock()){
+        // 入れたが行き場がない。ここで片付ける（後の掃除任せにしない）
+        if(!ownsLock()) lost=true;
+        try{ await PhotoDB.del(id); }catch(e){}
+        continue;
+      }
+      SCREENS._photos = (SCREENS._photos||[]).concat([{ id, ext:useExt, size:blob.size }]);
+      // 1枚ごとに控える。全部終えてからだと、2枚目の変換中に画面が変わったとき
+      // 1枚目まで消える（2026-08-17 の監査 Critical）
+      draftTouch();
+      ok++;
+    }catch(e){
+      ng++;
+      // 入れたあとで転んだ場合に備えて片付ける。無ければ何も起きない
+      try{ await PhotoDB.del(id); }catch(e2){}
+    }
+    finally{ PHOTO_PENDING.delete(id); }
+  }
+  if(screenStale(gen)) return;
+  renderPhotoPanel();
+  if(lost){
+    toast((ok ? `写真 ${ok}枚を追加しました。残りは、` : '')
+      + '別のタブで記録が開かれたため追加できませんでした。'
+      + 'そちらのタブでお試しください', 9000);
+  }else if(badType.length){
+    toast(`次のファイルは扱えない形式でした：${badType.slice(0,3).join('・')}`
+      + (badType.length>3?`ほか${badType.length-3}件`:''), 9000);
+  }else if(ng){
+    toast(`写真 ${ok}枚を追加しました。${ng}枚は保存できませんでした`
+      + '（端末の空き容量をご確認ください）', 8000);
+  }else{
+    toast(ok+'枚を追加しました');
+  }
+}
+/* 写真そのものはここでは消さない。保存せずに戻った場合に、記録が
+   「無い写真」を指してしまうため。実体は使われなくなった時点で gc() が片付ける */
+function delPhoto(id){
+  if(!confirm('この写真を外しますか？（保存を押すと反映されます）')) return;
+  SCREENS._photos = (SCREENS._photos||[]).filter(pp=>pp.id!==id);
+  draftTouch();
+  renderPhotoPanel();
+}
+/* 写真の見え方の後片付け。
+   まだ読み込み中のうちに手放すと、画面に「読めません」の跡が残る。
+   画面から消えるのを待ってから手放す（既定は3秒後） */
+function revokePhotoUrls(now){
+  const list = SCREENS._photoUrls||[];
+  SCREENS._photoUrls=[];
+  if(!list.length) return;
+  const go = ()=>list.forEach(u=>{ try{ URL.revokeObjectURL(u); }catch(e){} });
+  if(now) go(); else setTimeout(go, 3000);
+}
+/* 写真の並びを描いた回数。同じ画面で描き直しが重なったとき、
+   遅れて終わったほうが古い並びを出してしまうのを防ぐ
+   （2026-08-17 の再監査 Critical） */
+let PHOTO_RENDER_SEQ = 0;
+async function renderPhotoPanel(){
+  const gen = screenGen();
+  const my = ++PHOTO_RENDER_SEQ;
+  const box=$('#photoGrid'); if(!box) return;
+  const list = SCREENS._photos||[];
+  const cnt = $('#photoCount');
+  if(cnt) cnt.textContent = list.length ? `　${list.length}枚` : '';
+  if(!list.length){
+    if(!screenStale(gen) && my===PHOTO_RENDER_SEQ){ revokePhotoUrls(); box.innerHTML=''; }
+    return;
+  }
+  const parts=[];
+  // 自分が作った参照だけを手元に持つ。まとめ置き場に入れてしまうと、
+  // 読んでいる間に画面が変わったとき、次の画面の写真まで消してしまう
+  const mine=[];
+  for(const pp of list){
+    let rec=null; try{ rec=await PhotoDB.get(pp.id); }catch(e){}
+    if(!rec||!rec.blob) continue;
+    const url=URL.createObjectURL(rec.blob);
+    mine.push(url);
+    parts.push(`<div class="mediathumb"><img src="${url}" alt="写真"
+        onclick="viewPhoto('${pp.id}')">
+      <button class="mediadel" onclick="delPhoto('${pp.id}')" title="外す">&times;</button></div>`);
+  }
+  // 読んでいる間に画面が変わったり、もっと新しい描き直しが始まっていたら、
+  // 自分が作った参照だけを捨てて何も出さない
+  if(screenStale(gen) || my!==PHOTO_RENDER_SEQ){
+    mine.forEach(u=>{ try{ URL.revokeObjectURL(u); }catch(e){} });
+    return;
+  }
+  revokePhotoUrls();        // ここまで出ていた分を手放す（画面から消えた後で）
+  SCREENS._photoUrls = mine;
+  box.innerHTML = parts.join('');
+}
+/* 大きく見る。現場で写りを確かめられないと、撮り直しに気づけない。
+   同じ画面で続けて2枚たたいたとき、先にたたいたほうの読み出しが遅れて終わると、
+   あとからたたいた写真を閉じて古いほうを出してしまう。
+   そこで「たたいた順番」を持ち、最後にたたいた分だけを出す
+   （2026-08-17 の3回目の監査 Major） */
+let PHOTO_VIEW = null, PHOTO_VIEW_SEQ = 0;
+async function viewPhoto(id){
+  const gen = screenGen();
+  const my = ++PHOTO_VIEW_SEQ;
+  let rec=null; try{ rec=await PhotoDB.get(id); }catch(e){}
+  // 読んでいる間に別の記録へ移ったり、別の写真をたたいていたら出さない
+  if(screenStale(gen) || my!==PHOTO_VIEW_SEQ) return;
+  if(!rec||!rec.blob){ toast('写真が見つかりません'); return; }
+  closePhotoView(true);          // いま出ているものだけ閉じる（順番は進めない）
+  const url=URL.createObjectURL(rec.blob);
+  const box=document.createElement('div');
+  box.className='photoview';
+  box.innerHTML=`<img src="${url}" alt="写真">
+    <button class="btn" style="max-width:320px">閉じる</button>`;
+  box.addEventListener('click', ()=>closePhotoView());
+  PHOTO_VIEW = {box, url};
+  document.body.appendChild(box);
+}
+/* keepSeq を付けないときは順番を進める。
+   読み出しを待っている分があれば、それも出さないようにするため */
+function closePhotoView(keepSeq){
+  if(keepSeq!==true) PHOTO_VIEW_SEQ++;
+  if(!PHOTO_VIEW) return;
+  const {box, url} = PHOTO_VIEW;
+  PHOTO_VIEW = null;
+  try{ box.remove(); }catch(e){}
+  try{ URL.revokeObjectURL(url); }catch(e){}
+}
+/* いま開いている記録の写真を用意する。書きかけがあればそちらを使う */
+function photosBegin(rec, draft){
+  const d = draft && Array.isArray(draft.photos) ? draft.photos : null;
+  SCREENS._photos = (d || (rec && rec.photos) || []).slice();
+  renderPhotoPanel();
+}
+
 function download(filename, text, mime){
   downloadBlob(filename, new Blob([text], {type: mime||'text/plain;charset=utf-8'}));
 }
@@ -2278,6 +2589,14 @@ function rangeCheck(list){
     if(n < lo || n > hi) return `${label}は ${lo}〜${hi} の間で入れてください（いま ${n}）`;
   }
   return '';
+}
+/* 大きさを読みやすくする */
+function fmtBytes(n){
+  n = numOf(n); if(n==='' || !isFinite(n)) return '—';
+  if(n >= 1024*1024*1024) return (n/1024/1024/1024).toFixed(1)+' GB';
+  if(n >= 1024*1024) return Math.round(n/1024/1024)+' MB';
+  if(n >= 1024) return Math.round(n/1024)+' KB';
+  return n+' B';
 }
 function round1(v){
   const n = numOf(v);
@@ -2717,7 +3036,8 @@ SCREENS.survey = (svUuid)=>{
             : '<span class="pill ng">時刻なし</span>'}　${sp}種 ${n}尾${
             effortSeconds(st)>0 ? '　通電'+esc(fmtDur(effortSeconds(st))) : ''}${
             isDetail(sv) ? (numOf(st.latitude)!=='' ? '　±'+fmtNum(numOf(st.gps_accuracy),0)+'m'
-                                                    : '　<span class="pill ng">位置なし</span>') : ''}</div>
+                                                    : '　<span class="pill ng">位置なし</span>') : ''}${
+            (st.photos||[]).length ? '　写真'+(st.photos||[]).length+'枚' : ''}</div>
         </div>
         ${(isLiveNow(sv) && !isDetail(sv) && !st.ended_at)
           ? '<span class="pill ok">記録中</span>' : ''}
@@ -2902,6 +3222,7 @@ SCREENS.stationEdit = (arg)=>{
         <label>メモ</label>
         <textarea id="s_memo">${esc(g('memo'))}</textarea>
       </div>
+      ${photoPanelHtml('その場所のようす。上流向き・下流向きの景観など。')}
       <button class="btn pri" onclick="saveStation('${svUuid}','${arg.uuid||''}')">
         ${isNew ? (isLiveNow(sv) ? `この${stWord(sv)}をはじめる` : `この${stWord(sv)}を追加する`)
                 : '保存する'}</button>
@@ -2930,6 +3251,7 @@ SCREENS.stationEdit = (arg)=>{
         if(el && !el.value) el.value = timeValue();
       }
       const key = 'station:'+(arg.uuid || ('new:'+svUuid));
+      SCREENS._photos = ((st && st.photos)||[]).slice();   // 先にこの箇所の写真に入れ替える
       const base = collectStation();    // 書きかけを戻す前の姿を控える
       const d = draftGet(key);
       if(d){
@@ -2944,12 +3266,14 @@ SCREENS.stationEdit = (arg)=>{
         applySegMulti('method', d.survey_method);
         toast('書きかけを戻しました');
       }
+      photosBegin(st, d);
       draftBind(key, collectStation, base);
     }
   };
 };
 function collectStation(){
   return {
+    photos: (SCREENS._photos||[]).slice(),
     name: strVal('#s_name'), habitat_type: segVal('habitat'),
     survey_time_start: strVal('#s_t1'), survey_time_end: strVal('#s_t2'),
     survey_date: (segVal('stdate') || strVal('#s_date')),
@@ -3010,6 +3334,7 @@ function saveStation(svUuid, stUuid){
   rec.substrate1        = f.substrate1;
   rec.gravel_condition  = f.gravel_condition;
   rec.memo              = f.memo;
+  rec.photos            = (SCREENS._photos||[]).slice();
   if(isDetail(sv)){
     // 点は打った時点で1つの記録。区間のように「はじめて終える」ものではない
     rec.ended_at = rec.ended_at || nowISO();
@@ -3346,6 +3671,7 @@ SCREENS.catchEdit = (arg)=>{
         <label>備考</label>
         <textarea id="c_note">${esc(c.notes||'')}</textarea>
       </div>
+      ${photoPanelHtml('同定の証拠に。魚を並べた写真、特徴の分かる写真など。')}
       ${sp?'':'<div class="ngbox">この記録には種IDがありません。データベース取り込み用のCSVからは除かれます。</div>'}
       <button class="btn pri" onclick="saveCatch('${stUuid}','${arg.uuid||''}','${spId||''}',false)">保存する</button>
       <button class="btn" onclick="saveCatch('${stUuid}','${arg.uuid||''}','${spId||''}',true)">保存して次の魚種へ</button>
@@ -3353,6 +3679,10 @@ SCREENS.catchEdit = (arg)=>{
     `,
     onMount(){
       const key = 'catch:'+(arg.uuid || ('new:'+stUuid+':'+(spId||'')));
+      // 先にこの記録の写真に入れ替える。前の画面の写真が残ったままだと、
+      // 「開いたときの姿」を取り違えて、書きかけを消してしまう
+      // （2026-08-17 の監査 Critical）
+      SCREENS._photos = ((c && c.photos)||[]).slice();
       const base = collectCatch();      // 書きかけを戻す前の姿を控える
       const d = draftGet(key);
       if(d){
@@ -3360,6 +3690,7 @@ SCREENS.catchEdit = (arg)=>{
         applySeg('conf', d.identification_confidence);
         toast('書きかけを戻しました');
       }
+      photosBegin(c, d);
       draftBind(key, collectCatch, base);
       const el=$('#c_n'); if(el && isNew && !d) el.focus();
     }
@@ -3370,6 +3701,7 @@ function collectCatch(){
     count_unmeasured: strVal('#c_n'),
     identification_confidence: segVal('conf'),
     notes: strVal('#c_note'),
+    photos: (SCREENS._photos||[]).slice(),
   };
 }
 
@@ -3390,6 +3722,7 @@ function saveCatch(stUuid, caUuid, spId, next){
   rec.count_unmeasured        = countOf(raw);
   rec.identification_confidence = segVal('conf');
   rec.notes                   = strVal('#c_note');
+  rec.photos                  = (SCREENS._photos||[]).slice();
   const draftKey = 'catch:'+(caUuid || ('new:'+stUuid+':'+(spId||'')));
   if(catchTotalOf(rec)<=0){
     toast('尾数を入れてください（0だと書き出しから除かれます）');
@@ -3421,7 +3754,10 @@ function toIndividuals(stUuid, caUuid, spId){
     species_id:spId||'', species_name:sp?sp.ja:'', species_family:sp?sp.fam:'',
     count_unmeasured: countOf(raw),
     identification_confidence: segVal('conf'),
-    notes: strVal('#c_note')};
+    notes: strVal('#c_note'),
+    // ここで入れないと、写真を付けてから「1尾ずつ測る」を押した分が消える
+    // （2026-08-17 の監査 Critical）
+    photos: (SCREENS._photos||[]).slice()};
   if(!DB.upsert(DB.key.ca, rec)) return;
   draftClear('catch:new:'+stUuid+':'+(spId||''));
   draftUnbind();
@@ -3863,7 +4199,8 @@ SCREENS.notes = (svUuid)=>{
       <button class="btn pri" onclick="nav('noteEdit',{survey:'${svUuid}'})">メモを追加する</button>
       ${list.length ? list.map(n=>`<div class="card tap"
         onclick="nav('noteEdit',{uuid:'${n.uuid}'})">
-        <div class="dim small">${esc(fmtTime(n.created_at))}</div>
+        <div class="dim small">${esc(fmtTime(n.created_at))}
+          ${(n.photos||[]).length ? `　写真${(n.photos||[]).length}枚` : ''}</div>
         <div>${esc((n.content||'').slice(0,120))}</div></div>`).join('')
         : '<div class="card dim">まだメモがありません。</div>'}
     `};
@@ -3882,19 +4219,39 @@ SCREENS.noteEdit = (arg)=>{
         <label>内容</label>
         <textarea id="n_body" style="min-height:160px">${esc(n.content||'')}</textarea>
       </div>
+      ${photoPanelHtml('何の写真でも。看板・全景・作業のようすなど。')}
       <button class="btn pri" onclick="saveNote('${svUuid}','${arg.uuid||''}')">保存する</button>
       ${isNew?'':`<button class="btn ng" onclick="deleteNote('${arg.uuid}')">このメモを消す</button>`}
     `,
-    onMount(){ const el=$('#n_body'); if(el && isNew) el.focus(); }
+    onMount(){
+      const key = 'note:'+(arg.uuid || ('new:'+svUuid));
+      SCREENS._photos = ((n && n.photos)||[]).slice();     // 先にこのメモの写真に入れ替える
+      const base = collectNote();       // 書きかけを戻す前の姿を控える
+      const d = draftGet(key);
+      if(d){ applyVals({'#n_body':d.content}); toast('書きかけを戻しました'); }
+      photosBegin(n, d);
+      draftBind(key, collectNote, base);
+      const el=$('#n_body'); if(el && isNew && !d) el.focus();
+    }
   };
 };
+function collectNote(){
+  return { content: strVal('#n_body'), photos: (SCREENS._photos||[]).slice() };
+}
 function saveNote(svUuid, uu){
   const body = strVal('#n_body');
-  if(!body){ toast('内容を入れてください'); return; }
+  const photos = (SCREENS._photos||[]).slice();
+  // 写真だけのメモも残せるようにする（看板を撮っておく使い方があるため）
+  if(!body && !photos.length){ toast('内容か写真のどちらかを入れてください'); return; }
   const rec = uu ? (DB.get(DB.key.nt, uu)||{uuid:uu}) : {uuid:uuid(), survey_uuid:svUuid};
   rec.survey_uuid = rec.survey_uuid || svUuid;
   rec.content = body;
-  if(DB.upsert(DB.key.nt, rec)){ toast('保存しました'); goBack(); }
+  rec.photos = photos;
+  if(DB.upsert(DB.key.nt, rec)){
+    draftClear('note:'+(uu || ('new:'+svUuid)));
+    draftUnbind();
+    toast('保存しました'); goBack();
+  }
 }
 function deleteNote(uu){
   if(!confirm('このメモを消します。よろしいですか？')) return;
@@ -4531,6 +4888,7 @@ SCREENS.exportHub = (svUuid)=>{
     extra = {ind: buildIndRows(sv, snap).length, st: buildStationRows(sv, snap).length,
              pt: buildPointRows(sv, snap).length};
   }catch(e){}
+  const ph = photoStats(sv);
   return {
     title:'書き出す',
     sub:[{text:sv.river_name||''}],
@@ -4584,6 +4942,23 @@ SCREENS.exportHub = (svUuid)=>{
       </div>
 
       <div class="card">
+        <h3 style="margin-top:0">写真</h3>
+        <div class="row">
+          <div class="grow"><div class="dim small">枚数</div>
+            <div class="big">${ph.n} 枚</div></div>
+          <div class="grow"><div class="dim small">大きさの目安</div>
+            <div class="big">${ph.bytes ? esc(fmtBytes(ph.bytes)) : '—'}</div></div>
+        </div>
+        <button class="btn" ${ph.n?'':'disabled'}
+          onclick="exportPhotoZip('${svUuid}')">写真をまとめて書き出す（ZIP）</button>
+        <div class="dim small">1つのファイルにまとまります。パソコンで開くと、
+          「写真一覧.csv」でどの写真がどの記録のものか分かります。
+          ${ph.bytes >= PHOTO_ZIP_LIMIT
+            ? `<br><b>いまは大きすぎて書き出せません（${esc(fmtBytes(PHOTO_ZIP_LIMIT))}まで）。
+               調査を分けてください。</b>` : ''}</div>
+      </div>
+
+      <div class="card">
         <h3>取り込みかた</h3>
         <div class="dim small">
           魚類データベースを開き、「資料管理」→「調査記録」→「CSV / Excel から一括インポート」に
@@ -4592,6 +4967,155 @@ SCREENS.exportHub = (svUuid)=>{
       </div>
     `};
 };
+/* ---------- 写真ZIP（無圧縮・追加の部品なし） ----------
+   名前をUTF-8で入れる印（0x0800）を立てる。立てないと日本語のファイル名が化ける */
+function crc32(u8){
+  let c=~0>>>0;
+  for(let i=0;i<u8.length;i++){ c^=u8[i]; for(let k=0;k<8;k++) c=(c>>>1)^(0xEDB88320 & -(c&1)); }
+  return (~c)>>>0;
+}
+function buildZip(files){
+  const enc=new TextEncoder(); const parts=[]; const central=[]; let offset=0;
+  const u16=n=>[n&255,(n>>8)&255], u32=n=>[n&255,(n>>8)&255,(n>>16)&255,(n>>24)&255];
+  files.forEach(f=>{
+    const name=enc.encode(f.name), data=f.u8, crc=crc32(data);
+    const lh=[].concat([0x50,0x4b,0x03,0x04], u16(20), u16(0x0800), u16(0), u16(0), u16(0),
+      u32(crc), u32(data.length), u32(data.length), u16(name.length), u16(0));
+    parts.push(new Uint8Array(lh), name, data);
+    const ch=[].concat([0x50,0x4b,0x01,0x02], u16(20), u16(20), u16(0x0800), u16(0), u16(0), u16(0),
+      u32(crc), u32(data.length), u32(data.length), u16(name.length), u16(0), u16(0), u16(0), u16(0),
+      u32(0), u32(offset));
+    central.push({head:new Uint8Array(ch), name});
+    offset += lh.length + name.length + data.length;
+  });
+  const cdStart=offset; let cdSize=0;
+  central.forEach(c=>{ parts.push(c.head, c.name); cdSize += c.head.length + c.name.length; });
+  parts.push(new Uint8Array([].concat([0x50,0x4b,0x05,0x06], u16(0), u16(0),
+    u16(central.length), u16(central.length), u32(cdSize), u32(cdStart), u16(0))));
+  return new Blob(parts, {type:'application/zip'});
+}
+/* ファイル名に使えない文字を落とす */
+function safeName(v){
+  return String(v==null?'':v).replace(/[\\/:*?"<>|]/g,'_').replace(/\s+/g,'_').slice(0,40);
+}
+/* この調査の写真を、記録をたどって並べる */
+function photoItemsOf(sv){
+  const items = [];
+  const stations = DB.stationsOf(sv.uuid);
+  stations.forEach(st=>{
+    const day = stationDate(st, sv);
+    (st.photos||[]).forEach((pp,i)=>items.push({
+      p:pp, kind:'箇所', day, station:st.name||'',
+      species_id:'', species_name:'', time:st.survey_time_start||'',
+      lat:st.latitude, lon:st.longitude, rec_id:st.uuid, no:i+1}));
+    DB.catchesOf(st.uuid).forEach(c=>{
+      (c.photos||[]).forEach((pp,i)=>items.push({
+        p:pp, kind:'魚', day, station:st.name||'',
+        species_id:c.species_id||'', species_name:c.species_name||'',
+        time:st.survey_time_start||'', lat:st.latitude, lon:st.longitude,
+        rec_id:c.uuid, no:i+1}));
+    });
+  });
+  DB.notesOf(sv.uuid).forEach(n=>{
+    (n.photos||[]).forEach((pp,i)=>items.push({
+      p:pp, kind:'メモ', day:sv.survey_date||'', station:'',
+      species_id:'', species_name:'', time:n.created_at ? fmtTime(n.created_at) : '',
+      lat:'', lon:'', rec_id:n.uuid, no:i+1}));
+  });
+  return items;
+}
+function photoStats(sv){
+  const items = photoItemsOf(sv);
+  return {n: items.length,
+          bytes: items.reduce((a,it)=>a + (numOf(it.p && it.p.size)||0), 0)};
+}
+function photoFilename(it, seq){
+  const ext = (it.p && it.p.ext) || 'jpg';
+  const head = String(seq).padStart(3,'0');
+  if(it.kind==='魚')  return `${head}_魚_${safeName(it.station)}_${safeName(it.species_name||it.species_id)}_${it.no}.${ext}`;
+  if(it.kind==='箇所') return `${head}_箇所_${safeName(it.station)}_${it.no}.${ext}`;
+  return `${head}_メモ_${safeName(it.time)}_${it.no}.${ext}`;
+}
+const FS_PHOTO_COLS = ['ファイル名','状態','種類','調査日','箇所','種ID','種名',
+  '開始時刻','緯度','経度','記録ID','写真ID'];
+/* ZIPの決まりごと。ここを超えるとパソコン側で開けない形になる */
+const ZIP_MAX_FILES = 60000;          // 目録に入る件数（65535）より手前で止める
+const ZIP_MAX_BYTES = 3.5*1024*1024*1024;   // 位置の数え方が4GBまで
+/* 端末で無理なく作れる大きさ。超えたら調査を分けてもらう */
+const PHOTO_ZIP_LIMIT = 800*1024*1024;
+
+async function exportPhotoZip(svUuid){
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
+  const items = photoItemsOf(sv);
+  if(!items.length){ toast('この調査には写真がありません'); return; }
+  if(items.length + 2 > ZIP_MAX_FILES){
+    toast(`写真が多すぎてまとめられません（${items.length}枚）。調査を分けてください`, 9000);
+    return;
+  }
+  const guess = items.reduce((a,it)=>a + (numOf(it.p && it.p.size)||0), 0);
+  if(guess >= PHOTO_ZIP_LIMIT){
+    toast(`写真が多すぎてまとめられません（約${fmtBytes(guess)}）。`
+      + `${fmtBytes(PHOTO_ZIP_LIMIT)}までです。調査を分けて書き出してください`, 9000);
+    return;
+  }
+  if(guess >= 0.3*PHOTO_ZIP_LIMIT && !confirm(`約${fmtBytes(guess)}あります。`
+    + '\n時間がかかり、端末によっては失敗します。続けますか？')) return;
+
+  toast('写真をまとめています…', 8000);
+  const files=[], idx=[];
+  let seq=0, missing=0, bytes=0;
+  try{
+    for(const it of items){
+      let rec=null; try{ rec=await PhotoDB.get(it.p.id); }catch(e){}
+      let buf=null;
+      if(rec && rec.blob){
+        // 記録側の大きさは書いた時のもの。実物で数え直さないと歯止めが効かない
+        bytes += rec.blob.size;
+        if(bytes > PHOTO_ZIP_LIMIT || bytes > ZIP_MAX_BYTES){
+          toast(`写真が大きすぎてまとめられません（${fmtBytes(bytes)}を超えました）。`
+            + '調査を分けて書き出してください', 9000);
+          return;
+        }
+        try{ buf = await rec.blob.arrayBuffer(); }catch(e){ buf=null; }
+      }
+      // 中身が見つからなくても、一覧には必ず1行残す。
+      // 落として黙っていると、ZIPだけを見たとき取りこぼしに気づけない
+      // （2026-08-17 の監査 Major）
+      let name = '';
+      if(buf){
+        seq += 1;
+        name = photoFilename(it, seq);
+        files.push({name, u8:new Uint8Array(buf)});
+      }else{
+        missing += 1;
+      }
+      idx.push({'ファイル名':name, '状態': buf ? '入っています' : '中身が見つかりません',
+        '種類':it.kind, '調査日':it.day, '箇所':it.station,
+        '種ID':it.species_id, '種名':it.species_name, '開始時刻':it.time,
+        '緯度':fixCoord(it.lat), '経度':fixCoord(it.lon),
+        '記録ID':it.rec_id, '写真ID':it.p.id});
+    }
+    // 突き合わせ用の一覧を同じZIPに入れる。どの写真がどの記録のものか、後から分かるように
+    files.push({name:'写真一覧.csv',
+      u8:new TextEncoder().encode('\ufeff'+toCsv(FS_PHOTO_COLS, idx))});
+    if(missing){
+      files.push({name:'足りない写真.txt', u8:new TextEncoder().encode(
+        `この調査には写真が ${items.length}枚 ありますが、`
+        + `${missing}枚は中身が見つからず入れられませんでした。\r\n`
+        + '「写真一覧.csv」の「状態」の欄をご確認ください。\r\n')});
+    }
+    downloadBlob(`${exportFileBase(sv)}_写真.zip`, buildZip(files));
+  }catch(e){
+    toast('写真をまとめられませんでした：' + (e && e.message || e)
+      + '（枚数が多いときは、調査を分けてお試しください）', 9000);
+    return;
+  }
+  toast(missing
+    ? `写真 ${seq}枚を書き出しました。${missing}枚は中身が見つかりませんでした`
+      + '（ZIPの中の「足りない写真.txt」をご覧ください）'
+    : `写真 ${seq}枚を書き出しました`, missing?9000:3000);
+}
+
 /* 31列に乗らない分の書き出し */
 function exportExtraCsv(svUuid, kind){
   if(!ownsLock()){
@@ -4754,6 +5278,11 @@ function boot(){
   if('serviceWorker' in navigator){
     navigator.serviceWorker.register('./sw.js').catch(()=>{});
   }
+  // 使われなくなった写真の片付け。使用権を取れてから、少し置いて始める
+  // （起動直後に走らせると、書きかけを読む前に消してしまう）。
+  // 長く開いたままだと迷子が溜まるので、そのあとも時々見る
+  setTimeout(()=>{ try{ PhotoDB.gc(); }catch(e){} }, 4000);
+  setInterval(()=>{ try{ PhotoDB.gc(); }catch(e){} }, 30*60*1000);
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
