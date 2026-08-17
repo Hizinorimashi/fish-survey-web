@@ -125,7 +125,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v17';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v18';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1152,6 +1152,12 @@ const OPT = {
   habitat:     ['早瀬','平瀬','淵','瀬頭','トロ','たまり','その他'],
   surveyType:  ['採取','目視'],
   detail:      ['一般','詳細'],
+  // 何を調べる調査か。物理環境だけの日にも使えるようにする
+  surveyKind:  ['魚','物理環境'],
+  // 物理環境の取り方。現場のやり方が3通りある
+  envMethod:   ['点','ライン','メッシュ'],
+  // ラインを歩いた向き。距離は同じでも、記録の読み方が変わる
+  lineDir:     ['上流→下流','下流→上流'],
   // 調査方法。QFieldテンプレートの catch_method
   method:      ['投網','電気ショッカー','タモ網','手掴り','サデ網','カゴ網'],
   // 河床材料。QFieldテンプレートの kashouzai（粒径区分）
@@ -1177,10 +1183,33 @@ const SUBSTRATE_NOTE = {
    詳細＝魚が獲れた場所ごとに点を打ち、その点に種・尾数・体長を付ける
    入れ物は同じ（fs_stations）。呼び名と入力欄だけを変える */
 function isDetail(sv){ return !!sv && sv.detail_level==='詳細'; }
+
+/* 何を調べる調査か。古い記録は種別を持たないので「魚」とみなす */
+function surveyKind(sv){ return (sv && sv.survey_kind) === '物理環境' ? '物理環境' : '魚'; }
+function isEnvSurvey(sv){ return surveyKind(sv) === '物理環境'; }
+/* 物理環境の取り方。箇所ごとに持つ。未設定は「点」（いままでの取り方） */
+function envMethod(st){
+  const m = st && st.env_method;
+  return (m==='ライン' || m==='メッシュ') ? m : '点';
+}
+function isLine(st){ return envMethod(st)==='ライン'; }
+function isMesh(st){ return envMethod(st)==='メッシュ'; }
+/* 取り方ごとの呼び名 */
+function methodWord(m){
+  return m==='ライン' ? '区間' : (m==='メッシュ' ? '範囲' : '箇所');
+}
 /* 画面に出す呼び名 */
-function stWord(sv){ return isDetail(sv) ? '地点' : '箇所'; }
+function stWord(sv){
+  if(isDetail(sv)) return '地点';
+  if(isEnvSurvey(sv)) return methodWord((sv && sv.env_method_default) || '点');
+  return '箇所';
+}
 function stWordOf(st){
-  return stWord(st ? DB.get(DB.key.sv, st.survey_uuid) : null);
+  const sv = st ? DB.get(DB.key.sv, st.survey_uuid) : null;
+  if(isDetail(sv)) return '地点';
+  // 呼び名は、その箇所自身の取り方で決める。
+  // 調査の既定で決めると、調査の中に別の取り方を混ぜたとき呼び名がずれる
+  return st ? methodWord(envMethod(st)) : stWord(sv);
 }
 
 function isLiveNow(sv){
@@ -1334,6 +1363,19 @@ function effortRunning(st){ return !!(st && st.effort_started_at); }
    同じ50mを3往復して150mになる。面積が3倍、単位努力量あたりの尾数が
    3分の1になり、労力を記録する意味が消える。
    だから既定は「始点から終点までの直線」。軌跡も残して、後から確かめられるようにする */
+/* ラインの始点・終点。両方そろっていなければ距離は出さない */
+function linePt(st, which){
+  const la = numOf(st && st['line_'+which+'_lat']);
+  const lo = numOf(st && st['line_'+which+'_lon']);
+  if(la==='' || lo==='') return null;
+  const pt = [la, lo];
+  return validPt(pt) ? pt : null;
+}
+/* 始点から終点までの直線。歩いた向きは距離に関係しない */
+function lineDist(st){
+  const a = linePt(st,'start'), b = linePt(st,'end');
+  return (a && b) ? distMeters(a, b) : '';
+}
 function stationLengths(st){
   const track = (st.track||[]).filter(validPt);
   // 2点未満では長さを測りようがない。0mと言わずに空欄にする。
@@ -1342,10 +1384,14 @@ function stationLengths(st){
   const trackLen = has ? pathLength(track) : '';
   const straight = has ? distMeters(track[0], track[track.length-1]) : '';
   const manual = numOf(st.length_m_manual);
+  // 押さえた始点・終点があれば、軌跡から出した直線より信じる。
+  // 使う順は 手入力 ＞ 押さえた始終点 ＞ 軌跡の直線 ＞ 軌跡の総延長
+  const line = lineDist(st);
   const used = manual!=='' ? manual
+             : (line!=='' ? line
              : (straight!=='' && straight>0 ? straight
-             : (trackLen!=='' ? trackLen : ''));
-  return {track:trackLen, straight, manual, used};
+             : (trackLen!=='' ? trackLen : '')));
+  return {track:trackLen, straight, line, manual, used};
 }
 function stationAreas(st){
   const L = stationLengths(st).used;
@@ -2487,6 +2533,14 @@ function buildStationRows(sv, snap){
     return {
       '調査日': stationDate(st, sv), '河川名':sv.river_name||'', '地点名':sv.site_name||'',
       '箇所':st.name||'', '記録のしかた':sv.detail_level||'一般',
+      '調べたもの': surveyKind(sv), '環境の取り方': envMethod(st),
+      '向き': isLine(st) ? (st.line_direction||'') : '',
+      '始点緯度': fixCoord(st.line_start_lat), '始点経度': fixCoord(st.line_start_lon),
+      '始点GPS精度m': numOf(st.line_start_acc),
+      '終点緯度': fixCoord(st.line_end_lat), '終点経度': fixCoord(st.line_end_lon),
+      '終点GPS精度m': numOf(st.line_end_acc),
+      '距離_始終点直線m': round1(stationLengths(st).line),
+      '流量': numOf(st.flow_rate),
       '緯度': fixCoord(st.latitude), '経度': fixCoord(st.longitude),
       'GPS精度m': numOf(st.gps_accuracy), '位置の決め方': st.position_source||'',
       '環境区分':st.habitat_type||'',
@@ -2560,7 +2614,9 @@ function surveyRowOfDay(sv, snap, day, all){
     '日数': surveyDays(sv).length,
     '季節':sv.season||'', '天気':sv.weather||'',
     '河川名':sv.river_name||'', '地点名':sv.site_name||'', '区間名':sv.section_name||'',
-    '河川形態A':sv.river_morphology_a||'', '記録のしかた':sv.detail_level||'一般',
+    '河川形態A':sv.river_morphology_a||'',
+    '調べたもの': surveyKind(sv), '記録のしかた':sv.detail_level||'一般',
+    '環境の取り方': isEnvSurvey(sv) ? (sv.env_method_default||'点') : '',
     '緯度': fixCoord(sv.latitude), '経度': fixCoord(sv.longitude),
     'GPS精度m': numOf(sv.gps_accuracy), '位置の決め方':sv.position_source||'',
     '調査者':sv.investigator||'',
@@ -2617,6 +2673,9 @@ const FS_IND_COLS = ['調査日','河川名','地点名','箇所','種ID','種�
   '個体番号','全長cm','尾叉長cm','記録した時刻','調査ID','箇所ID','記録ID'];
 
 const FS_STATION_COLS = ['調査日','河川名','地点名','箇所','記録のしかた',
+  '調べたもの','環境の取り方','向き',
+  '始点緯度','始点経度','始点GPS精度m','終点緯度','終点経度','終点GPS精度m',
+  '距離_始終点直線m','流量',
   '緯度','経度','GPS精度m','位置の決め方',
   '環境区分','河川形態B','調査区分','調査方法','開始時刻','終了時刻','水温',
   '測点数','位置つき測点数',
@@ -2635,7 +2694,8 @@ const FS_STATION_COLS = ['調査日','河川名','地点名','箇所','記録の
   '種数','尾数','100秒あたり尾数','100m2あたり尾数',
   'メモ','調査ID','箇所ID'];
 
-const FS_SURVEY_COLS = ['調査日','終了日','日数','季節','天気','河川名','地点名','区間名','河川形態A','記録のしかた',
+const FS_SURVEY_COLS = ['調査日','終了日','日数','季節','天気','河川名','地点名','区間名','河川形態A',
+  '調べたもの','記録のしかた','環境の取り方',
   '緯度','経度','GPS精度m','位置の決め方','調査者','業務番号','業務名',
   '箇所数','種数','尾数','測った尾数',
   '通電秒数_合計','距離_合計m','距離_手入力m','距離_使う値m',
@@ -2729,6 +2789,16 @@ SCREENS.surveyEdit = (svUuid)=>{
         ${segHtml('formA', OPT.formA, g('river_morphology_a'), true)}
       </div>
       <div class="card">
+        <h3 style="margin-top:0">何を調べますか</h3>
+        <div onclick="setTimeout(onSurveyKind,0)">
+          ${segHtml('kind', OPT.surveyKind, g('survey_kind')||'魚')}</div>
+        <div class="dim small" style="margin-top:8px">
+          <b>魚</b>：獲れた魚を記録します。川の環境もあわせて記録できます。<br>
+          <b>物理環境</b>：川の環境だけを記録します。魚を獲らない日はこちら。
+        </div>
+      </div>
+
+      <div class="card" id="f_detailCard">
         <h3 style="margin-top:0">記録のしかた</h3>
         ${segHtml('detail', OPT.detail, g('detail_level')||'一般')}
         <div class="dim small" style="margin-top:8px">
@@ -2738,6 +2808,18 @@ SCREENS.surveyEdit = (svUuid)=>{
         </div>
         <div class="warnbox">あとから変えると、入力欄の並びが変わります。
           すでに入れた記録は消えません。</div>
+      </div>
+
+      <div class="card" id="f_envCard">
+        <h3 style="margin-top:0">環境の取り方</h3>
+        ${segHtml('envm', OPT.envMethod, g('env_method_default')||'点')}
+        <div class="dim small" style="margin-top:8px">
+          <b>点</b>：測点をどんどん打って、水深・流速を拾います。<br>
+          <b>ライン</b>：早瀬・平瀬・淵…を縦断的に区間で区切り、始点と終点を押さえて記録します。<br>
+          <b>メッシュ</b>：範囲に格子を切って、マスごとに詳しく記録します。
+        </div>
+        <div class="dim small">ここで決めるのは<b>新しく作るときの初期値</b>です。
+          取り方は1つずつ変えられます。</div>
       </div>
       <h3>位置（この調査の代表点）</h3>
       ${baseMapButtonsHtml()}
@@ -2778,6 +2860,7 @@ SCREENS.surveyEdit = (svUuid)=>{
       startGps();
       window._siteUuid = g('site_uuid') || '';
       onSurveyDate();
+      onSurveyKind();
       const key = 'survey:'+(svUuid||'new');
       const base = collectSurvey();     // 書きかけを戻す前の姿を控える
       const d = draftGet(key);
@@ -2790,6 +2873,8 @@ SCREENS.surveyEdit = (svUuid)=>{
         applySeg('season', d.season); applySeg('weather', d.weather);
         applySeg('formA', d.river_morphology_a); applySeg('svtype', d.survey_type_default);
         applySeg('detail', d.detail_level);
+        applySeg('kind', d.survey_kind); applySeg('envm', d.env_method_default);
+        onSurveyKind();
         if(d.site_uuid) window._siteUuid = d.site_uuid;
         toast('書きかけを戻しました');
       }
@@ -2832,6 +2917,7 @@ function collectSurvey(){
     project_number: strVal('#f_pno'), project_name: strVal('#f_pname'),
     investigator: strVal('#f_inv'), survey_type_default: segVal('svtype'),
     detail_level: segVal('detail'),
+    survey_kind: segVal('kind'), env_method_default: segVal('envm'),
     // 選ぶボタンは文字しか返さないので、選んだ地点のIDは別に覚えておく
     site_uuid: (window._siteUuid || ''),
     memo: strVal('#f_memo'),
@@ -2910,6 +2996,15 @@ function pickSurveySite(btn, uu){
   useSite(uu);
 }
 
+/* 「何を調べますか」で出す欄を入れ替える。
+   画面ごと作り直すと、書きかけや地図が巻き添えになるので、見せ方だけ変える */
+function onSurveyKind(){
+  const env = segVal('kind')==='物理環境';
+  const d = $('#f_detailCard'), e = $('#f_envCard');
+  if(d) d.style.display = env ? 'none' : '';
+  if(e) e.style.display = env ? '' : 'none';
+  draftTouch();
+}
 function onSurveyDate(){
   const s = seasonOf(strVal('#f_date'));
   const wrap = $('#f_season_wrap');
@@ -2943,6 +3038,12 @@ function saveSurvey(svUuid){
   const f = collectSurvey();
   // 一般と詳細では、箇所（地点）の意味も見せ方もCSVも変わる。
   // 作ったあとに切り替えると、既存の箇所の意味が黙って変わる（2026-08-17 の監査 Major）
+  if(svUuid && f.survey_kind && surveyKind(rec)!==(f.survey_kind==='物理環境'?'物理環境':'魚')
+     && DB.stationsOf(svUuid).length){
+    toast(`すでに${DB.stationsOf(svUuid).length}件つくってあるので、調べるものは変えられません。`
+      + '変えるには、新しい調査を作ってください', 8000);
+    return;
+  }
   if(svUuid && rec.detail_level && f.detail_level && rec.detail_level!==f.detail_level
      && DB.stationsOf(svUuid).length){
     toast(`すでに${DB.stationsOf(svUuid).length}件つくってあるので、記録のしかたは変えられません。`
@@ -2990,6 +3091,10 @@ function saveSurvey(svUuid){
   rec.investigator       = f.investigator;
   rec.survey_type_default= f.survey_type_default || '採取';
   rec.detail_level       = f.detail_level || '一般';
+  rec.survey_kind        = f.survey_kind === '物理環境' ? '物理環境' : '魚';
+  rec.env_method_default = f.env_method_default || '点';
+  // 物理環境の調査に「詳細」は無い。詳細は魚を点ごとに記録するための形
+  if(rec.survey_kind === '物理環境') rec.detail_level = '一般';
   if(f.site_uuid) rec.site_uuid = f.site_uuid;
   rec.memo               = f.memo;
   if(!rec.river_name && !rec.site_name){ toast('河川名か地点名のどちらかは入れてください'); return; }
@@ -3023,6 +3128,7 @@ SCREENS.survey = (svUuid)=>{
   const svLen = surveyLengths(sv), svArea = surveyAreas(sv);
   const svSec = stations.reduce((a,st)=>a+effortSeconds(st), 0);
   const nSp = new Set(DB.catchesOfSurvey(svUuid).map(c=>c.species_id).filter(Boolean)).size;
+  const envOnly = isEnvSurvey(sv);
   const stCards = stations.map(st=>{
     const n = stationTotal(st);
     const sp = DB.catchesOf(st.uuid).length;
@@ -3046,7 +3152,7 @@ SCREENS.survey = (svUuid)=>{
   return {
     title: `${sv.river_name||''} ${sv.site_name||''}`.trim() || '調査',
     sub:[{text:surveyPeriodText(sv)}, {text:sv.status||'未開始', cls: sv.status==='調査中'?'ok':''},
-         {text:`${nSp}種 ${surveyTotal(sv)}尾`}],
+         envOnly ? {text:'物理環境'} : {text:`${nSp}種 ${surveyTotal(sv)}尾`}],
     html:`
       ${running
         ? `<button class="btn pri" onclick="nav('station','${running.uuid}')">記録中の ${esc(running.name)} を開く</button>`
@@ -3136,6 +3242,7 @@ SCREENS.stationEdit = (arg)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
   const no = isNew ? (DB.stationsOf(svUuid).length + 1) : st.station_no;
+  const defMethod = (sv && sv.env_method_default) || '点';
   const g = k => (st[k]!==undefined && st[k]!=='' ? st[k] : '');
   return {
     title: isNew ? `${stWord(sv)} ${(isDetail(sv)?'P.':'St.')}${no}` : `${st.name} の設定`,
@@ -3211,6 +3318,48 @@ SCREENS.stationEdit = (arg)=>{
           空だと、取り込み側が別々の瀬淵を1つの箇所にまとめてしまいます。</div>
       </div>
       <div class="card">
+        <h3 style="margin-top:0">環境の取り方</h3>
+        <div onclick="setTimeout(onStationMethod,0)">
+          ${segHtml('envm2', OPT.envMethod, envMethod(isNew ? {env_method:defMethod} : st))}</div>
+        <div class="dim small" style="margin-top:8px">
+          <b>点</b>＝測点を打つ／<b>ライン</b>＝区間の始点と終点を押さえる／
+          <b>メッシュ</b>＝格子を切る</div>
+      </div>
+
+      <div class="card" id="s_lineCard">
+        <h3 style="margin-top:0">区間の始点と終点</h3>
+        <label>歩いた向き</label>
+        ${segHtml('linedir', OPT.lineDir, g('line_direction')||'上流→下流')}
+        <div class="dim small">向きは記録として残します。距離は向きに関係なく同じです。</div>
+        <div class="row" style="margin-top:10px">
+          <div class="grow">
+            <div class="dim small">始点</div>
+            <div id="s_lineStart">${lineFixText(st,'start')}</div>
+          </div>
+          <button class="btn ok sm" style="width:auto;margin:0"
+            onclick="grabLinePt('start')">いまここ</button>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <div class="grow">
+            <div class="dim small">終点</div>
+            <div id="s_lineEnd">${lineFixText(st,'end')}</div>
+          </div>
+          <button class="btn ok sm" style="width:auto;margin:0"
+            onclick="grabLinePt('end')">いまここ</button>
+        </div>
+        <input type="hidden" id="s_ls_lat" value="${esc(g('line_start_lat'))}">
+        <input type="hidden" id="s_ls_lon" value="${esc(g('line_start_lon'))}">
+        <input type="hidden" id="s_ls_acc" value="${esc(g('line_start_acc'))}">
+        <input type="hidden" id="s_le_lat" value="${esc(g('line_end_lat'))}">
+        <input type="hidden" id="s_le_lon" value="${esc(g('line_end_lon'))}">
+        <input type="hidden" id="s_le_acc" value="${esc(g('line_end_acc'))}">
+        <div class="dim small" id="s_lineDist" style="margin-top:8px"></div>
+        <div class="dim small" id="s_lineGps"></div>
+        <label>流量（分かるときだけ・m³/s）</label>
+        <input id="s_flow" inputmode="decimal" value="${esc(g('flow_rate'))}">
+      </div>
+
+      <div class="card">
         <h3>川底と流れ（分かる範囲で）</h3>
         <label>河床材料（いちばん多いもの）</label>
         ${segHtml('sub1', OPT.substrate, g('substrate1'), true)}
@@ -3264,10 +3413,26 @@ SCREENS.stationEdit = (arg)=>{
         applySeg('habitat', d.habitat_type); applySeg('svtype2', d.survey_type);
         applySeg('sub1', d.substrate1); applySeg('gravel', d.gravel_condition);
         applySegMulti('method', d.survey_method);
+        applySeg('envm2', d.env_method); applySeg('linedir', d.line_direction);
+        applyVals({'#s_flow':d.flow_rate,
+          '#s_ls_lat':d.line_start_lat, '#s_ls_lon':d.line_start_lon,
+          '#s_ls_acc':d.line_start_acc,
+          '#s_le_lat':d.line_end_lat, '#s_le_lon':d.line_end_lon,
+          '#s_le_acc':d.line_end_acc});
         toast('書きかけを戻しました');
       }
       photosBegin(st, d);
       draftBind(key, collectStation, base);
+      onStationMethod();
+      // ラインのときは、始点・終点を押さえるために位置を受け続ける
+      if(segVal('envm2')==='ライン'){
+        startGps();
+        const box = $('#s_lineGps');
+        if(box) ENV_GPS_TIMER = setInterval(()=>{
+          if(!document.body.contains(box)){ clearInterval(ENV_GPS_TIMER); ENV_GPS_TIMER=null; return; }
+          box.textContent = gpsHint();
+        }, 2000);
+      }
     }
   };
 };
@@ -3278,11 +3443,69 @@ function collectStation(){
     survey_time_start: strVal('#s_t1'), survey_time_end: strVal('#s_t2'),
     survey_date: (segVal('stdate') || strVal('#s_date')),
     survey_type: segVal('svtype2'), survey_method: segMultiVal('method'),
+    env_method: segVal('envm2'), line_direction: segVal('linedir'),
+    flow_rate: strVal('#s_flow'),
+    line_start_lat: strVal('#s_ls_lat'), line_start_lon: strVal('#s_ls_lon'),
+    line_start_acc: strVal('#s_ls_acc'),
+    line_end_lat: strVal('#s_le_lat'), line_end_lon: strVal('#s_le_lon'),
+    line_end_acc: strVal('#s_le_acc'),
     latitude: strVal('#s_lat'), longitude: strVal('#s_lon'),
     depth_rep_cm: strVal('#s_depth'), velocity_rep_cms: strVal('#s_vel'),
     water_temp: strVal('#s_wt'), substrate1: segVal('sub1'),
     gravel_condition: segVal('gravel'), memo: strVal('#s_memo'),
   };
+}
+
+/* 始点・終点の見せ方。押さえていなければ、そう言う */
+function lineFixText(st, which){
+  const pt = linePt(st, which);
+  if(!pt) return '<span class="pill ng">まだ押さえていません</span>';
+  const acc = numOf(st['line_'+which+'_acc']);
+  return esc(pt[0].toFixed(6)+', '+pt[1].toFixed(6))
+    + (acc==='' ? '' : ' <span class="dim small">±'+Math.round(acc)+'m</span>');
+}
+/* いまいる場所を、区間の始点／終点として押さえる */
+function grabLinePt(which){
+  const key = which==='start' ? 'ls' : 'le';
+  toast('現在地を取っています…');
+  getFixOnce(f=>{
+    if(!f){ toast('現在地を取れませんでした'); return; }
+    if(f.acc > GPS_MAX_ACC){
+      toast(`いまの位置は ±${Math.round(f.acc)}m と粗いので押さえていません。`
+        + '空の見えるところでお試しください', 8000);
+      return;
+    }
+    applyVals({['#s_'+key+'_lat']: f.lat.toFixed(6),
+               ['#s_'+key+'_lon']: f.lon.toFixed(6),
+               ['#s_'+key+'_acc']: String(Math.round(f.acc))});
+    const box = $(which==='start' ? '#s_lineStart' : '#s_lineEnd');
+    if(box) box.innerHTML = esc(f.lat.toFixed(6)+', '+f.lon.toFixed(6))
+      + ' <span class="dim small">±'+Math.round(f.acc)+'m</span>';
+    showLineDist();
+    draftTouch();
+    toast((which==='start'?'始点':'終点')+'を押さえました');
+  });
+}
+/* いま押さえてある始点・終点から、区間の長さを出して見せる */
+function showLineDist(){
+  const box = $('#s_lineDist'); if(!box) return;
+  const tmp = {
+    line_start_lat: numVal('#s_ls_lat'), line_start_lon: numVal('#s_ls_lon'),
+    line_end_lat: numVal('#s_le_lat'), line_end_lon: numVal('#s_le_lon'),
+  };
+  const d = lineDist(tmp);
+  box.textContent = d==='' ? '始点と終点の両方を押さえると、区間の長さが出ます。'
+                           : `始点から終点まで ${fmtDist(d)}`;
+}
+/* 取り方を変えたら、出す欄を入れ替える */
+function onStationMethod(){
+  const m = segVal('envm2');
+  const line = $('#s_lineCard');
+  if(line) line.style.display = (m==='ライン') ? '' : 'none';
+  const mesh = $('#s_meshCard');
+  if(mesh) mesh.style.display = (m==='メッシュ') ? '' : 'none';
+  showLineDist();
+  draftTouch();
 }
 
 function grabStationPos(){
@@ -3323,12 +3546,27 @@ function saveStation(svUuid, stUuid){
   // 調査日が今日でないときは入れない（あとから書き起こしている最中なので、
   // 今の時刻を入れると実際の調査時刻と食い違う）
   if(isNew && !rec.survey_time_start && isLiveNow(sv)) rec.survey_time_start = timeValue();
+  rec.env_method        = (f.env_method==='ライン' || f.env_method==='メッシュ')
+                            ? f.env_method : '点';
+  if(rec.env_method==='ライン'){
+    rec.line_direction  = f.line_direction || '上流→下流';
+    rec.line_start_lat  = numOf(f.line_start_lat);
+    rec.line_start_lon  = numOf(f.line_start_lon);
+    rec.line_start_acc  = numOf(f.line_start_acc);
+    rec.line_end_lat    = numOf(f.line_end_lat);
+    rec.line_end_lon    = numOf(f.line_end_lon);
+    rec.line_end_acc    = numOf(f.line_end_acc);
+    rec.flow_rate       = numOf(f.flow_rate);
+  }
   rec.habitat_type      = f.habitat_type;
   rec.survey_type       = f.survey_type || '採取';
   rec.survey_method     = f.survey_method;
   const serr = rangeCheck([['水温', f.water_temp, -5, 45],
     ['代表の水深', f.depth_rep_cm, 0, 2000], ['代表の流速', f.velocity_rep_cms, 0, 1000],
-    ['緯度', f.latitude, 20, 50], ['経度', f.longitude, 120, 155]]);
+    ['緯度', f.latitude, 20, 50], ['経度', f.longitude, 120, 155],
+    ['流量', f.flow_rate, 0, 100000],
+    ['始点の緯度', f.line_start_lat, 20, 50], ['始点の経度', f.line_start_lon, 120, 155],
+    ['終点の緯度', f.line_end_lat, 20, 50], ['終点の経度', f.line_end_lon, 120, 155]]);
   if(serr){ toast(serr, 6000); return; }
   rec.water_temp        = numOf(f.water_temp);
   rec.substrate1        = f.substrate1;
@@ -3388,7 +3626,7 @@ SCREENS.station = (stUuid)=>{
   const cs = DB.catchesOf(stUuid);
   const len = stationLengths(st), area = stationAreas(st), cp = cpue(st);
   const dep = depthStats(st), vel = velocityStats(st);
-  const detail = isDetail(sv), W = stWord(sv);
+  const detail = isDetail(sv), W = stWordOf(st);
   const rows = cs.map(c=>{
     const ls = catchLengths(c);
     return `<tr onclick="nav('catchEdit',{uuid:'${c.uuid}'})" style="cursor:pointer">
@@ -3402,11 +3640,25 @@ SCREENS.station = (stUuid)=>{
   return {
     title: st.name || W,
     sub:[{text:sv?sv.river_name||'':''}, {text:st.habitat_type||'区分なし'},
-         {text:`${cs.length}種 ${stationTotal(st)}尾`},
+         isEnvSurvey(sv) ? {text:envMethod(st)} : {text:`${cs.length}種 ${stationTotal(st)}尾`},
          (sv && isLiveNow(sv) && !isDetail(sv) && !st.ended_at) ? {text:'記録中', cls:'ok'}
            : (st.ended_at && !isDetail(sv) ? {text:'終了'} : null)].filter(Boolean),
     html:`
-      <button class="btn pri" onclick="nav('speciesPick','${stUuid}')">魚を記録する</button>
+      ${isEnvSurvey(sv) ? ''
+        : `<button class="btn pri" onclick="nav('speciesPick','${stUuid}')">魚を記録する</button>`}
+      ${isLine(st) ? `<div class="card">
+        <h3 style="margin-top:0">区間</h3>
+        <div class="row">
+          <div class="grow"><div class="dim small">向き</div>
+            <div>${esc(st.line_direction||'—')}</div></div>
+          <div class="grow"><div class="dim small">始点から終点</div>
+            <div>${len.line===''?'—':esc(fmtDist(len.line))}</div></div>
+          <div class="grow"><div class="dim small">使う長さ</div>
+            <div style="font-weight:700">${esc(fmtDist(len.used))}</div></div>
+        </div>
+        ${len.line==='' ? '<div class="warnbox">始点か終点を押さえていません。'
+          + `「${esc(W)}の設定」から押さえられます。</div>` : ''}
+      </div>` : ''}
       ${foldHtml('stinfo', `この${W}のこと`, `
         <span class="fsub">${surveyIsMultiDay(sv)
           ? esc(String(stationDate(st, sv)).slice(5))+'　' : ''}${st.survey_time_start
@@ -3485,11 +3737,12 @@ SCREENS.station = (stUuid)=>{
         </div>
         <button class="btn" onclick="saveEffort('${stUuid}')">労力を保存する</button>`)}
 
-      <div class="card tap" onclick="nav('env','${stUuid}')"
+      <div class="card tap" onclick="nav('${isMesh(st)?'mesh':'env'}','${stUuid}')"
         ${detail ? 'style="opacity:.85"' : ''}>
         <div class="row">
           <div class="grow">
-            <div style="font-weight:700">川の環境を${detail?'詳しく記録する':'記録する'}</div>
+            <div style="font-weight:700">${isMesh(st) ? 'メッシュで記録する'
+              : '川の環境を'+(detail?'詳しく記録する':'記録する')}</div>
             <div class="dim small">測点 ${envPoints(st).length}点
               水深 ${dep.rep===''?'—':fmtNum(dep.rep,1)+'cm'}
               流速 ${vel.rep===''?'—':fmtNum(vel.rep,1)+'cm/s'}
@@ -3499,12 +3752,12 @@ SCREENS.station = (stUuid)=>{
         </div>
       </div>
 
-      <h3>この${W}で記録した魚</h3>
-      ${cs.length ? `<div class="card" style="padding:4px 12px">
+      ${isEnvSurvey(sv) ? '' : `<h3>この${W}で記録した魚</h3>`}
+      ${isEnvSurvey(sv) ? '' : (cs.length ? `<div class="card" style="padding:4px 12px">
         <table><thead><tr><th>魚種</th><th class="num">尾数</th>
           <th class="num">体長cm</th><th>同定</th></tr></thead>
         <tbody>${rows}</tbody></table></div>`
-       : '<div class="card dim">まだ記録がありません。</div>'}
+       : '<div class="card dim">まだ記録がありません。</div>')}
 
       <div class="hr"></div>
       ${(!sv || !isLiveNow(sv) || detail) ? ''
@@ -4881,6 +5134,7 @@ function packDrop(id){
 SCREENS.exportHub = (svUuid)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
+  const envOnly = isEnvSurvey(sv);
   const r = buildDbRows(sv);
   let extra = {ind:0, st:0, pt:0};
   try{
@@ -4901,7 +5155,12 @@ SCREENS.exportHub = (svUuid)=>{
         <br><br>取り込み側は、環境区分・水温・水深・流速・調査方法・時刻などが
         すべて同じ箇所を1つとして扱います。分けて残したいときは、
         時刻か環境の値のどれかが違うようにしてください。</div>` : ''}
-      <div class="card">
+      ${envOnly ? `<div class="card">
+        <h3 style="margin-top:0">データベース取り込み用のCSV（31列）</h3>
+        <div class="warnbox">この調査は<b>物理環境</b>なので、31列のCSVは出しません。<br>
+          31列のCSVは1行が「1種の結果」で、種IDが要るためです。<br>
+          川の環境は、下の「箇所ごとの記録」「測点ごとの水深・流速」に出ます。</div>
+      </div>` : `<div class="card">
         <div class="big">${r.rows.length} 行</div>
         <div class="dim small">データベース取り込み用のCSV（31列）</div>
         ${(()=>{ const ds = Array.from(new Set(r.rows.map(x=>x['調査日']))).filter(Boolean).sort();
@@ -4920,7 +5179,7 @@ SCREENS.exportHub = (svUuid)=>{
         ${sv.exported_at ? `<div class="dim small" style="margin-top:8px">
           前回の書き出し：${esc(fmtDate(sv.exported_at))} ${esc(fmtTime(sv.exported_at))}<br>
           同じCSVをもう一度取り込むと、記録が二重に増えます。</div>` : ''}
-      </div>
+      </div>`}
       <div class="card">
         <h3 style="margin-top:0">31列に乗らない分</h3>
         <div class="row">
@@ -5149,6 +5408,12 @@ function exportExtraCsv(svUuid, kind){
 }
 
 function exportDbCsv(svUuid){
+  const svk = DB.getAlive(DB.key.sv, svUuid);
+  if(isEnvSurvey(svk)){
+    toast('この調査は物理環境なので、31列のCSVは出せません。'
+      + '「箇所ごとの記録」「測点ごとの水深・流速」をお使いください', 8000);
+    return;
+  }
   // 使用権のないタブから書き出すと、別のタブが書き換えている途中の
   // ばらばらな中身を1つのCSVに混ぜてしまう
   if(!ownsLock()){
