@@ -1,4 +1,4 @@
-const CACHE = 'fish-survey-v15';   // fish_survey.html の APP_VERSION と番号を揃える
+const CACHE = 'fish-survey-v16';   // fish_survey.html の APP_VERSION と番号を揃える
 // これが揃わないとアプリが成立しないもの。install時に全部そろわなければ失敗させ、
 // 中途半端なキャッシュのまま有効にしない
 const CORE = [

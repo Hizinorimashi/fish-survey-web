@@ -117,7 +117,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v15';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v16';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -177,7 +177,10 @@ function strVal(sel){ const el=$(sel); return el ? String(el.value).trim() : '';
 function nums(arr){ return (arr||[]).map(numOf).filter(v=>v!==''); }
 function fmtNum(v, d){ return v==='' || v===null || v===undefined || isNaN(v)
   ? '—' : (d===undefined ? String(v) : (+v).toFixed(d)); }
-function fmtDist(d){ d=+d||0; return d>=1000 ? (d/1000).toFixed(2)+'km' : Math.round(d)+'m'; }
+function fmtDist(d){
+  if(d==='' || d===null || d===undefined || !isFinite(d)) return '—';
+  d=+d; return d>=1000 ? (d/1000).toFixed(2)+'km' : Math.round(d)+'m';
+}
 function fmtDur(sec){ sec=Math.max(0,Math.round(sec||0));
   const h=Math.floor(sec/3600), m=Math.floor(sec%3600/60), s=sec%60;
   return h ? `${h}時間${m}分` : (m ? `${m}分${pad2(s)}秒` : `${s}秒`); }
@@ -489,7 +492,7 @@ const RIVERS = [
   {r:"黒松内川", b:[42.65763,140.29035,42.66563,140.29835], c:2},
 ];
 const PAST_SITES = [
-  {r:"オソベツ川", s:"喜水橋", y:43.3304, x:144.49457},
+  {r:"オソベツ川", s:"喜水橋", y:43.32816, x:144.49416},
   {r:"ポントネ川", s:"ST.1", y:43.2, x:141.77},
   {r:"ポー川", s:"St.1 改修予定区間", y:43.665, x:145.125},
   {r:"ポー川", s:"St.2 比較対象区間", y:43.663, x:145.122},
@@ -503,47 +506,47 @@ const PAST_SITES = [
   {r:"上流川", s:"産卵床No.7", y:44.72639, x:142.40413},
   {r:"上流川", s:"補足調査地点", y:44.725, x:142.41},
   {r:"利別川", s:"St.1", y:43.4617, x:143.7456},
-  {r:"利別川", s:"本別愛の架け橋", y:43.11967, x:143.5995},
-  {r:"利別川", s:"池田大橋", y:42.91538, x:143.44948},
-  {r:"十勝川", s:"利別川合流点下流", y:42.85719, x:143.46223},
-  {r:"十勝川", s:"十勝河口橋", y:42.71604, x:143.59701},
-  {r:"十勝川", s:"千代田堰堤下流", y:42.94116, x:143.35993},
-  {r:"十勝川", s:"平原大橋", y:42.94705, x:143.17597},
-  {r:"十勝川", s:"清水大橋", y:43.01481, x:142.93582},
-  {r:"千歳川", s:"根志越橋上流", y:42.8461, x:141.67075},
+  {r:"利別川", s:"本別愛の架け橋", y:43.11768, x:143.60483},
+  {r:"利別川", s:"池田大橋", y:42.91457, x:143.45269},
+  {r:"十勝川", s:"利別川合流点下流", y:42.85678, x:143.46361},
+  {r:"十勝川", s:"十勝河口橋", y:42.70018, x:143.61856},
+  {r:"十勝川", s:"千代田堰堤下流", y:42.93762, x:143.35309},
+  {r:"十勝川", s:"平原大橋", y:42.94372, x:143.16838},
+  {r:"十勝川", s:"清水大橋", y:43.00965, x:142.93946},
+  {r:"千歳川", s:"根志越橋上流", y:42.84547, x:141.67052},
   {r:"南利根別川", s:"ST.1", y:43.195, x:141.75},
   {r:"南利根別川", s:"ST.2", y:43.193, x:141.748},
   {r:"厚別川", s:"KP3.7右岸", y:43.06, x:141.46},
-  {r:"名寄川", s:"由仁内橋上流", y:44.30687, x:142.68869},
+  {r:"名寄川", s:"由仁内橋上流", y:44.30202, x:142.692},
   {r:"堀株川", s:"9号橋下流（SP13250付近）", y:42.97996, x:140.65846},
   {r:"堀株川", s:"まなび橋", y:43.162, x:140.598},
   {r:"堀株川", s:"学橋付近（SP13000付近）", y:43.17, x:141.07},
   {r:"堀株川", s:"紅葉橋", y:43.165, x:140.595},
   {r:"堀株川", s:"紅葉橋（SP15700付近）", y:43.155, x:141.055},
-  {r:"夕張川", s:"清幌床止下流", y:43.09278, x:141.67243},
-  {r:"夕張川", s:"長栗橋下流", y:43.0802, x:141.7385},
-  {r:"天塩川", s:"上幌延", y:44.9705, x:141.87213},
-  {r:"天塩川", s:"佐久橋上流", y:44.73661, x:142.04824},
-  {r:"天塩川", s:"名寄大橋下流", y:44.3935, x:142.46416},
-  {r:"天塩川", s:"小車大橋上流", y:44.60398, x:142.29423},
+  {r:"夕張川", s:"清幌床止下流", y:43.09215, x:141.67444},
+  {r:"夕張川", s:"長栗橋下流", y:43.0797, x:141.73854},
+  {r:"天塩川", s:"上幌延", y:44.96865, x:141.87198},
+  {r:"天塩川", s:"佐久橋上流", y:44.73591, x:142.04954},
+  {r:"天塩川", s:"名寄大橋下流", y:44.38891, x:142.4653},
+  {r:"天塩川", s:"小車大橋上流", y:44.60098, x:142.30125},
   {r:"天塩川", s:"幌延旧川", y:44.97026, x:141.8724},
-  {r:"天塩川", s:"河口大橋", y:44.93013, x:141.75874},
-  {r:"天塩川", s:"班渓橋下流", y:44.11425, x:142.55473},
+  {r:"天塩川", s:"河口大橋", y:44.91906, x:141.73058},
+  {r:"天塩川", s:"班渓橋下流", y:44.11174, x:142.55902},
   {r:"天塩川", s:"由仁内橋上流", y:44.30505, x:142.68835},
-  {r:"天塩川", s:"筬島橋下流", y:44.74065, x:142.18171},
+  {r:"天塩川", s:"筬島橋下流", y:44.73779, x:142.19095},
   {r:"安達の沢川", s:"A", y:44.22372, x:142.18582},
-  {r:"尻別川", s:"初田橋下流", y:42.86407, x:140.38778},
-  {r:"尻別川", s:"初田橋下流汽水域", y:42.86176, x:140.39163},
-  {r:"尻別川", s:"御成橋上流", y:42.83623, x:140.40326},
-  {r:"尻別川", s:"目名川合流点", y:42.8112, x:140.45453},
-  {r:"尻別川", s:"石淵地区", y:42.79819, x:140.47512},
-  {r:"尻別川", s:"豊国樋門", y:42.80322, x:140.51756},
-  {r:"常呂川", s:"常呂橋", y:44.11874, x:144.0721},
-  {r:"常呂川", s:"日吉橋", y:43.98204, x:143.95487},
-  {r:"常呂川", s:"林友橋", y:43.6713, x:143.58087},
-  {r:"常呂川", s:"若松大橋", y:43.79909, x:143.91113},
-  {r:"常呂川", s:"金比羅橋", y:43.75465, x:143.84074},
-  {r:"幾春別川", s:"川向頭首工下流", y:43.23027, x:141.81351},
+  {r:"尻別川", s:"初田橋下流", y:42.86359, x:140.3877},
+  {r:"尻別川", s:"初田橋下流汽水域", y:42.86121, x:140.39063},
+  {r:"尻別川", s:"御成橋上流", y:42.83462, x:140.40351},
+  {r:"尻別川", s:"目名川合流点", y:42.80896, x:140.4555},
+  {r:"尻別川", s:"石淵地区", y:42.79813, x:140.47916},
+  {r:"尻別川", s:"豊国樋門", y:42.80277, x:140.52183},
+  {r:"常呂川", s:"常呂橋", y:44.11815, x:144.07151},
+  {r:"常呂川", s:"日吉橋", y:43.98159, x:143.95354},
+  {r:"常呂川", s:"林友橋", y:43.67119, x:143.58107},
+  {r:"常呂川", s:"若松大橋", y:43.79803, x:143.91122},
+  {r:"常呂川", s:"金比羅橋", y:43.75412, x:143.84025},
+  {r:"幾春別川", s:"川向頭首工下流", y:43.2302, x:141.81339},
   {r:"当別川", s:"6.湖沼", y:43.232, x:141.492},
   {r:"当別川", s:"P-2", y:43.235, x:141.495},
   {r:"当別川", s:"P-3", y:43.233, x:141.493},
@@ -551,16 +554,16 @@ const PAST_SITES = [
   {r:"当別川", s:"P-9", y:43.228, x:141.488},
   {r:"当別川", s:"ワンド", y:43.234, x:141.494},
   {r:"当別川", s:"砂州", y:43.236, x:141.496},
-  {r:"後志利別川", s:"トマンケシナイ川合流点付近", y:42.41297, x:139.99428},
+  {r:"後志利別川", s:"トマンケシナイ川合流点付近", y:42.4127, x:139.99616},
   {r:"後志利別川", s:"住吉頭首工", y:42.40833, x:140.10262},
-  {r:"後志利別川", s:"住吉頭首工下流", y:42.40841, x:140.11158},
-  {r:"後志利別川", s:"兜野橋", y:42.41177, x:139.86389},
-  {r:"後志利別川", s:"志文内橋", y:42.38992, x:140.14209},
-  {r:"忠別川", s:"東神楽森林公園地先", y:43.6798, x:142.53328},
-  {r:"忠別川", s:"神楽橋付近", y:43.75607, x:142.36559},
+  {r:"後志利別川", s:"住吉頭首工下流", y:42.40741, x:140.10299},
+  {r:"後志利別川", s:"兜野橋", y:42.41163, x:139.86374},
+  {r:"後志利別川", s:"志文内橋", y:42.38795, x:140.14094},
+  {r:"忠別川", s:"東神楽森林公園地先", y:43.67635, x:142.53849},
+  {r:"忠別川", s:"神楽橋付近", y:43.7546, x:142.36685},
   {r:"斜里川", s:"St.1", y:43.8781, x:144.6474},
-  {r:"新釧路川", s:"鳥取橋", y:43.00952, x:144.36637},
-  {r:"札内川", s:"中札内橋", y:42.70016, x:143.11988},
+  {r:"新釧路川", s:"鳥取橋", y:43.00844, x:144.36567},
+  {r:"札内川", s:"中札内橋", y:42.69703, x:143.1227},
   {r:"札内川", s:"第１札内橋梁", y:42.90806, x:143.23243},
   {r:"朱太川", s:"GPS:8:25", y:42.64218, x:140.35},
   {r:"朱太川", s:"GPS:8:27", y:42.64216, x:140.34997},
@@ -571,7 +574,7 @@ const PAST_SITES = [
   {r:"朱太川", s:"GPS:8:35", y:42.64218, x:140.35067},
   {r:"朱太川", s:"GPS:8:36", y:42.64216, x:140.35057},
   {r:"朱太川", s:"GPS:8:37", y:42.64221, x:140.35059},
-  {r:"朱太川", s:"GPS:8:38", y:42.64226, x:140.35072},
+  {r:"朱太川", s:"GPS:8:38", y:42.64221, x:140.3507},
   {r:"朱太川", s:"GPS:8:40", y:42.64204, x:140.35052},
   {r:"朱太川", s:"GPS:8:41", y:42.64225, x:140.35083},
   {r:"朱太川", s:"GPS:8:45", y:42.64228, x:140.35082},
@@ -604,31 +607,31 @@ const PAST_SITES = [
   {r:"朱太川", s:"貝殻橋", y:42.63981, x:140.33831},
   {r:"東利根別川", s:"ST.1", y:43.19, x:141.76},
   {r:"東利根別川", s:"ST.2", y:43.185, x:141.755},
-  {r:"永山新川", s:"第一北永橋付近", y:43.81869, x:142.45252},
-  {r:"沙流川", s:"二風谷ダム下流", y:42.6149, x:142.14032},
+  {r:"永山新川", s:"第一北永橋付近", y:43.81761, x:142.4563},
+  {r:"沙流川", s:"二風谷ダム下流", y:42.61127, x:142.14344},
   {r:"沙流川", s:"二風谷ダム下流地区", y:42.60509, x:142.1481},
-  {r:"沙流川", s:"沙流川橋", y:42.50727, x:142.0199},
-  {r:"沙流川", s:"荷菜大橋", y:42.56711, x:142.10883},
-  {r:"浦幌十勝川", s:"十勝太", y:42.73447, x:143.67326},
-  {r:"渚滑川", s:"中渚滑豊盛川合流点", y:44.32399, x:143.27996},
-  {r:"渚滑川", s:"渚滑橋", y:44.3838, x:143.29669},
-  {r:"渚滑川", s:"渚滑橋下流", y:44.38182, x:143.30143},
-  {r:"渚滑川", s:"立牛川合流点下流", y:44.21881, x:143.23815},
+  {r:"沙流川", s:"沙流川橋", y:42.50347, x:142.02192},
+  {r:"沙流川", s:"荷菜大橋", y:42.56472, x:142.11844},
+  {r:"浦幌十勝川", s:"十勝太", y:42.73014, x:143.67734},
+  {r:"渚滑川", s:"中渚滑豊盛川合流点", y:44.31613, x:143.28342},
+  {r:"渚滑川", s:"渚滑橋", y:44.38092, x:143.30091},
+  {r:"渚滑川", s:"渚滑橋下流", y:44.38093, x:143.30078},
+  {r:"渚滑川", s:"立牛川合流点下流", y:44.21464, x:143.24134},
   {r:"渚滑川", s:"豊盛川合流点", y:44.31941, x:143.28561},
-  {r:"湧別川", s:"一号橋", y:44.2329, x:143.60936},
-  {r:"湧別川", s:"中湧別橋上流", y:44.19081, x:143.58193},
-  {r:"湧別川", s:"湧別1号橋", y:44.22901, x:143.61083},
-  {r:"湧別川", s:"遠軽橋", y:44.04953, x:143.51444},
-  {r:"湧別川", s:"開盛橋", y:44.107, x:143.54807},
+  {r:"湧別川", s:"一号橋", y:44.23148, x:143.60704},
+  {r:"湧別川", s:"中湧別橋上流", y:44.1876, x:143.58555},
+  {r:"湧別川", s:"湧別1号橋", y:44.22797, x:143.60963},
+  {r:"湧別川", s:"遠軽橋", y:44.04624, x:143.51795},
+  {r:"湧別川", s:"開盛橋", y:44.10276, x:143.55132},
   {r:"無加川", s:"豊地大橋", y:43.79062, x:143.84587},
   {r:"熱郛川", s:"岡本橋", y:42.67221, x:140.33553},
-  {r:"牛朱別川", s:"パルプ取水堰付近", y:43.77281, x:142.4005},
-  {r:"牛朱別川", s:"中央橋付近", y:43.77247, x:142.37584},
-  {r:"牛朱別川", s:"桜岡頭首工付近", y:43.79904, x:142.5014},
-  {r:"留萌川", s:"大和田水位観測所下流", y:43.90937, x:141.69727},
-  {r:"留萌川", s:"峠下橋", y:43.84736, x:141.81926},
+  {r:"牛朱別川", s:"パルプ取水堰付近", y:43.76962, x:142.40185},
+  {r:"牛朱別川", s:"中央橋付近", y:43.77191, x:142.37694},
+  {r:"牛朱別川", s:"桜岡頭首工付近", y:43.79904, x:142.50106},
+  {r:"留萌川", s:"大和田水位観測所下流", y:43.90873, x:141.69695},
+  {r:"留萌川", s:"峠下橋", y:43.8468, x:141.81973},
   {r:"留萌川", s:"明治橋", y:43.84626, x:141.76683},
-  {r:"留萌川", s:"河口", y:43.95741, x:141.64512},
+  {r:"留萌川", s:"河口", y:43.9571, x:141.64586},
   {r:"真駒内川", s:"①SP2200", y:42.984, x:141.355},
   {r:"真駒内川", s:"②SP3100", y:42.981, x:141.353},
   {r:"真駒内川", s:"③SP4700", y:42.976, x:141.348},
@@ -646,28 +649,28 @@ const PAST_SITES = [
   {r:"真駒内川", s:"総合流域防災工事区間（SP3600～SP6250）", y:42.975, x:141.347},
   {r:"石狩川", s:"KP13.8上流部", y:43.176, x:141.391},
   {r:"石狩川", s:"KP13.8下流部", y:43.175, x:141.39},
-  {r:"石狩川", s:"エチャナンケップ川合流点上流", y:43.86024, x:142.70003},
-  {r:"石狩川", s:"千歳川合流点付近", y:43.11737, x:141.5574},
+  {r:"石狩川", s:"エチャナンケップ川合流点上流", y:43.85966, x:142.70018},
+  {r:"石狩川", s:"千歳川合流点付近", y:43.11724, x:141.55746},
   {r:"石狩川", s:"奈江川合流点", y:43.44984, x:141.87272},
-  {r:"石狩川", s:"月形大橋上流", y:43.34674, x:141.70578},
-  {r:"石狩川", s:"比布大橋下流", y:43.88272, x:142.51515},
-  {r:"石狩川", s:"江竜橋上流", y:43.64552, x:141.91254},
+  {r:"石狩川", s:"月形大橋上流", y:43.34505, x:141.70341},
+  {r:"石狩川", s:"比布大橋下流", y:43.88034, x:142.51945},
+  {r:"石狩川", s:"江竜橋上流", y:43.64048, x:141.91285},
   {r:"石狩川", s:"石狩川河口左岸", y:43.25463, x:141.37754},
   {r:"石狩川", s:"石狩川河口（左岸）", y:43.26209, x:141.36767},
-  {r:"石狩川", s:"神居大橋上流", y:43.73206, x:142.20133},
-  {r:"石狩川", s:"神竜頭首工", y:43.73543, x:142.23569},
-  {r:"石狩川", s:"花咲大橋上流", y:43.7936, x:142.37929},
-  {r:"石狩川", s:"豊奈江川合流点沼", y:43.45243, x:141.87261},
+  {r:"石狩川", s:"神居大橋上流", y:43.7292, x:142.2063},
+  {r:"石狩川", s:"神竜頭首工", y:43.73373, x:142.21866},
+  {r:"石狩川", s:"花咲大橋上流", y:43.78894, x:142.38259},
+  {r:"石狩川", s:"豊奈江川合流点沼", y:43.44851, x:141.86602},
   {r:"石狩川", s:"豊沼奈江川合流点", y:43.45205, x:141.87241},
-  {r:"石狩川", s:"近文大橋上流", y:43.78981, x:142.31324},
-  {r:"空知川", s:"東栄橋上流", y:43.19369, x:142.42416},
-  {r:"空知川", s:"高速道路橋上流", y:43.56259, x:141.95642},
-  {r:"網走川", s:"大正橋", y:43.82628, x:144.09707},
-  {r:"網走川", s:"新橋", y:44.00982, x:144.22554},
-  {r:"網走川", s:"網走湖流入部", y:43.91992, x:144.1654},
-  {r:"網走川", s:"達媚橋", y:43.70896, x:144.01268},
+  {r:"石狩川", s:"近文大橋上流", y:43.78529, x:142.31492},
+  {r:"空知川", s:"東栄橋上流", y:43.18914, x:142.4322},
+  {r:"空知川", s:"高速道路橋上流", y:43.56228, x:141.95439},
+  {r:"網走川", s:"大正橋", y:43.8205, x:144.08674},
+  {r:"網走川", s:"新橋", y:44.00819, x:144.22531},
+  {r:"網走川", s:"網走湖流入部", y:43.918, x:144.17304},
+  {r:"網走川", s:"達媚橋", y:43.707, x:144.01158},
   {r:"美幌川", s:"美幌橋", y:43.82564, x:144.127},
-  {r:"美瑛川", s:"寿橋上流", y:43.66214, x:142.3946},
+  {r:"美瑛川", s:"寿橋上流", y:43.661, x:142.39773},
   {r:"臼別川", s:"SP1000", y:42.22306, x:139.874},
   {r:"臼別川", s:"SP1010", y:42.22315, x:139.87408},
   {r:"臼別川", s:"SP1020", y:42.22321, x:139.87415},
@@ -676,10 +679,10 @@ const PAST_SITES = [
   {r:"臼別川", s:"SP1110", y:42.22368, x:139.87513},
   {r:"臼別川", s:"SP1160", y:42.22405, x:139.87556},
   {r:"臼別川", s:"SP1230", y:42.13276, x:139.52321},
-  {r:"臼別川", s:"SP1270", y:42.1329, x:139.52329},
+  {r:"臼別川", s:"SP1270", y:42.13288, x:139.52329},
   {r:"臼別川", s:"SP1390", y:42.22597, x:139.87651},
   {r:"臼別川", s:"SP1490", y:42.2264, x:139.87758},
-  {r:"臼別川", s:"SP1510", y:42.22657, x:139.87784},
+  {r:"臼別川", s:"SP1510", y:42.22655, x:139.87779},
   {r:"臼別川", s:"SP1520", y:42.13353, x:139.52383},
   {r:"臼別川", s:"SP1550", y:42.22693, x:139.87787},
   {r:"臼別川", s:"SP1780", y:42.22874, x:139.87917},
@@ -688,7 +691,7 @@ const PAST_SITES = [
   {r:"臼別川", s:"SP2270", y:42.23167, x:139.88365},
   {r:"臼別川", s:"SP2280", y:42.13551, x:139.52582},
   {r:"臼別川", s:"SP2330", y:42.13541, x:139.53002},
-  {r:"臼別川", s:"SP2400", y:42.23112, x:139.88508},
+  {r:"臼別川", s:"SP2400", y:42.2311, x:139.88513},
   {r:"臼別川", s:"SP2420", y:42.13539, x:139.5304},
   {r:"臼別川", s:"SP250", y:42.131, x:139.52},
   {r:"臼別川", s:"SP2500", y:42.23123, x:139.88626},
@@ -701,11 +704,11 @@ const PAST_SITES = [
   {r:"臼別川", s:"SP2840", y:42.13562, x:139.53214},
   {r:"臼別川", s:"SP2870", y:42.23242, x:139.88949},
   {r:"臼別川", s:"SP3000", y:42.23212, x:139.89221},
-  {r:"臼別川", s:"SP3020", y:42.13556, x:139.53297},
+  {r:"臼別川", s:"SP3020", y:42.13555, x:139.53297},
   {r:"臼別川", s:"SP3090", y:42.13557, x:139.53329},
-  {r:"臼別川", s:"SP3180", y:42.13568, x:139.53368},
+  {r:"臼別川", s:"SP3180", y:42.13567, x:139.53368},
   {r:"臼別川", s:"SP320", y:42.21877, x:139.86893},
-  {r:"臼別川", s:"SP3250", y:42.13563, x:139.53387},
+  {r:"臼別川", s:"SP3250", y:42.13558, x:139.53401},
   {r:"臼別川", s:"SP3260", y:42.13563, x:139.5339},
   {r:"臼別川", s:"SP3280", y:42.23275, x:139.89545},
   {r:"臼別川", s:"SP3290", y:42.23279, x:139.89557},
@@ -723,20 +726,20 @@ const PAST_SITES = [
   {r:"臼別川", s:"SP3830", y:42.14025, x:139.54039},
   {r:"臼別川", s:"SP3840", y:42.14028, x:139.54042},
   {r:"臼別川", s:"SP3870", y:42.14032, x:139.54054},
-  {r:"臼別川", s:"SP3880", y:42.2326, x:139.9025},
+  {r:"臼別川", s:"SP3880", y:42.23259, x:139.90253},
   {r:"臼別川", s:"SP3890", y:42.23255, x:139.90257},
   {r:"臼別川", s:"SP3920", y:42.13595, x:139.54068},
   {r:"臼別川", s:"SP3950", y:42.23269, x:139.90329},
   {r:"臼別川", s:"SP3980", y:42.13578, x:139.54079},
   {r:"臼別川", s:"SP3990", y:42.233, x:139.9035},
   {r:"臼別川", s:"SP4010", y:42.23316, x:139.9036},
-  {r:"臼別川", s:"SP4070", y:42.23342, x:139.90432},
+  {r:"臼別川", s:"SP4070", y:42.23341, x:139.90434},
   {r:"臼別川", s:"SP4090", y:42.13581, x:139.54119},
-  {r:"臼別川", s:"SP4110", y:42.23321, x:139.90474},
+  {r:"臼別川", s:"SP4110", y:42.23315, x:139.90469},
   {r:"臼別川", s:"SP4120", y:42.23318, x:139.90486},
   {r:"臼別川", s:"SP4130", y:42.23309, x:139.9049},
   {r:"臼別川", s:"SP4140", y:42.13593, x:139.54135},
-  {r:"臼別川", s:"SP4170", y:42.136, x:139.54155},
+  {r:"臼別川", s:"SP4170", y:42.13597, x:139.54149},
   {r:"臼別川", s:"SP4180", y:42.23285, x:139.90548},
   {r:"臼別川", s:"SP4210", y:42.14008, x:139.54158},
   {r:"臼別川", s:"SP4220", y:42.14013, x:139.54161},
@@ -746,53 +749,53 @@ const PAST_SITES = [
   {r:"臼別川", s:"SP4450", y:42.23111, x:139.90773},
   {r:"臼別川", s:"SP4490", y:42.1353, x:139.54236},
   {r:"臼別川", s:"SP4560", y:42.13521, x:139.54268},
-  {r:"臼別川", s:"SP4570", y:42.13521, x:139.54273},
+  {r:"臼別川", s:"SP4570", y:42.1352, x:139.54273},
   {r:"臼別川", s:"SP4580", y:42.13519, x:139.54284},
   {r:"臼別川", s:"SP4590", y:42.13519, x:139.54285},
   {r:"臼別川", s:"SP4600", y:42.23107, x:139.90779},
   {r:"臼別川", s:"SP4610", y:42.13519, x:139.54298},
-  {r:"臼別川", s:"SP4620", y:42.1352, x:139.54299},
-  {r:"臼別川", s:"SP4640", y:42.23116, x:139.90826},
-  {r:"臼別川", s:"SP4650", y:42.23112, x:139.9083},
+  {r:"臼別川", s:"SP4620", y:42.1352, x:139.54298},
+  {r:"臼別川", s:"SP4640", y:42.23116, x:139.90825},
+  {r:"臼別川", s:"SP4650", y:42.23109, x:139.90831},
   {r:"臼別川", s:"SP4660", y:42.13523, x:139.54321},
   {r:"臼別川", s:"SP4670", y:42.13517, x:139.54322},
   {r:"臼別川", s:"SP4680", y:42.23104, x:139.90893},
-  {r:"臼別川", s:"SP4690", y:42.13522, x:139.54333},
+  {r:"臼別川", s:"SP4690", y:42.1352, x:139.54333},
   {r:"臼別川", s:"SP4720", y:42.13518, x:139.54349},
   {r:"臼別川", s:"SP4760", y:42.13527, x:139.54363},
   {r:"臼別川", s:"SP4770", y:42.13529, x:139.54362},
   {r:"臼別川", s:"SP4780", y:42.23143, x:139.91031},
   {r:"臼別川", s:"SP4790", y:42.13531, x:139.5437},
   {r:"臼別川", s:"SP4860", y:42.13547, x:139.54396},
-  {r:"臼別川", s:"SP4890", y:42.13545, x:139.54414},
+  {r:"臼別川", s:"SP4890", y:42.13544, x:139.54414},
   {r:"臼別川", s:"SP4960", y:42.23132, x:139.91232},
   {r:"臼別川", s:"SP5000", y:42.13512, x:139.54439},
   {r:"臼別川", s:"SP5020", y:42.13511, x:139.5444},
-  {r:"臼別川", s:"SP5040", y:42.23077, x:139.913},
+  {r:"臼別川", s:"SP5040", y:42.23075, x:139.91304},
   {r:"臼別川", s:"SP5050", y:42.13503, x:139.54445},
   {r:"臼別川", s:"SP5060", y:42.13503, x:139.54452},
   {r:"臼別川", s:"SP5070", y:42.13497, x:139.54461},
   {r:"臼別川", s:"SP5080", y:42.13497, x:139.5446},
   {r:"臼別川", s:"SP5100", y:42.13493, x:139.54466},
-  {r:"臼別川", s:"SP5110", y:42.23022, x:139.91344},
+  {r:"臼別川", s:"SP5110", y:42.23018, x:139.91341},
   {r:"臼別川", s:"SP5130", y:42.23007, x:139.91334},
   {r:"臼別川", s:"SP5160", y:42.2298, x:139.91349},
   {r:"臼別川", s:"SP5170", y:42.13475, x:139.54487},
-  {r:"臼別川", s:"SP5180", y:42.2296, x:139.91361},
+  {r:"臼別川", s:"SP5180", y:42.22958, x:139.91359},
   {r:"臼別川", s:"SP5190", y:42.13468, x:139.54487},
-  {r:"臼別川", s:"SP5200", y:42.13463, x:139.54489},
+  {r:"臼別川", s:"SP5200", y:42.13462, x:139.54489},
   {r:"臼別川", s:"SP5250", y:42.22935, x:139.91436},
   {r:"臼別川", s:"SP5260", y:42.13457, x:139.54514},
   {r:"臼別川", s:"SP5270", y:42.22942, x:139.9146},
   {r:"臼別川", s:"SP5280", y:42.13458, x:139.54521},
   {r:"臼別川", s:"SP5300", y:42.13458, x:139.5453},
-  {r:"臼別川", s:"SP5380", y:42.13473, x:139.54566},
+  {r:"臼別川", s:"SP5380", y:42.1347, x:139.54564},
   {r:"臼別川", s:"SP5390", y:42.22981, x:139.91597},
   {r:"臼別川", s:"SP5400", y:42.13473, x:139.54573},
-  {r:"臼別川", s:"SP5420", y:42.13475, x:139.54577},
+  {r:"臼別川", s:"SP5420", y:42.13474, x:139.54574},
   {r:"臼別川", s:"SP5450", y:42.22995, x:139.91672},
   {r:"臼別川", s:"SP5580", y:42.22932, x:139.91802},
-  {r:"臼別川", s:"SP5600", y:42.22922, x:139.91816},
+  {r:"臼別川", s:"SP5600", y:42.2292, x:139.91817},
   {r:"臼別川", s:"SP5610", y:42.13453, x:139.55053},
   {r:"臼別川", s:"SP5620", y:42.22905, x:139.9183},
   {r:"臼別川", s:"SP5700", y:42.13426, x:139.5508},
@@ -802,32 +805,32 @@ const PAST_SITES = [
   {r:"臼別川", s:"SP5740", y:42.22855, x:139.91941},
   {r:"臼別川", s:"SP5760", y:42.13428, x:139.551},
   {r:"臼別川", s:"SP5770", y:42.13427, x:139.55105},
-  {r:"臼別川", s:"SP5790", y:42.13421, x:139.55118},
+  {r:"臼別川", s:"SP5790", y:42.13418, x:139.5512},
   {r:"臼別川", s:"SP5800", y:42.13429, x:139.55127},
   {r:"臼別川", s:"SP5820", y:42.22843, x:139.92034},
-  {r:"臼別川", s:"SP5840", y:42.2281, x:139.92037},
+  {r:"臼別川", s:"SP5840", y:42.22804, x:139.92038},
   {r:"臼別川", s:"SP5880", y:42.13405, x:139.55147},
   {r:"臼別川", s:"SP5900", y:42.13399, x:139.5515},
   {r:"臼別川", s:"SP5920", y:42.13396, x:139.55162},
   {r:"臼別川", s:"SP6040", y:42.2277, x:139.92164},
   {r:"臼別川", s:"SP6060", y:42.13409, x:139.55229},
   {r:"臼別川", s:"SP6070", y:42.1341, x:139.55233},
-  {r:"臼別川", s:"SP6090", y:42.13414, x:139.5523},
+  {r:"臼別川", s:"SP6090", y:42.13413, x:139.5523},
   {r:"臼別川", s:"SP6170", y:42.22802, x:139.9232},
-  {r:"臼別川", s:"SP6200", y:42.22834, x:139.9236},
+  {r:"臼別川", s:"SP6200", y:42.22826, x:139.9236},
   {r:"臼別川", s:"SP6220", y:42.13409, x:139.55299},
-  {r:"臼別川", s:"SP6240", y:42.22799, x:139.92407},
+  {r:"臼別川", s:"SP6240", y:42.22797, x:139.92407},
   {r:"臼別川", s:"SP6250", y:42.13404, x:139.55311},
   {r:"臼別川", s:"SP6290", y:42.22797, x:139.9248},
   {r:"臼別川", s:"SP6300", y:42.22799, x:139.92486},
   {r:"臼別川", s:"SP6320", y:42.13405, x:139.55343},
-  {r:"臼別川", s:"SP6340", y:42.22801, x:139.92536},
+  {r:"臼別川", s:"SP6340", y:42.22785, x:139.92534},
   {r:"臼別川", s:"SP6380", y:42.13405, x:139.55356},
-  {r:"臼別川", s:"SP6390", y:42.13393, x:139.55372},
+  {r:"臼別川", s:"SP6390", y:42.13393, x:139.55371},
   {r:"臼別川", s:"SP6400", y:42.22756, x:139.92558},
-  {r:"臼別川", s:"SP6420", y:42.13397, x:139.55373},
+  {r:"臼別川", s:"SP6420", y:42.13388, x:139.55386},
   {r:"臼別川", s:"SP6430", y:42.22778, x:139.92631},
-  {r:"臼別川", s:"SP6460", y:42.22763, x:139.92691},
+  {r:"臼別川", s:"SP6460", y:42.22762, x:139.92691},
   {r:"臼別川", s:"SP6470", y:42.22743, x:139.92709},
   {r:"臼別川", s:"SP6490", y:42.13383, x:139.5542},
   {r:"臼別川", s:"SP6500", y:42.13384, x:139.55423},
@@ -895,18 +898,18 @@ const PAST_SITES = [
   {r:"豊平川", s:"KP3.0左岸", y:43.038, x:141.344},
   {r:"豊平川", s:"KP4.0右岸", y:43.033, x:141.34},
   {r:"豊平川", s:"KP4.0左岸", y:43.033, x:141.341},
-  {r:"豊平川", s:"南19条橋下流", y:43.0373, x:141.35662},
+  {r:"豊平川", s:"南19条橋下流", y:43.03367, x:141.35562},
   {r:"豊栄川", s:"ST.1 みなみっこ橋(SP1400)", y:44.345, x:142.43},
   {r:"豊栄川", s:"ST.2 公園裏(SP2600)", y:44.342, x:142.425},
   {r:"豊栄川", s:"ST.3 遊水地横(SP3170)", y:44.34, x:142.422},
   {r:"豊栄川", s:"ST.4 整備区間外(SP3950)", y:44.338, x:142.419},
   {r:"豊栄川", s:"ST.5 上流遊水地", y:44.336, x:142.416},
-  {r:"釧路川", s:"二本松橋", y:43.1642, x:144.48074},
-  {r:"釧路川", s:"五十石橋", y:43.24549, x:144.54291},
+  {r:"釧路川", s:"二本松橋", y:43.16389, x:144.47994},
+  {r:"釧路川", s:"五十石橋", y:43.24416, x:144.53987},
   {r:"釧路川", s:"細岡", y:43.10617, x:144.46849},
-  {r:"釧路川", s:"茅沼", y:43.20602, x:144.50085},
-  {r:"釧路川", s:"鐺別川合流点", y:43.47887, x:144.473},
-  {r:"釧路川", s:"開運橋", y:43.2973, x:144.60116},
+  {r:"釧路川", s:"茅沼", y:43.20553, x:144.50086},
+  {r:"釧路川", s:"鐺別川合流点", y:43.477, x:144.47291},
+  {r:"釧路川", s:"開運橋", y:43.29524, x:144.59897},
   {r:"釧路川", s:"鳥取橋", y:43.00866, x:144.36577},
   {r:"雨竜川", s:"R5確認魚類目録", y:43.75, x:142.4},
   {r:"雨竜川", s:"eDNA copies", y:43.75, x:142.4},
@@ -931,19 +934,19 @@ const PAST_SITES = [
   {r:"雨竜川", s:"⑪三股取水堰付近", y:44.29966, x:142.17936},
   {r:"雨竜川", s:"⑫R8工事（朱鞠内地区）えんじん橋上流", y:44.29017, x:142.16741},
   {r:"雨竜川", s:"⑫赤松川合流点", y:44.27731, x:142.16235},
-  {r:"雨竜川", s:"幌新太刀別川合流点", y:43.78266, x:141.91506},
+  {r:"雨竜川", s:"幌新太刀別川合流点", y:43.78234, x:141.91403},
   {r:"雨竜川", s:"経年目録", y:43.75, x:142.4},
-  {r:"雨竜川", s:"鷹泊橋下流", y:43.88753, x:142.09904},
-  {r:"音更川", s:"士幌新橋", y:43.16646, x:143.21575},
-  {r:"音更川", s:"音幌橋", y:42.99415, x:143.21219},
-  {r:"鵡川", s:"川西頭首工", y:42.58511, x:142.03275},
-  {r:"鵡川", s:"有明", y:42.61157, x:142.08808},
-  {r:"鵡川", s:"穂別橋", y:42.7583, x:142.14335},
+  {r:"雨竜川", s:"鷹泊橋下流", y:43.8861, x:142.09941},
+  {r:"音更川", s:"士幌新橋", y:43.16311, x:143.21927},
+  {r:"音更川", s:"音幌橋", y:42.98969, x:143.21775},
+  {r:"鵡川", s:"川西頭首工", y:42.57848, x:142.02036},
+  {r:"鵡川", s:"有明", y:42.60675, x:142.09082},
+  {r:"鵡川", s:"穂別橋", y:42.74965, x:142.13623},
   {r:"鵡川", s:"鵡川河口", y:42.56011, x:141.93105},
-  {r:"鵡川", s:"鵡川河口部", y:42.56053, x:141.93166},
+  {r:"鵡川", s:"鵡川河口部", y:42.56008, x:141.93219},
   {r:"黒松内川", s:"西の沢橋", y:42.66163, x:140.29435},
 ];
-const RIVER_STAMP = {n:49, m:453, sha:"576f05d0f34c"};
+const RIVER_STAMP = {n:49, m:453, sha:"2797697049b3"};
 /* <<<FS_RIVERS_AUTO_END>>> */
 
 /* 河川名から、地図を合わせる範囲を返す。無ければ null */
@@ -1177,6 +1180,7 @@ function isLiveNow(sv){
   return surveyDays(sv).indexOf(dateValue()) >= 0;
 }
 
+const SURVEY_MAX_DAYS = 62;   // これより長い期間は保存のときに断る
 /* 調査の期間。終了日が無ければ1日だけ */
 function surveyDays(sv){
   const a = String(sv && sv.survey_date || '').slice(0,10);
@@ -1185,7 +1189,7 @@ function surveyDays(sv){
   const out = [];
   const d0 = new Date(a+'T00:00:00'), d1 = new Date((b<a?a:b)+'T00:00:00');
   if(isNaN(d0) || isNaN(d1)) return a ? [a] : [];
-  for(let d=new Date(d0); d<=d1 && out.length<62; d.setDate(d.getDate()+1)){
+  for(let d=new Date(d0); d<=d1 && out.length<=SURVEY_MAX_DAYS; d.setDate(d.getDate()+1)){
     out.push(dateValue(d));
   }
   return out.length ? out : [a];
@@ -1199,9 +1203,14 @@ function surveyPeriodText(sv){
   return `${days[0]} 〜 ${days[days.length-1]}（${days.length}日）`;
 }
 /* その箇所の日付。入っていなければ調査の開始日 */
+/* その箇所の日付。
+   1日だけの調査や、期間の外の日付が残っているときは、調査のはじめの日を使う */
 function stationDate(st, sv){
+  const base = String(sv && sv.survey_date || '').slice(0,10);
   const d = String(st && st.survey_date || '').slice(0,10);
-  return d || String(sv && sv.survey_date || '').slice(0,10);
+  if(!d) return base;
+  const days = surveyDays(sv);
+  return days.indexOf(d) >= 0 ? d : base;
 }
 
 function seasonOf(dateStr){
@@ -1319,33 +1328,50 @@ function effortRunning(st){ return !!(st && st.effort_started_at); }
    だから既定は「始点から終点までの直線」。軌跡も残して、後から確かめられるようにする */
 function stationLengths(st){
   const track = (st.track||[]).filter(validPt);
-  const trackLen = pathLength(track);
-  let straight = '';
-  const a = track.length ? track[0] : null;
-  const b = track.length ? track[track.length-1] : null;
-  if(a && b) straight = distMeters(a, b);
+  // 2点未満では長さを測りようがない。0mと言わずに空欄にする。
+  // 空欄を0にすると、歩いていないのに「距離0m」がCSVに出る
+  const has = track.length >= 2;
+  const trackLen = has ? pathLength(track) : '';
+  const straight = has ? distMeters(track[0], track[track.length-1]) : '';
   const manual = numOf(st.length_m_manual);
-  const used = manual!=='' ? manual : (straight!=='' && straight>0 ? straight : trackLen);
+  const used = manual!=='' ? manual
+             : (straight!=='' && straight>0 ? straight
+             : (trackLen!=='' ? trackLen : ''));
   return {track:trackLen, straight, manual, used};
 }
 function stationAreas(st){
   const L = stationLengths(st).used;
   const w = numOf(st.width_m);
-  const calc = (w==='' || !isFinite(L)) ? '' : L * w;
+  const calc = (w==='' || L==='' || !isFinite(L)) ? '' : L * w;
   const manual = numOf(st.area_m2_manual);
   const used = manual!=='' ? manual : calc;
   return {calc, manual, used};
 }
 /* 調査ぜんぶの合計。箇所の「使う値」を足す */
+/* 種数。尾数0の記録は数えない。
+   種を選んだだけで戻ったときに空の記録が残るので、
+   数えると箇所CSVと調査CSVの種数が食い違う（2026-08-17 の監査 Major） */
+function speciesCount(catches, inds){
+  const set = new Set();
+  (catches||[]).forEach(c=>{
+    if(!c || (!c.species_id && !c.species_name)) return;
+    if(catchTotal(c, inds) <= 0) return;
+    set.add(c.species_id || c.species_name);
+  });
+  return set.size;
+}
 function surveyLengths(sv){
-  const auto = DB.stationsOf(sv.uuid)
-    .reduce((a,st)=>{ const v=stationLengths(st).used; return a + (isFinite(v)?v:0); }, 0);
+  // 1つも測っていなければ空欄。0を返すと「調べたが0m」に見える
+  const vals = DB.stationsOf(sv.uuid)
+    .map(st=>stationLengths(st).used).filter(v=>v!=='' && isFinite(v));
+  const auto = vals.length ? vals.reduce((a,b)=>a+b, 0) : '';
   const manual = numOf(sv.survey_length_m_manual);
   return {auto, manual, used: manual!=='' ? manual : auto};
 }
 function surveyAreas(sv){
-  const auto = DB.stationsOf(sv.uuid)
-    .reduce((a,st)=>{ const v=stationAreas(st).used; return a + (v===''||!isFinite(v)?0:v); }, 0);
+  const vals = DB.stationsOf(sv.uuid)
+    .map(st=>stationAreas(st).used).filter(v=>v!=='' && isFinite(v));
+  const auto = vals.length ? vals.reduce((a,b)=>a+b, 0) : '';
   const manual = numOf(sv.survey_area_m2_manual);
   return {auto, manual, used: manual!=='' ? manual : auto};
 }
@@ -1362,13 +1388,23 @@ function cpue(st){
 
 /* ---- 歩いた道すじを記録する ---- */
 let TRACK_SAVED_AT = 0;
+/* いま軌跡を記録してよい箇所を返す。1つに決まらなければ null。
+   「最初に見つかった調査中の調査」を使うと、去年の調査を終え忘れていたとき、
+   いまの位置がそちらへ黙って入って距離・面積・CPUEを壊す（2026-08-17 の監査 Critical） */
+function trackTarget(){
+  const cand = DB.surveys().filter(sv=>
+    sv.status==='調査中' && isLiveNow(sv) && !isDetail(sv));
+  if(cand.length!==1) return null;         // 0件でも2件以上でも、当て推量しない
+  const sts = DB.stationsOf(cand[0].uuid).filter(x=>!x.ended_at);
+  if(sts.length!==1) return null;
+  return {sv:cand[0], st:sts[0]};
+}
 function trackTick(fix){
-  if(!fix || !window.WRITE_OK) return;
+  if(!fix || !ownsLock()) return;
   if(fix.acc > GPS_MAX_ACC) return;        // 粗すぎる位置は使わない
-  const sv = DB.surveys().find(x=>x.status==='調査中');
-  if(!sv) return;
-  const st = DB.stationsOf(sv.uuid).find(x=>!x.ended_at);
-  if(!st) return;
+  const t = trackTarget();
+  if(!t) return;
+  const st = t.st;
   const pt = [fix.lat, fix.lon];
   if(!validPt(pt)) return;
   const track = (st.track||[]).filter(validPt);
@@ -1415,6 +1451,44 @@ function draftBind(key, get, base){
   try{ DRAFT_BASE = JSON.stringify(base!==undefined ? base : get()); }
   catch(e){ DRAFT_BASE=null; }
 }
+/* 決まった入力欄をまとめて集める／戻す。
+   新しく足した画面（労力・環境・地点）は書きかけを持っていなかったので、
+   測点を1点足しただけで、まだ保存していない入力が消えていた
+   （2026-08-17 の監査 Major） */
+function collectSels(sels){
+  const o = {};
+  sels.forEach(sel=>{ const el=$(sel); o[sel] = el ? String(el.value) : ''; });
+  return o;
+}
+function applySels(o){
+  if(!o) return;
+  Object.keys(o).forEach(sel=>{
+    if(sel.charAt(0)!=='#') return;
+    const el=$(sel); if(el && o[sel]!==undefined && o[sel]!==null) el.value = o[sel];
+  });
+}
+/* 労力（箇所ハブ）の入力欄 */
+function effortSels(){ return ['#e_passes','#e_width','#e_len','#e_area']; }
+function collectEffort(){ return collectSels(effortSels()); }
+/* 川の環境の入力欄 */
+function envSels(){
+  const sels = ['#e_drep','#e_vrep','#p_d','#p_v','#p_note'];
+  OPT.substrate.forEach(k=>sels.push('#sp_'+SUBSTRATE_NO[k]));
+  ['left','right'].forEach(side=>{
+    [0,1,2].forEach(i=>{ sels.push('#cv_'+side+'_'+i+'_t'); sels.push('#cv_'+side+'_'+i); });
+    sels.push('#cv_'+side+'_len');
+  });
+  return sels;
+}
+function collectEnv(){
+  const o = collectSels(envSels());
+  o.__sub = segVal('p_sub');
+  return o;
+}
+/* 地点の登録 */
+function siteSels(){ return ['#si_river','#si_name','#si_lat','#si_lon','#si_r','#si_memo']; }
+function collectSite(){ return collectSels(siteSels()); }
+
 function draftUnbind(){ DRAFT_KEY=null; DRAFT_GET=null; DRAFT_BASE=null; }
 function draftTouch(){
   if(!DRAFT_KEY || !DRAFT_GET) return;
@@ -1712,7 +1786,13 @@ function fitRiver(map, name, msgSel){
   });
 }
 /* 過去の調査地点を地図に出す（薄い青の丸） */
+/* 過去の調査地点。河川名を変えるたびに呼ぶので、
+   前に描いたものを必ず片付ける。片付けないと、前の川の点が重なって残る
+   （2026-08-17 の監査 Minor） */
+let PAST_LAYER = [];
 function drawPastSites(map, name){
+  try{ PAST_LAYER.forEach(x=>map.removeLayer(x)); }catch(e){}
+  PAST_LAYER = [];
   const out = [];
   pastSitesOf(name).forEach(s=>{
     const m = L.circleMarker([s.y, s.x], {radius:4, color:'#4aa3ff', weight:1,
@@ -1720,6 +1800,7 @@ function drawPastSites(map, name){
     m.bindPopup(`過去の調査地点<br><b>${esc(s.s)}</b>`);
     out.push(m);
   });
+  PAST_LAYER = out;
   return out;
 }
 
@@ -1911,6 +1992,10 @@ function cmToM(v){ const n=numOf(v); return n==='' ? '' : (n/100); }
    魚類データベース app/pages/4_資料管理.py の _HABITAT_KEY と同じ並び */
 const FS_HABITAT_KEY = ['環境区分','河川形態B','水温','水深','流速','流量',
   '河床材料','礫の状況','調査区分','調査方法','開始時刻','終了時刻'];
+/* 取り込み側が「同じ調査」とみなす手がかり。
+   魚類データベース app/pages/4_資料管理.py の _EVENT_KEY と同じ並び */
+const FS_EVENT_KEY = ['業務番号','業務名','河川名','地点名','区間名',
+  '調査日','季節','天気','緯度','経度','河川形態A'];
 
 /* データベース取り込み用の行を組み立てる。
    1行 = 1種の結果。落とすものは黙って落とさず、理由と件数を返す */
@@ -1971,13 +2056,27 @@ function buildDbRows(sv){
     });
   });
   // 別々の箇所が1つにまとめられてしまう組み合わせを探す。
-  // 実際に書き出す文字で見る（画面の値ではなく、CSVに載る形で比べる）
+  // 実際に書き出す文字で見る（画面の値ではなく、CSVに載る形で比べる）。
+  // 調査そのものが分かれていれば（日付や地点名が違えば）まとまらないので、
+  // 調査の手がかりも一緒に見る
   const seen = {};
   stations.forEach(st=>{
     const src = dbRowOf(sv, st, null, snap);
-    const k = FS_HABITAT_KEY.map(c=>String(src[c]==null?'':src[c])).join('');
-    if(seen[k]) warnings.push(`${seen[k]} と ${st.name} は、取り込み側で1つの箇所にまとめられます`);
-    else seen[k] = st.name;
+    const k = FS_EVENT_KEY.concat(FS_HABITAT_KEY)
+      .map(c=>String(src[c]==null?'':src[c])).join(String.fromCharCode(1));
+    const hasFish = snap.ca.some(c=>c.station_uuid===st.uuid
+      && c.species_id && catchTotal(c, snap)>0);
+    if(seen[k]){
+      const msg = `${seen[k].name} と ${st.name} は、取り込み側で1つの箇所にまとめられます`;
+      // どちらにも魚が入っているなら、まとまると記録が混ざる。書き出しを止める
+      if(hasFish && seen[k].hasFish){
+        blocked.push(msg + '。日付・時刻・環境のどれかを変えてください');
+      }else{
+        warnings.push(msg);
+      }
+    }else{
+      seen[k] = {name:st.name, hasFish};
+    }
   });
 
   return {rows, excluded, blocked, warnings};
@@ -2112,7 +2211,7 @@ function buildStationRows(sv, snap){
       '距離_手入力m': len.manual, '距離_使う値m': round1(len.used),
       '面積_計算m2': round1(area.calc), '面積_手入力m2': area.manual,
       '面積_使う値m2': round1(area.used),
-      '種数': cs.length, '尾数': n,
+      '種数': speciesCount(cs, snap), '尾数': n,
       '100秒あたり尾数': round1(cp.per100s), '100m2あたり尾数': round1(cp.per100m2),
       'メモ':st.memo||'', '調査ID':sv.uuid, '箇所ID':st.uuid,
     };
@@ -2120,15 +2219,33 @@ function buildStationRows(sv, snap){
 }
 
 /* 調査ぜんぶ（1行） */
+/* 調査CSVは、日ごとに1行にする。
+   31列CSVは箇所の日付で調査が分かれるので、期間全体を1行にまとめると
+   件数も日別の集計も食い違う（2026-08-17 の監査 Major） */
 function buildSurveyRow(sv, snap){
-  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid);
+  const all = snap.st.filter(x=>x.survey_uuid===sv.uuid);
+  // 実際に箇所がある日だけ出す。箇所が1つも無ければ、はじめの日で1行
+  const days = Array.from(new Set(all.map(st=>stationDate(st, sv)))).sort();
+  const list = days.length ? days : [String(sv.survey_date||'').slice(0,10)];
+  return list.map(day=>surveyRowOfDay(sv, snap, day, all));
+}
+function surveyRowOfDay(sv, snap, day, all){
+  const stations = all.filter(st=>stationDate(st, sv)===day);
   const ids = new Set(stations.map(x=>x.uuid));
   const cs = snap.ca.filter(c=>ids.has(c.station_uuid));
   const n = cs.reduce((a,c)=>a+catchTotal(c, snap), 0);
   const measured = cs.reduce((a,c)=>a+indsOf(snap, c.uuid).length, 0);
-  const len = surveyLengths(sv), area = surveyAreas(sv);
-  return [{
-    '調査日':sv.survey_date||'', '終了日':sv.survey_date_end||'',
+  // 距離・面積はその日の箇所だけを足す
+  const dayLen = stations.map(st=>stationLengths(st).used).filter(v=>v!=='' && isFinite(v));
+  const dayArea = stations.map(st=>stationAreas(st).used).filter(v=>v!=='' && isFinite(v));
+  const oneDay = surveyDays(sv).length <= 1;
+  const len = oneDay ? surveyLengths(sv)
+    : {auto: dayLen.length ? dayLen.reduce((a,b)=>a+b,0) : '', manual:'', used:''};
+  const area = oneDay ? surveyAreas(sv)
+    : {auto: dayArea.length ? dayArea.reduce((a,b)=>a+b,0) : '', manual:'', used:''};
+  if(!oneDay){ len.used = len.auto; area.used = area.auto; }
+  return {
+    '調査日': day||'', '終了日':sv.survey_date_end||'',
     '日数': surveyDays(sv).length,
     '季節':sv.season||'', '天気':sv.weather||'',
     '河川名':sv.river_name||'', '地点名':sv.site_name||'', '区間名':sv.section_name||'',
@@ -2138,7 +2255,7 @@ function buildSurveyRow(sv, snap){
     '調査者':sv.investigator||'',
     '業務番号':sv.project_number||'', '業務名':sv.project_name||'',
     '箇所数': stations.length,
-    '種数': new Set(cs.map(c=>c.species_id||c.species_name)).size,
+    '種数': speciesCount(cs, snap),
     '尾数': n, '測った尾数': measured,
     '通電秒数_合計': Math.round(stations.reduce((a,st)=>a+effortSeconds(st), 0)),
     '距離_合計m': round1(len.auto), '距離_手入力m': len.manual, '距離_使う値m': round1(len.used),
@@ -2147,7 +2264,20 @@ function buildSurveyRow(sv, snap){
     '開始': sv.started_at ? fmtTime(sv.started_at) : '',
     '終了': sv.finished_at ? fmtTime(sv.finished_at) : '',
     'メモ':sv.memo||'', '調査ID':sv.uuid,
-  }];
+  };
+}
+/* 数の範囲を見る。おかしいものがあれば、その説明を返す。無ければ空文字。
+   負の距離や100%を超える割合が入ると、面積・CPUE・河床材の割合が
+   静かに壊れる（2026-08-17 の監査 Major） */
+function rangeCheck(list){
+  for(const it of list){
+    const label = it[0], v = it[1], lo = it[2], hi = it[3];
+    if(v==='' || v===null || v===undefined) continue;
+    const n = numOf(v);
+    if(n==='' || !isFinite(n)) return `${label}は数で入れてください`;
+    if(n < lo || n > hi) return `${label}は ${lo}〜${hi} の間で入れてください（いま ${n}）`;
+  }
+  return '';
 }
 function round1(v){
   const n = numOf(v);
@@ -2206,7 +2336,7 @@ SCREENS.home = ()=>{
   const list = DB.surveys();
   const cards = list.map(s=>{
     const nSt = DB.stationsOf(s.uuid).length;
-    const nSp = new Set(DB.catchesOfSurvey(s.uuid).map(c=>c.species_id||c.species_name)).size;
+    const nSp = speciesCount(DB.catchesOfSurvey(s.uuid), null);
     const cls = s.status==='調査中' ? 'ok' : (s.status==='終了' ? '' : 'warn');
     return `<div class="card tap" onclick="nav('survey','${s.uuid}')">
       <div class="row">
@@ -2492,11 +2622,41 @@ function grabPos(){
 function saveSurvey(svUuid){
   const rec = svUuid ? (DB.get(DB.key.sv, svUuid)||{uuid:svUuid}) : {uuid:uuid(), status:'未開始'};
   const f = collectSurvey();
+  // 一般と詳細では、箇所（地点）の意味も見せ方もCSVも変わる。
+  // 作ったあとに切り替えると、既存の箇所の意味が黙って変わる（2026-08-17 の監査 Major）
+  if(svUuid && rec.detail_level && f.detail_level && rec.detail_level!==f.detail_level
+     && DB.stationsOf(svUuid).length){
+    toast(`すでに${DB.stationsOf(svUuid).length}件つくってあるので、記録のしかたは変えられません。`
+      + '変えるには、新しい調査を作ってください', 8000);
+    return;
+  }
   rec.survey_date        = f.survey_date;
   rec.survey_date_end    = f.survey_date_end;
   if(rec.survey_date_end && rec.survey_date_end < rec.survey_date){
     toast('終わりの日が、はじめの日より前になっています'); return;
   }
+  if(surveyDays(rec).length > SURVEY_MAX_DAYS){
+    toast(`期間が長すぎます（${SURVEY_MAX_DAYS}日まで）。調査を分けてください`, 6000);
+    return;
+  }
+  // 期間を縮めたとき、期間の外になる箇所が無いか見る。
+  // 黙って直すと、いつ取ったかが変わってしまう
+  if(svUuid){
+    const days = surveyDays(rec);
+    const out = DB.stationsOf(svUuid).filter(st=>{
+      const d = String(st.survey_date||'').slice(0,10);
+      return d && days.indexOf(d)<0;
+    });
+    if(out.length){
+      toast(`期間の外になる箇所があります：${out.map(x=>x.name).join('・')}。`
+        + '先にその箇所の日付を直してください', 8000);
+      return;
+    }
+  }
+  const rerr = rangeCheck([['緯度', f.latitude, 20, 50], ['経度', f.longitude, 120, 155],
+    ['調査距離（手入力）', f.survey_length_m_manual, 0, 1000000],
+    ['調査面積（手入力）', f.survey_area_m2_manual, 0, 100000000]]);
+  if(rerr){ toast(rerr, 6000); return; }
   rec.season             = f.season;
   rec.weather            = f.weather;
   rec.river_name         = f.river_name;
@@ -2619,6 +2779,18 @@ function startSurvey(u){
 }
 function endSurvey(u){
   const sv = DB.get(DB.key.sv, u); if(!sv) return;
+  // 通電を押しっぱなしのまま終えると、そのあとも秒数が増え続けて
+  // 単位努力量あたりの尾数が狂う（2026-08-17 の監査 Major）
+  const running = DB.stationsOf(u).filter(effortRunning);
+  for(const st of running){
+    st.effort_seconds = Math.round(effortSeconds(st));
+    delete st.effort_started_at;
+    if(!DB.upsert(DB.key.st, st)){
+      toast(`${st.name} の通電を止められませんでした。調査を終えていません`, 8000);
+      return;                    // 半端な状態で終えない
+    }
+  }
+  if(running.length) toast(`${running.length}件の通電を止めました`);
   sv.status='終了'; sv.finished_at = nowISO();
   if(DB.upsert(DB.key.sv, sv)){ stopGps(); toast('調査を終えました'); render(); }
 }
@@ -2830,6 +3002,10 @@ function saveStation(svUuid, stUuid){
   rec.habitat_type      = f.habitat_type;
   rec.survey_type       = f.survey_type || '採取';
   rec.survey_method     = f.survey_method;
+  const serr = rangeCheck([['水温', f.water_temp, -5, 45],
+    ['代表の水深', f.depth_rep_cm, 0, 2000], ['代表の流速', f.velocity_rep_cms, 0, 1000],
+    ['緯度', f.latitude, 20, 50], ['経度', f.longitude, 120, 155]]);
+  if(serr){ toast(serr, 6000); return; }
   rec.water_temp        = numOf(f.water_temp);
   rec.substrate1        = f.substrate1;
   rec.gravel_condition  = f.gravel_condition;
@@ -3014,6 +3190,11 @@ SCREENS.station = (stUuid)=>{
     `,
     onMount(){
       startGps();
+      const dkey = 'effort:'+stUuid;
+      const dbase = collectEffort();
+      const dd = draftGet(dkey);
+      if(dd){ applySels(dd); toast('労力の書きかけを戻しました'); }
+      draftBind(dkey, collectEffort, dbase);
       if(effortRunning(st)){
         const el = $('#effClock');
         EFFORT_TIMER = setInterval(()=>{
@@ -3042,11 +3223,20 @@ function saveEffort(stUuid){
   const st = DB.liveStation(stUuid); if(!st) return;
   const passes = strVal('#e_passes');
   if(countOf(passes)===null){ toast('流した回数は0以上の整数で入れてください'); return; }
+  const err = rangeCheck([
+    ['流した回数', passes, 0, 999],
+    ['平均の川幅', strVal('#e_width'), 0, 2000],
+    ['区間の長さ', strVal('#e_len'), 0, 100000],
+    ['面積', strVal('#e_area'), 0, 10000000]]);
+  if(err){ toast(err, 6000); return; }
   st.effort_passes    = countOf(passes);
   st.width_m          = numVal('#e_width');
   st.length_m_manual  = numVal('#e_len');
   st.area_m2_manual   = numVal('#e_area');
-  if(DB.upsert(DB.key.st, st)){ toast('保存しました'); render(); }
+  if(DB.upsert(DB.key.st, st)){
+    draftClear('effort:'+stUuid);
+    toast('保存しました'); render();
+  }
 }
 function endStation(u){
   const st = DB.get(DB.key.st, u); if(!st) return;
@@ -3379,6 +3569,15 @@ SCREENS.env = (stUuid)=>{
     `,
     onMount(){
       startGps();                       // 測点に位置を添えるため
+      const dkey = 'env:'+stUuid;
+      const dbase = collectEnv();
+      const dd = draftGet(dkey);
+      if(dd){
+        applySels(dd);
+        applySeg('p_sub', dd.__sub);
+        toast('環境の書きかけを戻しました');
+      }
+      draftBind(dkey, collectEnv, dbase);
       const el=$('#p_d'); if(el) el.focus();
       const box = $('#gpsNow');
       if(box) ENV_GPS_TIMER = setInterval(()=>{
@@ -3401,8 +3600,9 @@ function addEnvPoint(stUuid){
   const st = DB.liveStation(stUuid); if(!st) return;
   const d = numVal('#p_d'), v = numVal('#p_v');
   if(d==='' && v===''){ toast('水深か流速のどちらかは入れてください'); return; }
-  if(d!=='' && d<0){ toast('水深は0以上で入れてください'); return; }
-  if(v!=='' && v<0){ toast('流速は0以上で入れてください'); return; }
+  const perr = rangeCheck([['水深', strVal('#p_d'), 0, 2000],
+                           ['流速', strVal('#p_v'), 0, 1000]]);
+  if(perr){ toast(perr, 6000); return; }
 
   const pt = {depth_cm:d, velocity_cms:v, substrate:segVal('p_sub'), note:strVal('#p_note')};
   // いま立っている場所を添える。
@@ -3422,6 +3622,12 @@ function addEnvPoint(stUuid){
   pts.push(pt);
   st.env_points = pts;
   if(!DB.upsert(DB.key.st, st)) return;      // 保存できていないので欄も消さない
+  // 測点の欄だけを空にして控え直す。そのまま render() すると、
+  // まだ保存していない代表値やカバーの入力まで消える
+  const dft = draftGet('env:'+stUuid) || {};
+  ['#p_d','#p_v','#p_note'].forEach(k=>{ dft[k] = ''; });
+  dft.__sub = '';
+  draftSave('env:'+stUuid, dft);
   toast(`${pts.length}点目${posMsg}`, posMsg?4000:2400);
   render();
 }
@@ -3436,6 +3642,16 @@ function delEnvPoint(stUuid, i){
 }
 function saveEnv(stUuid){
   const st = DB.liveStation(stUuid); if(!st) return;
+  const checks = [['代表の水深', strVal('#e_drep'), 0, 2000],
+                  ['代表の流速', strVal('#e_vrep'), 0, 1000]];
+  OPT.substrate.forEach(k=>checks.push([k+'の割合', strVal('#sp_'+SUBSTRATE_NO[k]), 0, 100]));
+  ['left','right'].forEach(side=>{
+    const label = side==='left' ? '左岸' : '右岸';
+    [0,1,2].forEach(i=>checks.push([label+'のカバーの割合', strVal('#cv_'+side+'_'+i), 0, 100]));
+    checks.push([label+'のカバーの長さ', strVal('#cv_'+side+'_len'), 0, 100000]);
+  });
+  const err = rangeCheck(checks);
+  if(err){ toast(err, 6000); return; }
   st.depth_rep_cm     = numVal('#e_drep');
   st.velocity_rep_cms = numVal('#e_vrep');
 
@@ -3460,7 +3676,10 @@ function saveEnv(stUuid){
     st['cover_'+side+'_length_m'] = numVal('#cv_'+side+'_len');
   });
 
-  if(DB.upsert(DB.key.st, st)){ toast('保存しました'); goBack(); }
+  if(DB.upsert(DB.key.st, st)){
+    draftClear('env:'+stUuid);
+    toast('保存しました'); goBack();
+  }
 }
 
 /* ---------- 地点（河川ごとに登録して使い回す） ---------- */
@@ -3541,8 +3760,13 @@ SCREENS.siteEdit = (arg)=>{
     `,
     onMount(){
       startGps();
-      const c = (numOf(si.latitude)!=='' && numOf(si.longitude)!=='')
-        ? [+si.latitude, +si.longitude] : [43.06, 141.35];
+      const dkey = 'site:'+(si.uuid||'new');
+      const dbase = collectSite();
+      const dd = draftGet(dkey);
+      if(dd){ applySels(dd); toast('書きかけを戻しました'); }
+      draftBind(dkey, collectSite, dbase);
+      const c = (numVal('#si_lat')!=='' && numVal('#si_lon')!=='')
+        ? [numVal('#si_lat'), numVal('#si_lon')] : [43.06, 141.35];
       MAPS.main.map = makeMap('sitemap', c, numOf(si.latitude)!=='' ? 15 : 9);
       const map = MAPS.main.map;
       if(!map) return;
@@ -3606,6 +3830,10 @@ function saveSite(uu){
   rec.longitude  = numVal('#si_lon');
   rec.radius_m   = numVal('#si_r') || 100;
   rec.memo       = strVal('#si_memo');
+  const serr = rangeCheck([['緯度', strVal('#si_lat'), 20, 50],
+                           ['経度', strVal('#si_lon'), 120, 155],
+                           ['まわりの広さ', strVal('#si_r'), 1, 100000]]);
+  if(serr){ toast(serr, 6000); return; }
   if(!rec.river_name){ toast('河川名を入れてください'); return; }
   if(!rec.name){ toast('地点名を入れてください'); return; }
   if(rec.latitude==='' || rec.longitude===''){
@@ -3613,6 +3841,7 @@ function saveSite(uu){
     return;
   }
   if(!DB.upsert(DB.key.si, rec)) return;
+  draftClear('site:'+(uu||'new'));
   toast('登録しました');
   goBack();
 }
@@ -3721,7 +3950,8 @@ SCREENS.individuals = (caUuid)=>{
         <div class="dim small">全長を打って「つぎ」。これを繰り返してから、まとめて追加します。
           尾叉長は入りません（必要なときは、上の1尾ずつの欄で入れてください）。</div>
         <textarea id="i_bulk" inputmode="decimal" style="min-height:96px"
-          placeholder="8.2 9.1 7.6" oninput="bulkHint()"></textarea>
+          placeholder="8.2 9.1 7.6"
+          oninput="bulkKeep('${caUuid}');bulkHint()"></textarea>
         <div class="btn2">
           <button class="btn ok" onclick="bulkSep()">つぎ</button>
           <button class="btn" onclick="bulkUndo()">1つ消す</button>
@@ -3750,7 +3980,11 @@ SCREENS.individuals = (caUuid)=>{
 
       <button class="btn" onclick="goBack()">測り終える</button>
     `,
-    onMount(){ const el=$('#i_tl'); if(el) el.focus(); bulkHint(); }
+    onMount(){
+      const el=$('#i_tl'); if(el) el.focus();
+      bulkRestore(caUuid);      // 画面を描き直しても、打ち込み途中の並びを残す
+      bulkHint();
+    }
   };
 };
 
@@ -3787,12 +4021,28 @@ function bulkHint(){
       ? `${r.ok.length}尾をまとめて追加` : 'まとめて追加';
   }
 }
+/* 打ち込み途中の並びを覚えておく。画面が描き直されても消えないように */
+let BULK_TEXT = {};
+function bulkKeep(caUuid){
+  const box = $('#i_bulk');
+  if(box) BULK_TEXT[caUuid] = String(box.value);
+}
+function bulkRestore(caUuid){
+  const box = $('#i_bulk');
+  if(box && BULK_TEXT[caUuid]) box.value = BULK_TEXT[caUuid];
+}
+/* いま開いている記録に対して覚え直す */
+function bulkKeepAll(){
+  const cur = STACK[STACK.length-1];
+  if(cur && cur.name==='individuals' && cur.arg) bulkKeep(cur.arg);
+}
 /* 区切りを入れる。テンキーには空白キーが無いので、画面のボタンで区切る */
 function bulkSep(){
   const box = $('#i_bulk'); if(!box) return;
   const v = String(box.value);
   if(v.trim()!=='' && !/[\s,、，;；\/]$/.test(v)) box.value = v + ' ';
   box.focus();
+  bulkKeepAll();
   bulkHint();
 }
 /* 打ち間違いを1つ戻す。テンキーだと文字を選んで直しにくいため */
@@ -3802,6 +4052,7 @@ function bulkUndo(){
   t.pop();
   box.value = t.length ? t.join(' ') + ' ' : '';
   box.focus();
+  bulkKeepAll();
   bulkHint();
 }
 
@@ -3830,6 +4081,7 @@ function addIndividualsBulk(caUuid){
       recorded_at:at, created_at:at, updated_at:at});
   });
   if(!DB.save(DB.key.ind, all)) return;      // 保存できていないので欄も消さない
+  delete BULK_TEXT[caUuid];                  // 入れ終わったので覚えておかない
   toast(`${r.ok.length}尾を追加しました`);
   render();
 }
@@ -4458,6 +4710,21 @@ function forceUpdate(){
     + '・圏外用に落とした地図もそのまま残ります\n'
     + '・電波の届くところで行ってください\n\nよろしいですか？')) return;
 
+  // 先に取れるか確かめる。取れないまま消すと、圏外では二度と開けなくなる
+  toast('新しい版があるか調べています…', 8000);
+  checkLatestVersion().then(latest=>{
+    if(latest === APP_VERSION
+       && !confirm(`いま入っている ${APP_VERSION} が最新です。\nそれでも読み込み直しますか？`)){
+      toast('やめました');
+      return;
+    }
+    doForceUpdate();
+  }).catch(e=>{
+    toast('新しい版を取りに行けませんでした：' + e.message
+      + '。電波の届くところでお試しください（何も消していません）', 9000);
+  });
+}
+function doForceUpdate(){
   toast('最新に読み込み直しています…', 8000);
   const reload = ()=>location.reload();
   const tasks = [];
