@@ -125,7 +125,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v24';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v25';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1585,7 +1585,11 @@ function envCatColor(list, v){
 /* 数の大小を色にする。青（小）→黄→赤（大） */
 function envRampColor(v, lo, hi){
   const n = numOf(v);
-  if(n==='' || !(hi > lo)) return '#8b949e';
+  if(n==='') return '#8b949e';          // 未記入だけを灰色にする
+  // 入力が1件だけ、または全部同じ値のときは、幅が無い。
+  // ここで灰色を返すと、入れてあるのに「未記入」に見える
+  // （2026-08-18 の9回目の監査 Major）
+  if(!(hi > lo)) return 'rgb(63,185,80)';
   const t = Math.max(0, Math.min(1, (n - lo) / (hi - lo)));
   const stops = [[74,163,255],[63,185,80],[210,153,34],[240,136,62],[248,81,73]];
   const x = t * (stops.length - 1);
@@ -1629,10 +1633,12 @@ function envLegendHtml(svUuid){
       const why = n===0 ? 'まだ入っていないので、色は分かれません'
                 : n===1 ? '値が1つだけなので、色は分かれません'
                         : 'どれも同じ値なので、色は分かれません';
-      return wrap(`<div class="dim small">${esc(by)}：${why}
-        <span style="display:inline-flex;align-items:center;gap:4px;margin-left:8px">
-        <span style="width:12px;height:12px;border-radius:6px;background:#8b949e;
-        display:inline-block"></span>未記入</span></div>`);
+      // 入っている分は同じ色で出る。その色も凡例に出さないと、
+      // 地図の色が何を指すのか分からない（2026-08-18 の10回目の監査 Major）
+      const 同値 = n===0 ? '' : chip(envRampColor(lo, lo, hi),
+        fmtNum(cmToMDisp(lo),3)+(by==='流速'?' m/s':' m'));
+      return wrap(`<div class="dim small">${esc(by)}：${why}　${同値}`
+        + chip('#8b949e','未記入') + '</div>');
     }
     return wrap(`<div class="dim small">${esc(by)}　`
       + [0,0.25,0.5,0.75,1].map(t=>{
@@ -1685,7 +1691,8 @@ function envAllPoints(svUuid){
       if(a) pts.push(a);
       if(b) pts.push(b);
     }else{
-      if(numOf(st.latitude)!=='') pts.push([+st.latitude, +st.longitude]);
+      const p = stationPt(st);
+      if(p) pts.push(p);
     }
   });
   return pts;
@@ -1705,6 +1712,20 @@ function envPendingLine(svUuid){
   const list = DB.stationsOf(svUuid).filter(st=>isLine(st)
     && linePt(st,'start') && !linePt(st,'end'));
   return list.length ? list[list.length-1] : null;
+}
+/* 箇所の通し番号。
+   生きている件数＋1で決めると、消したあとや、手で大きい番号を付けたときに
+   番号がぶつかる。消したものも含めた「いちばん大きい番号＋1」にする
+   （2026-08-18 の監査 Major） */
+function nextStationNo(svUuid, all){
+  const list = (all || DB.load(DB.key.st)).filter(x=>x && x.survey_uuid===svUuid);
+  const max = list.reduce((m,x)=>{
+    const n = countOf(x.station_no);
+    return (n===null || n==='') ? m : Math.max(m, n);
+  }, 0);
+  // これ以上は、数として正しく数えられない。黙って同じ番号を出し続けない
+  if(max >= Number.MAX_SAFE_INTEGER) return null;
+  return max + 1;
 }
 /* P1 / L1 の採番。種類ごとに数える */
 function envAutoName(svUuid, kind){
@@ -1811,8 +1832,7 @@ function envAddAt(svUuid, lat, lon, acc){
     const つなぐ = envChain() && ENV_NEXT.auto;
     const nx = つなぐ ? {
       uuid: uuid(), survey_uuid: svUuid,
-      // まだ保存していないので、いまの件数＋1でよい（+2 にすると番号がぶつかる）
-      station_no: DB.stationsOf(svUuid).length + 1,
+      station_no: 0,          // すぐ下で、いま読んだ一覧から決め直す
       started_at: nowISO(), env_points: [],
       survey_time_start: now,
       survey_type: sv.survey_type_default || '目視',
@@ -1830,7 +1850,14 @@ function envAddAt(svUuid, lat, lon, acc){
     if(i < 0){ toast('この区間が見つかりません'); return null; }
     st.updated_at = nowISO();
     all[i] = st;
-    if(nx){ nx.created_at = nowISO(); nx.updated_at = nx.created_at; all.push(nx); }
+    if(nx){
+      // 番号は、いま読んだ一覧から決める（別に数えると食い違う）
+      const nn = nextStationNo(svUuid, all);
+      if(nn===null){ toast('番号が大きすぎて、これ以上つなげません', 7000); return null; }
+      nx.station_no = nn;
+      nx.created_at = nowISO(); nx.updated_at = nx.created_at;
+      all.push(nx);
+    }
     if(!DB.save(DB.key.st, all)) return null;   // 保存できていないので、何も変えない
 
     envAdvance('LE');
@@ -1847,7 +1874,7 @@ function envAddAt(svUuid, lat, lon, acc){
 
   const rec = {
     uuid: uuid(), survey_uuid: svUuid,
-    station_no: DB.stationsOf(svUuid).length + 1,
+    station_no: 0,
     started_at: nowISO(), env_points: [],
     survey_time_start: now,
     survey_type: sv.survey_type_default || '目視',
@@ -1867,6 +1894,9 @@ function envAddAt(svUuid, lat, lon, acc){
     rec.survey_time_end = now;      // 点は幅を持たない
     rec.ended_at = nowISO();
   }
+  const no2 = nextStationNo(svUuid);
+  if(no2===null){ toast('番号が大きすぎて、これ以上置けません', 7000); return null; }
+  rec.station_no = no2;
   if(!DB.upsert(DB.key.st, rec)) return null;
   envAdvance(k, rec.uuid);
   // 置いたものをそのまま選ぶ。選ばないと、前の記録の入力欄が出たままになり、
@@ -1876,6 +1906,15 @@ function envAddAt(svUuid, lat, lon, acc){
   return rec.uuid;
 }
 
+/* その箇所の位置。緯度と経度がそろって、地球上の値のときだけ返す。
+   緯度だけで判ずると、経度が空の古い記録で [緯度, 0] を地図に渡してしまう
+   （2026-08-18 の3回目の監査 Minor） */
+function stationPt(st){
+  const la = numOf(st && st.latitude), lo = numOf(st && st.longitude);
+  if(la==='' || lo==='') return null;
+  const pt = [la, lo];
+  return validPt(pt) ? pt : null;
+}
 /* ラインの始点・終点。両方そろっていなければ距離は出さない */
 function linePt(st, which){
   const la = numOf(st && st['line_'+which+'_lat']);
@@ -1999,7 +2038,17 @@ function draftSave(key, obj){
   try{ localStorage.setItem('fs_draft_edit', JSON.stringify(a)); }catch(e){}
 }
 function draftGet(key){ return draftAll()[key] || null; }
-function draftClear(key){ draftSave(key, null); }
+function draftClear(key){
+  // 書きかけを捨てるときは、その中の写真の「付ける先」の印も外す。
+  // 残すと、捨てたはずの写真が開き直しで戻ってくる
+  try{
+    const d = draftGet(key);
+    if(d && d.photos && d.photos.length && typeof photoOwnerDone==='function'){
+      photoOwnerDone(d.photos);
+    }
+  }catch(e){}
+  draftSave(key, null);
+}
 
 /* 入力中の書きかけを控える。
    画面ごとに「どこから値を集めるか」を登録し、入力のたびに保存する。
@@ -2164,7 +2213,7 @@ let ENV_GPS_TIMER = null;
 function render(){
   // 物理環境の画面で打ちかけの分があれば、先に書いてしまう
   try{ if(typeof envFlush==='function') envFlush(); }catch(e){}
-  try{ ENV_FORM = ''; ENV_DIRTY = false; }catch(e){}
+  try{ ENV_FORM = ''; ENV_DIRTY = false; PHOTO_OWNER = ''; PHOTO_OWNER_SV = ''; }catch(e){}
   SCREEN_SEQ++;
   draftUnbind();
   closePhotoView();           // 大きく見ていた写真は、画面が変わったら閉じる
@@ -2425,13 +2474,18 @@ function meIcon(){
       ></div>`});
 }
 /* いまいる場所を描き直す。位置が取れていなければ、何も描かない */
-function drawMe(slot){
-  const sl = MAPS[slot || 'main'];
+/* いまいる場所を描き直す。
+   取ったばかりの位置があれば、それを使う（取り直すと、飛んだ先と印がずれる）。
+   どの地図に描くかも渡せるようにする（圏外用の地図にも出せるように）
+   （2026-08-18 の監査 Major） */
+function drawMe(slot, fix){
+  const key = slot || 'main';
+  const sl = MAPS[key];
   if(!sl || !sl.map) return false;
   const map = sl.map;
   try{ MEMARK.forEach(x=>map.removeLayer(x)); }catch(e){}
   MEMARK = [];
-  const f = freshFix(20000);
+  const f = fix || freshFix(20000);
   if(!f) return false;
   const pt = [f.lat, f.lon];
   if(!validPt(pt)) return false;
@@ -2465,7 +2519,7 @@ function addMapButton(map, label, title, onTap, pos){
 }
 
 /* 現在地ボタン。画像を使わない自前のコントロール */
-function addLocateControl(map){
+function addLocateControl(map, slot){
   const C = L.Control.extend({
     options:{position:'topleft'},
     onAdd(){
@@ -2480,7 +2534,7 @@ function addLocateControl(map){
           if(!f){ toast('いまいる場所を取れませんでした。空の見えるところでお試しください', 6000); return; }
           // 動かしている途中で画面を移ると、片付けと重なって落ちることがある
           map.setView([f.lat,f.lon], Math.max(map.getZoom(),16), {animate:false});
-          drawMe('main');
+          drawMe(slot || 'main', f);      // いま取れた位置で描く
           if(f.acc > GPS_MAX_ACC){
             toast(`いまの位置は ±${Math.round(f.acc)}m と粗いです`, 5000);
           }
@@ -2649,16 +2703,33 @@ function openMediaDB(){
   });
 }
 // 書き込みは tx.oncomplete まで待つ。ここで待たないと「保存したのに無い」が起きる
-function idbDo(mode, fn){
-  return openMediaDB().then(db=>new Promise((res,rej)=>{
-    const tx=db.transaction(MEDIA_STORE, mode);
+function idbRun(db, mode, fn){
+  // トランザクションを作るところは Promise の外に出す。
+  // 中に入れると、つながりが切れていても「作り損ね」が外へ伝わらず、
+  // 開き直しが動かないまま写真の読み書きが止まる（2026-08-18 の9回目の監査 Critical）
+  const tx=db.transaction(MEDIA_STORE, mode);
+  return new Promise((res,rej)=>{
     let out;
     const r=fn(tx.objectStore(MEDIA_STORE));
     if(r && r.onsuccess!==undefined) r.onsuccess=()=>{ out=r.result; };
     tx.oncomplete=()=>res(out);
     tx.onerror=()=>rej(tx.error);
     tx.onabort=()=>rej(tx.error);
-  }));
+  });
+}
+function idbDo(mode, fn){
+  // すでに開いているなら、待たずにその場で始める。
+  // 一度でも待つと、確かめてから実際に消すまでの間に、ほかの用事が割り込む
+  // （2026-08-18 の8回目の監査 Critical）
+  if(_mediaDB){
+    try{ return idbRun(_mediaDB, mode, fn); }
+    catch(e){
+      // つながりが切れていた。畳んでから開き直し、もう一度だけ試す
+      try{ _mediaDB.close(); }catch(e2){}
+      _mediaDB = null;
+    }
+  }
+  return openMediaDB().then(db=>idbRun(db, mode, fn));
 }
 const PhotoDB = {
   put(rec){ return idbDo('readwrite', st=>st.put(rec)); },
@@ -2682,27 +2753,150 @@ const PhotoDB = {
     let refs = photoRefs();
     if(!refs) return 0;              // 1つでも読めなければ何もしない（消しすぎ防止）
     let recs; try{ recs = await this.all(); }catch(e){ return 0; }
+    // まだ記録に付いていないが、付ける先が生きている写真は残す。
+    // 空き容量が尽きた場面では、ここだけが手がかりになる
+    let owners; try{ owners = livePhotoOwners(); }catch(e){ return 0; }
+    if(!owners) return 0;
+    // 記録に付いている写真のID（書きかけや画面の分は入れない）。
+    // 付いているのに印が残っていたら、ここで外す
+    let saved; try{ saved = savedPhotoIds(); }catch(e){ return 0; }
     const cut = Date.now() - PHOTO_GRACE_MS;
     let n=0;
     for(const r of recs){
       if(!r || !r.id) continue;
-      if(refs.has(r.id) || PHOTO_PENDING.has(r.id)) continue;
+      if(refs.has(r.id) || PHOTO_PENDING.has(r.id)){
+        // 記録に付いたのに印が残っている＝外し損ね。ここで後始末する。
+        // 残したままだと、あとで写真を外しても実体が消えない
+        // （2026-08-18 の5回目の監査 Major）
+        if(r.owner && saved.has(r.id)) photoOwnerDone([{id:r.id}]);
+        continue;
+      }
+      if(photoOwnerLiveIn(owners, r.owner, r.owner_sv)) continue;  // 付ける先が待っている
       const at = Date.parse(r.added_at||'');
       if(isFinite(at) && at > cut) continue;   // 入れたばかりのものは残す
+      // 対象を取り直してから、最後の確認をひととおり行う。
+      // 確かめたあとに待つと、その待っている間の変化を見落とす
+      // （2026-08-18 の6回目の監査 Critical）
+      let cur=null; try{ cur = await this.get(r.id); }catch(e){ continue; }
+      if(!cur) continue;                              // すでに無い
       if(!ownsLock()) return n;                // 途中で使用権を渡していたら止める
       const now = photoRefs();                 // 消す直前に、もう一度確かめる
       if(!now) return n;
       if(now.has(r.id) || PHOTO_PENDING.has(r.id)) continue;
+      let own2; try{ own2 = livePhotoOwners(); }catch(e){ return n; }
+      if(!own2) return n;
+      if(photoOwnerLiveIn(own2, cur.owner, cur.owner_sv)) continue;  // 付ける先が待っている
+      const at2 = Date.parse(cur.added_at||'');
+      if(isFinite(at2) && at2 > cut) continue;        // 入れ直されたばかり
+      // 確かめている間に使用権が移ることがある。消す直前に、もう一度だけ見る
+      // （2026-08-18 の7回目の監査 Critical）
+      if(!ownsLock()) return n;
       try{ await this.del(r.id); n++; }catch(e){}
     }
     return n;
   },
 };
+/* 保存された記録から指されている写真のID。書きかけや画面の分は入れない。
+   「印を外し損ねたか」を見分けるために使う */
+function savedPhotoIds(){
+  const out = new Set();
+  Object.keys(DB.key).forEach(kk=>{
+    DB.loadRaw(DB.key[kk]).forEach(x=>photoIdsOf(x).forEach(id=>out.add(id)));
+  });
+  return out;
+}
+/* いま写真を付けようとしている記録（箇所・魚・メモのどれか）。
+   まだ記録になっていない画面では、書きかけの鍵を使う */
+let PHOTO_OWNER = '';
+/* その付け先が属する調査。まだ記録が無いときの「生きているか」の判断に使う */
+let PHOTO_OWNER_SV = '';
+/* いま外したばかりの写真。印を外し終えるまで、画面に戻さない */
+const PHOTO_REMOVED = new Set();
+/* 写真の付け先として生きている記録。読めなければ例外（消しすぎ防止） */
+function livePhotoOwners(){
+  const sv = new Set(DB.loadRaw(DB.key.sv).filter(x=>x && !x.deleted_at).map(x=>x.uuid));
+  const st = DB.loadRaw(DB.key.st)
+    .filter(x=>x && !x.deleted_at && sv.has(x.survey_uuid)).map(x=>x.uuid);
+  const stSet = new Set(st);
+  const ca = DB.loadRaw(DB.key.ca)
+    .filter(x=>x && !x.deleted_at && stSet.has(x.station_uuid)).map(x=>x.uuid);
+  const nt = DB.loadRaw(DB.key.nt)
+    .filter(x=>x && !x.deleted_at && sv.has(x.survey_uuid)).map(x=>x.uuid);
+  return {rec: new Set(st.concat(ca, nt)), sv};
+}
+/* その写真の付け先が、いまも生きているか。
+   まだ記録になっていない画面の分は、調査が生きていれば待ち続ける */
+function photoOwnerLiveIn(sets, owner, svu){
+  if(!owner || !sets) return false;
+  if(sets.rec.has(owner)) return true;
+  return !!(svu && sets.sv.has(svu));
+}
+function photoOwnerAlive(u, svu){
+  if(!u) return false;
+  try{ return photoOwnerLiveIn(livePhotoOwners(), u, svu); }catch(e){ return false; }
+}
+/* 記録に付いた写真からは、付け先の印を外す。
+   外さないと、あとで写真を外しても実体が残り続ける */
+function photoOwnerDone(list){
+  // 見ているだけのタブでは、印を外さない。
+  // 外すと、記録を入れているタブがまだ保存していない写真の守りを解いてしまう
+  // （2026-08-18 の11回目の監査 Critical）
+  if(!ownsLock()) return Promise.resolve(false);
+  return Promise.all((list||[]).map(pp=>{
+    if(!pp || !pp.id) return Promise.resolve(true);
+    // 写真を入れる口（PhotoDB.put）は通さない。
+    // 通すと「何枚入れたか」を数えている所で、印外しまで数えてしまう
+    return Promise.resolve().then(()=>PhotoDB.get(pp.id)).then(r=>{
+      if(!r || !r.owner) return true;
+      delete r.owner;
+      return idbDo('readwrite', st=>st.put(r)).then(()=>true);
+    }).catch(()=>false);
+  })).then(a=>a.every(Boolean));
+}
+/* 記録に付けられなかった写真を、画面に戻す。
+   空き容量が尽きたときは記録にも書きかけにも残らないので、
+   写真そのものに付けた印だけが手がかりになる */
+async function photoRestorePending(stUuid){
+  if(!stUuid) return 0;
+  const gen = screenGen();
+  // いま取り込んでいる最中の写真には触らない。
+  // 触ると、取り込み側が「画面が変わったから片付ける」と決めた写真を
+  // こちらが拾い上げてしまい、中身の無い写真が画面に残る
+  const 取り込み中 = new Set(PHOTO_PENDING);
+  let recs=null; try{ recs = await PhotoDB.all(); }catch(e){ return 0; }
+  if(!recs || screenStale(gen) || PHOTO_OWNER !== stUuid) return 0;
+  // 待っている間に、別のタブへ使用権が移っていることがある。
+  // そのまま書くと、記録を入れているタブの書きかけを上書きしてしまう
+  // （2026-08-18 の5回目の監査 Critical）
+  if(!ownsLock() || !photoOwnerAlive(stUuid, PHOTO_OWNER_SV)) return 0;
+  const now = new Set((SCREENS._photos||[]).map(pp=>pp && pp.id));
+  // すでにどこかの記録に付いている分は、印の外し損ね。戻さずに後始末する
+  let saved; try{ saved = savedPhotoIds(); }catch(e){ return 0; }
+  const stale = recs.filter(r=>r && r.id && r.owner===stUuid && saved.has(r.id));
+  if(stale.length) photoOwnerDone(stale.map(r=>({id:r.id})));
+  const add = recs.filter(r=>r && r.id && r.blob && r.owner===stUuid
+      && !now.has(r.id) && !saved.has(r.id) && !PHOTO_REMOVED.has(r.id)
+      && !取り込み中.has(r.id) && !PHOTO_PENDING.has(r.id))
+    .sort((a,b)=>String(a.added_at||'').localeCompare(String(b.added_at||'')))
+    .map(r=>({id:r.id, ext:r.ext||'', size:r.size||0}));
+  if(!add.length) return 0;
+  SCREENS._photos = (SCREENS._photos||[]).concat(add);
+  draftTouch();
+  renderPhotoPanel();
+  toast(`保存できていなかった写真 ${add.length}枚を戻しました。`
+    + (ENV_FORM ? '「写真をもう一度保存」を押してください'
+                : '「保存する」を押してください'), 9000);
+  return add.length;
+}
 /* いま取り込んでいる最中の写真。片付けの対象から外す */
 const PHOTO_PENDING = new Set();
 /* 入れたばかりの写真は片付けない。取り込みと片付けが重なっても巻き添えにしない */
 const PHOTO_GRACE_MS = 30*60*1000;
 /* いま使われている写真のID。1つでも読めなければ null を返す（消しすぎ防止） */
+/* ここでは「消した記録」も数える（deleted_at で外さない）。
+   外すと、ごみ箱から戻したときに写真だけ無い記録ができる。
+   片付けの最中に記録が戻ってくる筋があっても、写真そのものは
+   ここで守られているので失われない（2026-08-18 の9回目の監査への回答） */
 function photoRefs(){
   try{
     const refs = new Set();
@@ -2772,6 +2966,8 @@ function photoPanelHtml(label, auto){
     <button class="btn" onclick="document.getElementById('fPhotoIn').click()">
       写真を撮る／端末から選ぶ</button>
     <div class="mediagrid" id="photoGrid"></div>
+    <button class="btn ng" id="photoRetry" style="display:none"
+      onclick="photoRetrySave()">写真をもう一度保存</button>
     <div class="dim small">${auto
       ? '入れたそばから、この記録に付きます。'
       : '保存を押すまで、この記録には結びつきません。'}</div>
@@ -2787,8 +2983,10 @@ async function pickPhotos(input){
   }
   const gen = screenGen();          // 取り込み中に別の記録へ移ったら、そちらには足さない
   toast('写真を取り込んでいます…');
-  let ok=0, ng=0, lost=false;
+  let ok=0, ng=0, lost=false, notSaved=0;
   const badType=[];
+  const addedIds=[];
+  const startForm = (typeof ENV_FORM!=='undefined') ? ENV_FORM : '';
   for(const f of files){
     const ext = fileExt(f);
     if(!ext){ badType.push(f.name||'(名前なし)'); ng++; continue; }
@@ -2801,7 +2999,12 @@ async function pickPhotos(input){
       // 待つたびに確かめないと、書いてはいけないタブが書きかけを上書きする
       // （2026-08-17 の再監査 Critical）
       if(screenStale(gen) || !ownsLock()){ if(!ownsLock()) lost=true; continue; }
-      await PhotoDB.put({ id, blob, ext:useExt, size:blob.size, added_at:nowISO() });
+      // 「どの記録のために撮ったか」を写真そのものに持たせる。
+      // 端末の空きが尽きると、記録にも書きかけにも控えられない。
+      // そのとき手がかりが何も残らないと、画面を移った時点で写真が失われる
+      // （2026-08-18 の4回目の監査 Critical）
+      await PhotoDB.put({ id, blob, ext:useExt, size:blob.size, added_at:nowISO(),
+        owner: PHOTO_OWNER||'', owner_sv: PHOTO_OWNER_SV||'' });
       if(screenStale(gen) || !ownsLock()){
         // 入れたが行き場がない。ここで片付ける（後の掃除任せにしない）
         if(!ownsLock()) lost=true;
@@ -2812,9 +3015,12 @@ async function pickPhotos(input){
       // 1枚ごとに控える。全部終えてからだと、2枚目の変換中に画面が変わったとき
       // 1枚目まで消える（2026-08-17 の監査 Critical）
       draftTouch();
-      // 物理環境の画面では、1枚ごとにその記録へ保存する。
-      // 全部終えてからだと、2枚目の途中で画面が変わったとき1枚目が記録に付かない
-      try{ if(typeof envAutoSave==='function' && ENV_FORM) envAutoSave(ENV_FORM); }catch(e){}
+      // 物理環境の画面では、1枚ごとに、待たずにその記録へ保存する。
+      // 待つ形だと、撮った直後に画面を閉じたとき記録に付かない。
+      // 入ったかどうかは、全部終えてから記録を読んで確かめる
+      // （途中の1枚が失敗しても、次の1枚の保存で一緒に入ることがあるため）
+      addedIds.push(id);
+      if(ENV_FORM){ try{ envSavePhotosNow(); }catch(e){} }
       ok++;
     }catch(e){
       ng++;
@@ -2824,8 +3030,39 @@ async function pickPhotos(input){
     finally{ PHOTO_PENDING.delete(id); }
   }
   if(screenStale(gen)) return;
-  renderPhotoPanel();
-  if(lost){
+  // 記録を読み直して、入っていない写真があれば、もう一度だけ試す。
+  // 読み直しは、使用権を失っていても必ずする。
+  // 省くと、途中で権利を失ったとき「追加しました」と嘘を伝えてしまう
+  // （2026-08-18 の3回目の監査 Major）
+  if(startForm && ENV_FORM === startForm && addedIds.length){
+    const 入っているか = ()=>{
+      const st = DB.liveStation(startForm);
+      const set = new Set(photoIdsOf(st));
+      return addedIds.filter(x=>!set.has(x));
+    };
+    let 残り = 入っているか();
+    // やり直すのは、いまも自分が書いてよいときだけ
+    if(残り.length && ownsLock()){
+      try{ envSavePhotosNow(); }catch(e){}
+      残り = 入っているか();
+    }
+    notSaved = 残り.length;
+    ok = addedIds.length - notSaved;
+  }
+  renderPhotoPanel();      // ここで、やり直しの口も数え直される
+  if(notSaved){
+    // 保存できていないのに「追加しました」と言わない。
+    // 言ってしまうと、閉じたあとで写真が消えていても気づけない。
+    // 「選び直して」とは言わない。選び直すと同じ写真が二重に入る
+    // （2026-08-18 の3回目の監査 Major）
+    toast(`写真 ${notSaved}枚を記録に保存できませんでした。`
+      + (lost
+        ? '別のタブで記録が開かれたためです。そちらのタブでお試しください'
+        : '写真は画面に残っています。選び直さずに、'
+          + '「写真をもう一度保存」を押してください'
+          + '（端末の空き容量もご確認ください）')
+      + (ok ? `（${ok}枚は保存できています）` : ''), 12000);
+  }else if(lost){
     toast((ok ? `写真 ${ok}枚を追加しました。残りは、` : '')
       + '別のタブで記録が開かれたため追加できませんでした。'
       + 'そちらのタブでお試しください', 9000);
@@ -2841,14 +3078,57 @@ async function pickPhotos(input){
 }
 /* 写真そのものはここでは消さない。保存せずに戻った場合に、記録が
    「無い写真」を指してしまうため。実体は使われなくなった時点で gc() が片付ける */
-function delPhoto(id){
+async function delPhoto(id){
+  // 見ているだけのタブでは外せない。
+  // 外せてしまうと、共有している書きかけから写真が消える
+  // （2026-08-18 の11回目の監査 Critical）
+  if(!writeAllowed()){
+    toast('このタブでは写真を外せません。記録を入れているタブでお試しください', 7000);
+    return;
+  }
   // 物理環境の画面は入れたそばから保存されるので、案内を分ける
   const auto = (typeof ENV_FORM!=='undefined') && ENV_FORM;
   if(!confirm(auto ? 'この写真を外しますか？'
                    : 'この写真を外しますか？（保存を押すと反映されます）')) return;
+  // 外したことを、その場で控える。印を外し終えるまでの間に画面を開き直しても、
+  // 外したはずの写真を戻さないため（2026-08-18 の9回目の監査 Major）
+  PHOTO_REMOVED.add(id);
+  const 元 = (SCREENS._photos||[]).slice();
   SCREENS._photos = (SCREENS._photos||[]).filter(pp=>pp.id!==id);
   draftTouch();
-  try{ if(typeof envAutoSave==='function' && ENV_FORM) envAutoSave(ENV_FORM); }catch(e){}
+  if(!ENV_FORM){
+    // 物理環境でない画面は、ここで保存はしない（保存を押したときに入る）。
+    // ただし印は外す。残すと、開き直したときに外した写真が戻ってくる
+    // （2026-08-18 の10回目の監査 Major）
+    renderPhotoPanel();
+    let 済んだ = false;
+    try{ 済んだ = await photoOwnerDone([{id}]); }catch(e){}
+    if(済んだ) PHOTO_REMOVED.delete(id);
+    else toast('外した写真の後始末が終わりませんでした。'
+      + 'アプリを開き直すと、その写真が戻ってくることがあります', 9000);
+    return;
+  }
+  if(ENV_FORM){
+    let 外せた = false;
+    try{ 外せた = envSavePhotosNow(); }catch(e){}
+    if(!外せた){
+      SCREENS._photos = 元;        // 消えたように見せない
+      draftTouch();
+      PHOTO_REMOVED.delete(id);
+      toast('外せませんでした。端末の空き容量をご確認ください', 8000);
+      renderPhotoPanel();
+      return;
+    }
+    // 外した写真の印も外す。残すと、開き直したときに戻ってきてしまい、
+    // 片付けの対象からも永久に外れる（2026-08-18 の6回目の監査 Major）
+    renderPhotoPanel();            // 見た目は待たせない
+    let 済んだ = false;
+    try{ 済んだ = await photoOwnerDone([{id}]); }catch(e){}
+    if(済んだ) PHOTO_REMOVED.delete(id);
+    else toast('外した写真の後始末が終わりませんでした。'
+      + 'アプリを開き直すと、その写真が戻ってくることがあります', 9000);
+    return;
+  }
   renderPhotoPanel();
 }
 /* 写真の見え方の後片付け。
@@ -2865,7 +3145,41 @@ function revokePhotoUrls(now){
    遅れて終わったほうが古い並びを出してしまうのを防ぐ
    （2026-08-17 の再監査 Critical） */
 let PHOTO_RENDER_SEQ = 0;
+/* 保存できなかった写真を、選び直さずにもう一度保存する。
+   選び直すと同じ写真が別の名前で入り、次に保存できたとき二重になる
+   （2026-08-18 の3回目の監査 Major） */
+function photoRetrySave(){
+  if(!ENV_FORM){ toast('この画面では使えません'); return; }
+  if(!writeAllowed()){
+    toast('このタブでは保存できません。記録を入れているタブでお試しください', 7000);
+    return;
+  }
+  try{ envSavePhotosNow(); }catch(e){}
+  const set = new Set(photoIdsOf(DB.liveStation(ENV_FORM)));
+  const 残り = (SCREENS._photos||[]).filter(pp=>pp && pp.id && !set.has(pp.id));
+  photoShowRetry(残り.length);
+  toast(残り.length
+    ? `まだ ${残り.length}枚が保存できていません。端末の空き容量をご確認ください`
+    : '写真を保存しました', 残り.length ? 9000 : 3000);
+}
+/* いま画面にある写真のうち、記録に入っていない数を数え直して出し入れする。
+   数を持ち回すと、あとから保存できた分だけ口が出しっぱなしになる */
+function photoRefreshRetry(){
+  if(!ENV_FORM){ photoShowRetry(0); return; }
+  const set = new Set(photoIdsOf(DB.liveStation(ENV_FORM)));
+  photoShowRetry((SCREENS._photos||[]).filter(pp=>pp && pp.id && !set.has(pp.id)).length);
+}
+/* 「写真をもう一度保存」を出す／しまう */
+function photoShowRetry(n){
+  const b = $('#photoRetry'); if(!b) return;
+  b.style.display = n ? '' : 'none';
+  b.textContent = n ? `写真 ${n}枚をもう一度保存` : '写真をもう一度保存';
+}
 async function renderPhotoPanel(){
+  // 口の出し入れは、そのつど数え直す。
+  // 取り込んだ枚数だけで決めると、前に入らなかった分が置き去りになる
+  // （2026-08-18 の4回目の監査 Major）
+  photoRefreshRetry();
   const gen = screenGen();
   const my = ++PHOTO_RENDER_SEQ;
   const box=$('#photoGrid'); if(!box) return;
@@ -2933,10 +3247,18 @@ function closePhotoView(keepSeq){
   try{ URL.revokeObjectURL(url); }catch(e){}
 }
 /* いま開いている記録の写真を用意する。書きかけがあればそちらを使う */
-function photosBegin(rec, draft){
+function photosBegin(rec, draft, opt){
   const d = draft && Array.isArray(draft.photos) ? draft.photos : null;
   SCREENS._photos = (d || (rec && rec.photos) || []).slice();
+  // これから撮る写真の「付ける先」。
+  // まだ記録になっていない画面（新規）でも、書きかけの鍵を付ける先にする。
+  // 空のままだと、端末の空きが尽きたときに手がかりが何も残らない
+  // （2026-08-18 の10回目の監査 Critical）
+  PHOTO_OWNER = (rec && rec.uuid) || (opt && opt.key) || '';
+  PHOTO_OWNER_SV = (opt && opt.survey) || (rec && rec.survey_uuid) || '';
   renderPhotoPanel();
+  // 前に付けられなかった写真があれば、画面に戻す
+  if(PHOTO_OWNER && ownsLock()) photoRestorePending(PHOTO_OWNER);
 }
 
 function download(filename, text, mime){
@@ -3920,7 +4242,14 @@ SCREENS.stationEdit = (arg)=>{
   const svUuid = isNew ? arg.survey : st.survey_uuid;
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
-  const no = isNew ? (DB.stationsOf(svUuid).length + 1) : st.station_no;
+  // 画面に出す番号も、保存するときと同じ決め方にする。
+  // 違うと「St.3 と出たのに 4 で保存される」が起きる（2026-08-18 の監査 Major）
+  const no = isNew ? nextStationNo(svUuid) : st.station_no;
+  if(isNew && no===null){
+    toast('番号が大きすぎて、これ以上作れません。'
+      + '番号を手で直すか、新しい調査を作ってください', 9000);
+    return null;                       // 「St.null」の画面を出さない
+  }
   const defMethod = (sv && sv.env_method_default) || '点';
   const g = k => (st[k]!==undefined && st[k]!=='' ? st[k] : '');
   return {
@@ -4073,6 +4402,7 @@ SCREENS.stationEdit = (arg)=>{
       <button class="btn pri" onclick="saveStation('${svUuid}','${arg.uuid||''}')">
         ${isNew ? (isLiveNow(sv) ? `この${stWord(sv)}をはじめる` : `この${stWord(sv)}を追加する`)
                 : '保存する'}</button>
+      ${isNew ? `<input type="hidden" id="s_no" value="${no}">` : ''}
       ${isNew?'':`<button class="btn ng" onclick="deleteStation('${arg.uuid}')">この${stWord(sv)}を削除する</button>`}
     `,
     onMount(){
@@ -4119,7 +4449,7 @@ SCREENS.stationEdit = (arg)=>{
           '#s_le_acc':d.line_end_acc});
         toast('書きかけを戻しました');
       }
-      photosBegin(st, d);
+      photosBegin(st, d, {key, survey:svUuid});
       draftBind(key, collectStation, base);
       onStationMethod();
       // ラインのときは、始点・終点を押さえるために位置を受け続ける
@@ -4228,12 +4558,24 @@ function nowInto(sel){
 function saveStation(svUuid, stUuid, opt){
   const isNew = !stUuid;
   const sv = DB.getAlive(DB.key.sv, svUuid);
+  const noNew = isNew ? nextStationNo(svUuid) : null;
+  if(isNew && noNew===null){ toast('番号が大きすぎて、これ以上作れません', 7000); return; }
+  // 画面を開いてから保存するまでに、ほかで記録が増えていることがある。
+  // 出した番号と食い違ったまま保存すると、名前と番号がずれる
+  const noShown = isNew ? countOf(strVal('#s_no')) : null;
+  const 名前がずれる = isNew && noShown!==null && noShown!=='' && noShown!==noNew;
   const rec = isNew
-    ? {uuid:uuid(), survey_uuid:svUuid, station_no: DB.stationsOf(svUuid).length+1,
+    ? {uuid:uuid(), survey_uuid:svUuid, station_no: noNew,
        started_at:nowISO(), env_points:[]}
     : (DB.get(DB.key.st, stUuid)||{uuid:stUuid, survey_uuid:svUuid});
   const f = collectStation();
-  rec.name              = f.name || ((isDetail(sv)?'P.':'St.')+(rec.station_no||1));
+  const 既定名 = (n)=>(isDetail(sv)?'P.':'St.')+n;
+  // 名前を打っていない、または出した番号のままの既定名なら、新しい番号に直す
+  rec.name = (f.name && !(名前がずれる && f.name===既定名(noShown)))
+    ? f.name : 既定名(rec.station_no||1);
+  if(名前がずれる){
+    toast(`ほかで記録が増えたため、番号を ${noShown} から ${noNew} に直しました`, 7000);
+  }
   rec.survey_time_start = f.survey_time_start;
   rec.survey_time_end   = f.survey_time_end;
   if(surveyIsMultiDay(sv)){
@@ -4298,6 +4640,7 @@ function saveStation(svUuid, stUuid, opt){
   }
   window._stPosSource=null; window._stPosAcc=null;
   const ok = DB.upsert(DB.key.st, rec);
+  if(ok) photoOwnerDone(rec.photos);       // 付いたので、印は外す
   if(!ok) return;                       // 保存できていないので書きかけを消さない
   draftClear('station:'+(stUuid || ('new:'+svUuid)));
   draftUnbind();
@@ -4634,7 +4977,7 @@ SCREENS.envMap = (svUuid)=>{
             <div class="dim small">${envKindOf(cur)==='L'
               ? (linePt(cur,'end') ? '区間 '+esc(fmtDist(lineDist(cur)))
                                    : '<span class="pill warn">終わりがまだ</span>')
-              : (numOf(cur.latitude)===''? '<span class="pill ng">位置なし</span>'
+              : (!stationPt(cur) ? '<span class="pill ng">位置なし</span>'
                  : esc(fixCoord(cur.latitude)+', '+fixCoord(cur.longitude)))}
               ${cur.survey_time_start ? '　'+esc(cur.survey_time_start) : ''}${
                 cur.survey_time_end ? '〜'+esc(cur.survey_time_end) : ''}</div>
@@ -4755,7 +5098,7 @@ SCREENS.envMap = (svUuid)=>{
           applySeg('envsub', d.__sub); applySeg('envgr', d.__gr);
           toast('書きかけを戻しました');
         }
-        photosBegin(cur, d);
+        photosBegin(cur, d, {key, survey:sv.uuid});
         if(ownsLock()) draftBind(key, collectEnvItem, base);
         envShowError(envItemError());
         // 入力のたびに、少し待ってから保存する
@@ -4766,9 +5109,12 @@ SCREENS.envMap = (svUuid)=>{
           // 選ぶボタン（環境区分・河床材料・礫の状況）は input も change も出さない。
           // 拾わないと、押したのに記録にも書き出しにも入らない
           // （2026-08-17 の監査 Critical）
+          // 押したボタンそのものだけを拾う（枠の余白を押しても数えない）。
+          // pickSeg はボタン自身の onclick なので、ここへ来る時点で選び終わっている。
+          // ひと呼吸置くと、その間に画面が変わって取りこぼす（2026-08-18 の監査 Major）
           box.addEventListener('click', e=>{
-            if(e.target && e.target.closest && e.target.closest('[data-seg]')){
-              setTimeout(()=>envAutoSave(cur.uuid), 0);   // 選び終わってから
+            if(e.target && e.target.closest && e.target.closest('[data-seg] button')){
+              envAutoSave(cur.uuid);
             }
           });
         }
@@ -4804,17 +5150,18 @@ SCREENS.envMap = (svUuid)=>{
 function envMapCenter(sv, cur){
   if(cur){
     const p = envKindOf(cur)==='L' ? (linePt(cur,'start') || linePt(cur,'end'))
-                                   : (numOf(cur.latitude)==='' ? null : [+cur.latitude, +cur.longitude]);
+                                   : stationPt(cur);
     if(p) return p;
   }
   const list = DB.stationsOf(sv.uuid).filter(x=>!isMesh(x));
   for(let i=list.length-1;i>=0;i--){
     const st = list[i];
     const p = envKindOf(st)==='L' ? (linePt(st,'start') || linePt(st,'end'))
-                                  : (numOf(st.latitude)==='' ? null : [+st.latitude, +st.longitude]);
+                                  : stationPt(st);
     if(p) return p;
   }
-  if(numOf(sv.latitude)!=='') return [+sv.latitude, +sv.longitude];
+  const svp = stationPt(sv);      // 調査そのものの位置（緯度だけで決めない）
+  if(svp) return svp;
   return [43.06, 141.35];
 }
 
@@ -4846,7 +5193,7 @@ function envDrawAll(svUuid){
         {color:col, weight:on?6:4, opacity:.9, bubblingMouseEvents:false})
         .on('click', e=>{ L.DomEvent.stop(e); envSelect(st.uuid); }).addTo(map));
     }else{
-      const pt = numOf(st.latitude)==='' ? null : [+st.latitude, +st.longitude];
+      const pt = stationPt(st);
       if(pt) put(pt, nm, false);
     }
   });
@@ -4933,6 +5280,40 @@ function envAutoSave(stUuid){
     envAutoSaveNow(stUuid);
   }, ENV_AUTO_MS);
 }
+/* 書きかけの「開いたときの姿」を、いまの中身にそろえる。
+   保存したのに古い姿のままだと、次に何か触ったとき
+   「保存済みの値」が新しい書きかけとして作られ、あとで古い値を運んでくる
+   （2026-08-18 の監査 Major） */
+function envRebaseDraft(key, obj){
+  if(DRAFT_KEY !== key) return false;
+  try{ DRAFT_BASE = JSON.stringify(obj); return true; }catch(e){ return false; }
+}
+/* 写真だけを、待たずにその場で保存する。
+   600ミリ秒待つ形だと、撮った直後にアプリを閉じたとき記録に付かない
+   （2026-08-18 の監査 Major） */
+function envSavePhotosNow(){
+  if(!ENV_FORM) return false;
+  if(!ownsLock()) return false;
+  const st = DB.liveStation(ENV_FORM);
+  if(!st) return false;
+  st.photos = (SCREENS._photos||[]).slice();
+  if(!DB.upsert(DB.key.st, st)) return false;   // 失敗なら、書きかけを残したまま
+  photoOwnerDone(st.photos);         // 付いたので、印は外す
+  // 書きかけの「開いたときの姿」も、いまの写真に合わせる。
+  // 合わせないと、あとで書きかけを戻したときに古い写真の並びへ戻ってしまう
+  // （2026-08-18 の監査 Major）
+  try{
+    if(DRAFT_KEY === 'envitem:'+ENV_FORM && DRAFT_BASE){
+      const b = JSON.parse(DRAFT_BASE);
+      b.photos = (SCREENS._photos||[]).slice();
+      DRAFT_BASE = JSON.stringify(b);
+    }
+  }catch(e){}
+  draftTouch();      // 写真のほかに差が無ければ、書きかけは消える
+  const mark = $('#ev_saved');
+  if(mark) mark.textContent = '写真を保存しました（' + timeValue() + '）';
+  return true;
+}
 /* すぐ保存する。記録を選び替える前や、画面を離れる前に使う */
 function envAutoSaveNow(stUuid){
   if(!stUuid) return false;
@@ -4998,7 +5379,13 @@ function saveEnvItem(stUuid, opt){
   });
 
   if(!DB.upsert(DB.key.st, st)) return false;   // 保存できていないので書きかけを消さない
+  // 「開いたときの姿」も、いま保存した中身にそろえる。
+  // そろえないと、次に何か触ったとき保存済みの値が書きかけとして作り直される
+  photoOwnerDone(st.photos);         // 付いたので、印は外す
+  envRebaseDraft('envitem:'+stUuid, collectEnvItem());
   draftClear('envitem:'+stUuid);
+  // ふつうの保存でも写真は一緒に入る。入ったなら、やり直しの口はしまう
+  photoRefreshRetry();
   envShowError('');
   ENV_DIRTY = false;
   if(quiet){
@@ -5081,9 +5468,8 @@ SCREENS.meshSetup = (stUuid)=>{
       }, 2000);
       window._meshCorners = (meshCorners(st)||[]).slice();
       showMeshPlan();
-      const first = (window._meshCorners[0]) ||
-        (numOf(st.latitude)!=='' ? [+st.latitude, +st.longitude] : null) ||
-        (sv && numOf(sv.latitude)!=='' ? [+sv.latitude, +sv.longitude] : [43.06, 141.35]);
+      const first = (window._meshCorners[0]) || stationPt(st)
+        || (sv ? stationPt(sv) : null) || [43.06, 141.35];
       MAPS.main.map = makeMap('meshmap', first, 17);
       const map = MAPS.main.map;
       if(!map) return;
@@ -5324,8 +5710,7 @@ SCREENS.mesh = (stUuid)=>{
     `,
     onMount(){
       const g2 = meshGeom(st);
-      const c = (g2 ? g2.corners[0] : null)
-        || (numOf(st.latitude)!=='' ? [+st.latitude, +st.longitude] : [43.06, 141.35]);
+      const c = (g2 ? g2.corners[0] : null) || stationPt(st) || [43.06, 141.35];
       MAPS.main.map = makeMap('meshmap2', c, 17);
       const map = MAPS.main.map;
       if(!map || !g2) return;
@@ -5632,7 +6017,7 @@ SCREENS.catchEdit = (arg)=>{
         applySeg('conf', d.identification_confidence);
         toast('書きかけを戻しました');
       }
-      photosBegin(c, d);
+      photosBegin(c, d, {key, survey:(DB.liveStation(stUuid)||{}).survey_uuid||''});
       draftBind(key, collectCatch, base);
       const el=$('#c_n'); if(el && isNew && !d) el.focus();
     }
@@ -5670,6 +6055,7 @@ function saveCatch(stUuid, caUuid, spId, next){
     toast('尾数を入れてください（0だと書き出しから除かれます）');
   }
   if(!DB.upsert(DB.key.ca, rec)) return;   // 保存できていないので書きかけを消さない
+  photoOwnerDone(rec.photos);              // 付いたので、印は外す
   draftClear(draftKey);
   draftUnbind();
   toast('保存しました');
@@ -6171,7 +6557,7 @@ SCREENS.noteEdit = (arg)=>{
       const base = collectNote();       // 書きかけを戻す前の姿を控える
       const d = draftGet(key);
       if(d){ applyVals({'#n_body':d.content}); toast('書きかけを戻しました'); }
-      photosBegin(n, d);
+      photosBegin(n, d, {key, survey:svUuid});
       draftBind(key, collectNote, base);
       const el=$('#n_body'); if(el && isNew && !d) el.focus();
     }
@@ -6190,6 +6576,7 @@ function saveNote(svUuid, uu){
   rec.content = body;
   rec.photos = photos;
   if(DB.upsert(DB.key.nt, rec)){
+    photoOwnerDone(photos);                // 付いたので、印は外す
     draftClear('note:'+(uu || ('new:'+svUuid)));
     draftUnbind();
     toast('保存しました'); goBack();
@@ -6435,7 +6822,7 @@ SCREENS.map = (svUuid)=>{
       if(!map) return;
       applyBaseMap('main', baseMapName());
       addLocateControl(map);
-      if(numOf(sv.latitude)!==''){
+      if(stationPt(sv)){
         L.marker(c, {icon:dotIcon('#4aa3ff',16)}).addTo(map).bindPopup('調査の位置');
       }
       // 位置を持っている地点・箇所を出す
@@ -6599,12 +6986,12 @@ SCREENS.offlineMap = (svUuid)=>{
         : '<div class="card dim">まだありません。</div>'}
     `,
     onMount(){
-      const c = (sv && numOf(sv.latitude)!=='') ? [+sv.latitude, +sv.longitude] : [43.06,141.35];
+      const c = (sv ? stationPt(sv) : null) || [43.06,141.35];
       MAPS.off.map = makeMap('omap', c, 13);
       const map = MAPS.off.map;
       if(!map) return;
       applyBaseMap('off', baseMapName());
-      addLocateControl(map);
+      addLocateControl(map, 'off');
       map.on('click', e=>{ OPOLY.push([e.latlng.lat, e.latlng.lng]); opolyDraw(); });
     }
   };
@@ -6898,11 +7285,13 @@ SCREENS.exportHub = (svUuid)=>{
         <h3 style="margin-top:0">写真</h3>
         <div class="row">
           <div class="grow"><div class="dim small">枚数</div>
-            <div class="big">${ph.n} 枚</div></div>
+            <div class="big" id="phCount">${ph.n} 枚</div></div>
           <div class="grow"><div class="dim small">大きさの目安</div>
-            <div class="big">${ph.bytes ? esc(fmtBytes(ph.bytes)) : '—'}</div></div>
+            <div class="big" id="phBytes" data-bytes="${ph.bytes||0}">${
+              ph.bytes ? esc(fmtBytes(ph.bytes)) : '—'}</div></div>
         </div>
-        <button class="btn" ${ph.n?'':'disabled'}
+        <div class="dim small" id="phPend"></div>
+        <button class="btn" id="phZip"
           onclick="exportPhotoZip('${svUuid}')">写真をまとめて書き出す（ZIP）</button>
         <div class="dim small">1つのファイルにまとまります。パソコンで開くと、
           「写真一覧.csv」でどの写真がどの記録のものか分かります。
@@ -6911,14 +7300,15 @@ SCREENS.exportHub = (svUuid)=>{
                調査を分けてください。</b>` : ''}</div>
       </div>
 
-      <div class="card">
+      <div class="card" id="expHowto">
         <h3>取り込みかた</h3>
         <div class="dim small">
           魚類データベースを開き、「資料管理」→「調査記録」→「CSV / Excel から一括インポート」に
           書き出したファイルを入れてください。
         </div>
       </div>
-    `};
+    `,
+    onMount(){ exportPhotoCount(sv, ph.n); }};
 };
 /* ---------- 写真ZIP（無圧縮・追加の部品なし） ----------
    名前をUTF-8で入れる印（0x0800）を立てる。立てないと日本語のファイル名が化ける */
@@ -6977,6 +7367,79 @@ function photoItemsOf(sv){
   });
   return items;
 }
+/* まだ記録に付いていない写真（付ける先の印だけが頼り）を拾う。
+   拾わないと、書き出したZIPに入らないまま「できました」と言ってしまう
+   （2026-08-18 の5回目の監査 Major） */
+async function pendingPhotoItems(sv){
+  // 読めなかったときは「0件」と言わない。
+  // 言ってしまうと、足りないZIPを「できました」と渡すことになる
+  // （2026-08-18 の6回目の監査 Major）
+  const recs = await PhotoDB.all();
+  if(!recs || !recs.length) return [];
+  const saved = savedPhotoIds();
+  // 付け先ごとの「どこの何か」を引けるようにする
+  const 表 = {};
+  DB.stationsOf(sv.uuid).forEach(st=>{
+    const day = stationDate(st, sv);
+    表[st.uuid] = {kind:'箇所', day, station:st.name||'', species_id:'', species_name:'',
+      time:st.survey_time_start||'', lat:st.latitude, lon:st.longitude, rec_id:st.uuid};
+    DB.catchesOf(st.uuid).forEach(c=>{
+      表[c.uuid] = {kind:'魚', day, station:st.name||'',
+        species_id:c.species_id||'', species_name:c.species_name||'',
+        time:st.survey_time_start||'', lat:st.latitude, lon:st.longitude, rec_id:c.uuid};
+    });
+  });
+  DB.notesOf(sv.uuid).forEach(n=>{
+    表[n.uuid] = {kind:'メモ', day:sv.survey_date||'', station:'',
+      species_id:'', species_name:'', time:n.created_at ? fmtTime(n.created_at) : '',
+      lat:'', lon:'', rec_id:n.uuid};
+  });
+  // まだ記録になっていない画面の分は、書きかけの鍵から種類を読む
+  const 鍵の種類 = (k)=>{
+    const head = String(k||'').split(':')[0];
+    if(head==='catch') return '魚';
+    if(head==='note')  return 'メモ';
+    return '箇所';
+  };
+  const 数 = {};
+  return recs.filter(r=>r && r.id && r.owner && !saved.has(r.id))
+    .filter(r=>表[r.owner] || r.owner_sv===sv.uuid)
+    .sort((a,b)=>String(a.added_at||'').localeCompare(String(b.added_at||'')))
+    .map(r=>{
+      const base = 表[r.owner] || {kind: 鍵の種類(r.owner), day:sv.survey_date||'',
+        station:'', species_id:'', species_name:'', time:'', lat:'', lon:'',
+        rec_id:r.owner};
+      数[r.owner] = (数[r.owner]||0) + 1;
+      return Object.assign({p:{id:r.id, ext:r.ext||'', size:r.size||0},
+        pending:true, no:数[r.owner]}, base);
+    });
+}
+/* 書き出し画面に、まだ記録に付いていない写真の分を足す。
+   足さないと「0枚」に見えて、書き出しボタンを押せない
+   （2026-08-18 の6回目の監査 Major） */
+async function exportPhotoCount(sv, n){
+  const gen = screenGen();
+  let pend;
+  try{ pend = await pendingPhotoItems(sv); }
+  catch(e){
+    if(screenStale(gen)) return;
+    const box = $('#phPend');
+    if(box) box.innerHTML = '<span class="pill ng">写真の置き場を読めません</span>';
+    return;
+  }
+  if(screenStale(gen) || !pend.length) return;
+  const 足す = pend.reduce((a,it)=>a + (numOf(it.p && it.p.size)||0), 0);
+  const sz = $('#phBytes');
+  if(sz) sz.textContent = fmtBytes((numOf(sz.dataset.bytes)||0) + 足す);
+  const box = $('#phPend');
+  if(box) box.innerHTML = `<span class="pill warn">まだ記録に付いていない写真が `
+    + `${pend.length}枚あります</span>　ZIPには入りますが、`
+    + `その箇所を開いて「写真をもう一度保存」を押すことをおすすめします。`;
+  const cnt = $('#phCount');
+  if(cnt) cnt.textContent = (n + pend.length) + ' 枚';
+  const btn = $('#phZip');
+  if(btn) btn.disabled = false;
+}
 function photoStats(sv){
   const items = photoItemsOf(sv);
   return {n: items.length,
@@ -6985,9 +7448,10 @@ function photoStats(sv){
 function photoFilename(it, seq){
   const ext = (it.p && it.p.ext) || 'jpg';
   const head = String(seq).padStart(3,'0');
-  if(it.kind==='魚')  return `${head}_魚_${safeName(it.station)}_${safeName(it.species_name||it.species_id)}_${it.no}.${ext}`;
-  if(it.kind==='箇所') return `${head}_箇所_${safeName(it.station)}_${it.no}.${ext}`;
-  return `${head}_メモ_${safeName(it.time)}_${it.no}.${ext}`;
+  const mark = it.pending ? '未保存_' : '';
+  if(it.kind==='魚')  return `${head}_${mark}魚_${safeName(it.station)}_${safeName(it.species_name||it.species_id)}_${it.no}.${ext}`;
+  if(it.kind==='箇所') return `${head}_${mark}箇所_${safeName(it.station)}_${it.no}.${ext}`;
+  return `${head}_${mark}メモ_${safeName(it.time)}_${it.no}.${ext}`;
 }
 const FS_PHOTO_COLS = ['ファイル名','状態','種類','調査日','箇所','種ID','種名',
   '開始時刻','緯度','経度','記録ID','写真ID'];
@@ -6999,7 +7463,16 @@ const PHOTO_ZIP_LIMIT = 800*1024*1024;
 
 async function exportPhotoZip(svUuid){
   const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
-  const items = photoItemsOf(sv);
+  // まだ記録に付いていない写真も入れる。落とすと、取りこぼしに気づけない
+  let pend;
+  try{ pend = await pendingPhotoItems(sv); }
+  catch(e){
+    toast('写真の置き場を読めませんでした。'
+      + '足りないZIPになるおそれがあるため、書き出しを中止します'
+      + '（端末を再起動してからお試しください）', 12000);
+    return;
+  }
+  const items = photoItemsOf(sv).concat(pend);
   if(!items.length){ toast('この調査には写真がありません'); return; }
   if(items.length + 2 > ZIP_MAX_FILES){
     toast(`写真が多すぎてまとめられません（${items.length}枚）。調査を分けてください`, 9000);
@@ -7042,7 +7515,10 @@ async function exportPhotoZip(svUuid){
       }else{
         missing += 1;
       }
-      idx.push({'ファイル名':name, '状態': buf ? '入っています' : '中身が見つかりません',
+      idx.push({'ファイル名':name,
+        '状態': !buf ? '中身が見つかりません'
+                : (it.pending ? 'まだ記録に付いていません（アプリで保存し直してください）'
+                              : '入っています'),
         '種類':it.kind, '調査日':it.day, '箇所':it.station,
         '種ID':it.species_id, '種名':it.species_name, '開始時刻':it.time,
         '緯度':fixCoord(it.lat), '経度':fixCoord(it.lon),
@@ -7051,6 +7527,13 @@ async function exportPhotoZip(svUuid){
     // 突き合わせ用の一覧を同じZIPに入れる。どの写真がどの記録のものか、後から分かるように
     files.push({name:'写真一覧.csv',
       u8:new TextEncoder().encode('\ufeff'+toCsv(FS_PHOTO_COLS, idx))});
+    if(pend.length){
+      files.push({name:'まだ記録に付いていない写真.txt', u8:new TextEncoder().encode(
+        `${pend.length}枚は、まだ記録に付いていません。\r\n`
+        + '端末の空き容量が足りず、保存しきれなかった写真です。\r\n'
+        + 'アプリでその箇所を開き、「写真をもう一度保存」を押してください。\r\n'
+        + 'ファイル名の「未保存」が目印です。\r\n')});
+    }
     if(missing){
       files.push({name:'足りない写真.txt', u8:new TextEncoder().encode(
         `この調査には写真が ${items.length}枚 ありますが、`
