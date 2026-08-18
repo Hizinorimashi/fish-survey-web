@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v28';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v29';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -5367,6 +5367,33 @@ SCREENS.envMap = (svUuid)=>{
             onclick="envDelete('${cur.uuid}')">消す</button>
         </div>
 
+        ${foldHtml('envfix', '位置と時刻を直す',
+          `<span class="fsub">${envKindOf(cur)==='L' ? '始点・終点・時刻' : '位置・時刻'}</span>`,
+          (envKindOf(cur)==='L' ? ['始点','終点'] : ['点']).map(w=>{
+            const ある = w==='点' ? !!stationPt(cur)
+                       : !!linePt(cur, w==='始点' ? 'start' : 'end');
+            const 待ち = envMoveOn(cur.uuid, w);
+            return `<div class="row" style="margin-bottom:6px">
+              <div class="grow"><div class="dim small">${esc(w)}</div>
+                <div>${ある
+                  ? esc(w==='点' ? fixCoord(cur.latitude)+', '+fixCoord(cur.longitude)
+                      : fixCoord(cur['line_'+(w==='始点'?'start':'end')+'_lat'])+', '
+                        +fixCoord(cur['line_'+(w==='始点'?'start':'end')+'_lon']))
+                  : '<span class="pill ng">まだありません</span>'}</div></div>
+              <button class="btn sm ok" style="width:auto;margin:0"
+                onclick="envGrabHere('${cur.uuid}','${w}')">いまここ</button>
+              <button class="btn sm ${待ち?'ng':''}" style="width:auto;margin:0"
+                onclick="envMoveStart('${cur.uuid}','${w}')">${待ち?'やめる':'地図で直す'}</button>
+            </div>`;
+          }).join('')
+          + `<div class="dim small">「地図で直す」を押してから、地図をタップしてください。</div>
+          <div class="row" style="margin-top:8px">
+            <div class="grow"><label>開始時刻</label>
+              <input type="time" id="ev_t1" value="${esc(cur.survey_time_start||'')}"></div>
+            ${envKindOf(cur)==='L' ? `<div class="grow"><label>終了時刻</label>
+              <input type="time" id="ev_t2" value="${esc(cur.survey_time_end||'')}"></div>` : ''}
+          </div>`, envMoveOn(cur.uuid))}
+
         <label>環境区分</label>
         <div class="seg" data-seg="envhab">
           ${['なし'].concat(OPT.habitat).map(o=>{
@@ -5465,6 +5492,7 @@ SCREENS.envMap = (svUuid)=>{
       }, 2000);
 
       if(ENV_PICK && ENV_PICK.sv !== svUuid) ENV_PICK = null;
+      if(ENV_MOVE && !DB.liveStation(ENV_MOVE.uuid)) ENV_MOVE = null;
       ENV_FORM = cur ? cur.uuid : '';
       ENV_DIRTY = false;
       if(cur){
@@ -5531,6 +5559,12 @@ SCREENS.envMap = (svUuid)=>{
       drawMe('main');            // 開いた時点でも、いる場所を出す
       ENV_MAP_SV = svUuid;      // 片付ける直前に、見ている場所を覚えるため
       map.on('click', e=>{
+        // 直す待ちのときは、新しく置かずに動かす
+        if(ENV_MOVE){
+          const m = ENV_MOVE;
+          if(envMoveTo(m.uuid, m.which, e.latlng.lat, e.latlng.lng, null)) render();
+          return;
+        }
         if(envPickOn()){ toast('消すものを選んでいます。先に「やめる」を押してください', 6000); return; }
         envAddAt(svUuid, e.latlng.lat, e.latlng.lng, null); render();
       });
@@ -5635,7 +5669,7 @@ function envDelete(u){
 }
 
 function envItemSels(){
-  const sels = ['#ev_v','#ev_d','#ev_memo'];
+  const sels = ['#ev_v','#ev_d','#ev_memo','#ev_t1','#ev_t2'];
   OPT.substrate.forEach(k=>sels.push('#evp_'+SUBSTRATE_NO[k]));
   ['left','right'].forEach(side=>{
     [0,1,2].forEach(i=>{ sels.push('#evc_'+side+'_'+i+'_t'); sels.push('#evc_'+side+'_'+i); });
@@ -5717,6 +5751,60 @@ function envSavePhotosNow(){
   if(mark) mark.textContent = '写真を保存しました（' + timeValue() + '）';
   return true;
 }
+/* いま「地図をタップして直す」を待っている相手。
+   {uuid, which} which は '点' / '始点' / '終点'（2026-08-18 の実機の声） */
+let ENV_MOVE = null;
+function envMoveOn(u, which){
+  return !!(ENV_MOVE && ENV_MOVE.uuid === u && (!which || ENV_MOVE.which === which));
+}
+function envMoveStart(u, which){
+  if(!writeAllowed()){
+    toast('このタブでは直せません。記録を入れているタブでお試しください', 7000);
+    return;
+  }
+  if(envMoveOn(u, which)){ ENV_MOVE = null; toast('直すのをやめました'); render(); return; }
+  ENV_MOVE = {uuid:u, which:which};
+  toast(`地図をタップすると、${which}をそこへ動かします（もう一度押すとやめます）`, 8000);
+  render();
+}
+/* 位置を書き替える。lat/lon が空なら「位置なし」に戻す */
+function envMoveTo(u, which, la, lo, acc){
+  const st = DB.liveStation(u); if(!st) return false;
+  const a = (acc===undefined || acc===null || acc==='') ? '' : Math.round(acc);
+  if(which === '始点'){
+    st.line_start_lat = la; st.line_start_lon = lo; st.line_start_acc = a;
+  }else if(which === '終点'){
+    st.line_end_lat = la; st.line_end_lon = lo; st.line_end_acc = a;
+    // 終わりを入れたら、終わりの時刻も入れておく（無いときだけ）
+    if(!st.survey_time_end) st.survey_time_end = timeValue();
+  }else{
+    st.latitude = la; st.longitude = lo; st.gps_accuracy = a;
+  }
+  if(!DB.upsert(DB.key.st, st)){
+    toast('直せませんでした（端末の空き容量をご確認ください）', 8000);
+    return false;
+  }
+  ENV_MOVE = null;
+  toast(`${st.name||''} の${which}を直しました`);
+  return true;
+}
+/* いまいる場所へ直す */
+function envGrabHere(u, which){
+  if(!writeAllowed()){
+    toast('このタブでは直せません。記録を入れているタブでお試しください', 7000);
+    return;
+  }
+  toast('現在地を取っています…');
+  getFixOnce(f=>{
+    if(!f){ toast('現在地を取れませんでした。地図で直すこともできます', 7000); return; }
+    if(f.acc > GPS_MAX_ACC){
+      toast(`いまの位置は ±${Math.round(f.acc)}m と粗いので直していません。`
+        + '空の見えるところでお試しいただくか、地図で直してください', 9000);
+      return;
+    }
+    if(envMoveTo(u, which, f.lat, f.lon, f.acc)) render();
+  });
+}
 /* すぐ保存する。記録を選び替える前や、画面を離れる前に使う */
 function envAutoSaveNow(stUuid){
   if(!stUuid) return false;
@@ -5761,6 +5849,9 @@ function saveEnvItem(stUuid, opt){
   st.velocity_rep_cms = mToCm(strVal('#ev_v'));
   st.memo             = strVal('#ev_memo');
   st.photos           = (SCREENS._photos||[]).slice();
+  // 時刻。欄が出ているときだけ書く（出ていない画面から呼ばれても消さない）
+  if($('#ev_t1')) st.survey_time_start = strVal('#ev_t1');
+  if($('#ev_t2')) st.survey_time_end   = strVal('#ev_t2');
 
   const pct = {};
   OPT.substrate.forEach(k=>{ pct[k] = numVal('#evp_'+SUBSTRATE_NO[k]); });
