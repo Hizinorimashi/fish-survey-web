@@ -125,7 +125,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v25';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v26';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2038,6 +2038,30 @@ function draftSave(key, obj){
   try{ localStorage.setItem('fs_draft_edit', JSON.stringify(a)); }catch(e){}
 }
 function draftGet(key){ return draftAll()[key] || null; }
+/* その記録の書きかけを、まとめて消す。
+   消し忘れると、書きかけが写真を指したままになり、
+   その写真が片付かないまま溜まる（2026-08-18 の13回目の監査 Major） */
+function draftClearFor(kind, u){
+  const keys = [];
+  if(kind === 'メモ')  keys.push('note:'+u);
+  if(kind === '魚')    keys.push('catch:'+u);
+  if(kind === '箇所'){
+    keys.push('station:'+u, 'envitem:'+u, 'effort:'+u, 'env:'+u);
+    // その箇所の中の記録の分も。新規の魚の鍵（catch:new:<箇所>:<種>）も含める
+    try{
+      DB.load(DB.key.ca).forEach(c=>{
+        if(c && c.station_uuid===u) keys.push('catch:'+c.uuid);
+      });
+    }catch(e){}
+    try{
+      Object.keys(draftAll()).forEach(k=>{
+        if(k.indexOf('catch:new:'+u+':')===0) keys.push(k);
+      });
+    }catch(e){}
+  }
+  keys.forEach(k=>{ try{ draftClear(k); }catch(e){} });
+  return keys.length;
+}
 function draftClear(key){
   // 書きかけを捨てるときは、その中の写真の「付ける先」の印も外す。
   // 残すと、捨てたはずの写真が開き直しで戻ってくる
@@ -2213,7 +2237,10 @@ let ENV_GPS_TIMER = null;
 function render(){
   // 物理環境の画面で打ちかけの分があれば、先に書いてしまう
   try{ if(typeof envFlush==='function') envFlush(); }catch(e){}
-  try{ ENV_FORM = ''; ENV_DIRTY = false; PHOTO_OWNER = ''; PHOTO_OWNER_SV = ''; }catch(e){}
+  try{
+    ENV_FORM = ''; ENV_DIRTY = false; PHOTO_OWNER = ''; PHOTO_OWNER_SV = '';
+    PHOTO_OWNER_INFO = {mode:'', kind:'', station:'', species:''};
+  }catch(e){}
   SCREEN_SEQ++;
   draftUnbind();
   closePhotoView();           // 大きく見ていた写真は、画面が変わったら閉じる
@@ -2771,7 +2798,7 @@ const PhotoDB = {
         if(r.owner && saved.has(r.id)) photoOwnerDone([{id:r.id}]);
         continue;
       }
-      if(photoOwnerLiveIn(owners, r.owner, r.owner_sv)) continue;  // 付ける先が待っている
+      if(photoOwnerLiveIn(owners, r)) continue;      // 付ける先が待っている
       const at = Date.parse(r.added_at||'');
       if(isFinite(at) && at > cut) continue;   // 入れたばかりのものは残す
       // 対象を取り直してから、最後の確認をひととおり行う。
@@ -2785,7 +2812,7 @@ const PhotoDB = {
       if(now.has(r.id) || PHOTO_PENDING.has(r.id)) continue;
       let own2; try{ own2 = livePhotoOwners(); }catch(e){ return n; }
       if(!own2) return n;
-      if(photoOwnerLiveIn(own2, cur.owner, cur.owner_sv)) continue;  // 付ける先が待っている
+      if(photoOwnerLiveIn(own2, cur)) continue;      // 付ける先が待っている
       const at2 = Date.parse(cur.added_at||'');
       if(isFinite(at2) && at2 > cut) continue;        // 入れ直されたばかり
       // 確かめている間に使用権が移ることがある。消す直前に、もう一度だけ見る
@@ -2805,11 +2832,24 @@ function savedPhotoIds(){
   });
   return out;
 }
+/* いま画面に打たれている呼び名を読む。まだ記録が無い画面のため */
+function photoOwnerNameNow(){
+  const info = (typeof PHOTO_OWNER_INFO!=='undefined') ? PHOTO_OWNER_INFO : null;
+  if(!info) return '';
+  if(!info.nameSel) return info.st_name || '';
+  const el = $(info.nameSel);
+  if(!el) return info.st_name || '';
+  return String(el.value || el.placeholder || '') || info.st_name || '';
+}
 /* いま写真を付けようとしている記録（箇所・魚・メモのどれか）。
    まだ記録になっていない画面では、書きかけの鍵を使う */
 let PHOTO_OWNER = '';
 /* その付け先が属する調査。まだ記録が無いときの「生きているか」の判断に使う */
 let PHOTO_OWNER_SV = '';
+/* 付け先の中身。「もう記録になっているか（record）／まだ画面だけか（draft）」と、
+   種類・どの箇所・どの魚種。書き出しで「どの写真がどの記録のものか」を出すために持つ
+   （2026-08-18 の11回目の監査 Major） */
+let PHOTO_OWNER_INFO = {mode:'', kind:'', station:'', species:''};
 /* いま外したばかりの写真。印を外し終えるまで、画面に戻さない */
 const PHOTO_REMOVED = new Set();
 /* 写真の付け先として生きている記録。読めなければ例外（消しすぎ防止） */
@@ -2826,14 +2866,29 @@ function livePhotoOwners(){
 }
 /* その写真の付け先が、いまも生きているか。
    まだ記録になっていない画面の分は、調査が生きていれば待ち続ける */
-function photoOwnerLiveIn(sets, owner, svu){
-  if(!owner || !sets) return false;
-  if(sets.rec.has(owner)) return true;
-  return !!(svu && sets.sv.has(svu));
+/* その写真の付け先が、いまも生きているか。
+     ・もう記録になっている分（record）＝その記録が生きているときだけ。
+       調査が生きているからと守り続けると、消した記録の写真が永久に残る
+       （2026-08-18 の11回目の監査 Major）
+     ・まだ画面だけの分（draft）＝その調査が生きているあいだは守る */
+function photoOwnerMode(r, sets){
+  if(r && r.owner_mode) return r.owner_mode;
+  // 古い写真には印が無い。いま記録として在るなら record、無ければ鍵の形で見分ける
+  if(sets && r && sets.rec.has(r.owner)) return 'record';
+  return (r && String(r.owner||'').indexOf(':')>=0) ? 'draft' : 'record';
+}
+function photoOwnerLiveIn(sets, r){
+  if(!sets || !r || !r.owner) return false;
+  if(sets.rec.has(r.owner)) return true;
+  if(photoOwnerMode(r, sets) !== 'draft') return false;
+  return !!(r.owner_sv && sets.sv.has(r.owner_sv));
 }
 function photoOwnerAlive(u, svu){
   if(!u) return false;
-  try{ return photoOwnerLiveIn(livePhotoOwners(), u, svu); }catch(e){ return false; }
+  try{
+    return photoOwnerLiveIn(livePhotoOwners(),
+      {owner:u, owner_sv:svu, owner_mode:PHOTO_OWNER_INFO.mode||''});
+  }catch(e){ return false; }
 }
 /* 記録に付いた写真からは、付け先の印を外す。
    外さないと、あとで写真を外しても実体が残り続ける */
@@ -3004,7 +3059,11 @@ async function pickPhotos(input){
       // そのとき手がかりが何も残らないと、画面を移った時点で写真が失われる
       // （2026-08-18 の4回目の監査 Critical）
       await PhotoDB.put({ id, blob, ext:useExt, size:blob.size, added_at:nowISO(),
-        owner: PHOTO_OWNER||'', owner_sv: PHOTO_OWNER_SV||'' });
+        owner: PHOTO_OWNER||'', owner_sv: PHOTO_OWNER_SV||'',
+        owner_mode: PHOTO_OWNER_INFO.mode||'', owner_kind: PHOTO_OWNER_INFO.kind||'',
+        owner_st: PHOTO_OWNER_INFO.station||'', owner_sp: PHOTO_OWNER_INFO.species||'',
+        owner_st_name: photoOwnerNameNow()||'',
+        owner_sp_name: PHOTO_OWNER_INFO.sp_name||'' });
       if(screenStale(gen) || !ownsLock()){
         // 入れたが行き場がない。ここで片付ける（後の掃除任せにしない）
         if(!ownsLock()) lost=true;
@@ -3256,6 +3315,24 @@ function photosBegin(rec, draft, opt){
   // （2026-08-18 の10回目の監査 Critical）
   PHOTO_OWNER = (rec && rec.uuid) || (opt && opt.key) || '';
   PHOTO_OWNER_SV = (opt && opt.survey) || (rec && rec.survey_uuid) || '';
+  const stName = (opt && opt.station)
+    ? ((DB.get(DB.key.st, opt.station)||{}).name || '') : '';
+  const spName = (opt && opt.species)
+    ? ((speciesById(opt.species)||{}).ja || '') : '';
+  PHOTO_OWNER_INFO = {
+    mode: (rec && rec.uuid) ? 'record' : (PHOTO_OWNER ? 'draft' : ''),
+    kind: (opt && opt.kind) || '',
+    station: (opt && opt.station) || '',
+    species: (opt && opt.species) || '',
+    // 撮ったときの呼び名も控える。あとで箇所を消したり魚種を変えても、
+    // 書き出しで「どの写真か」が分かるようにするため
+    // （2026-08-18 の12回目の監査 Major）
+    st_name: stName, sp_name: spName,
+    // まだ記録になっていない箇所は、画面に打った名前が頼り。
+    // 開いた時点では空なので、撮るときに読み直す
+    // （2026-08-18 の13回目の監査 Major）
+    nameSel: (opt && opt.nameSel) || '',
+  };
   renderPhotoPanel();
   // 前に付けられなかった写真があれば、画面に戻す
   if(PHOTO_OWNER && ownsLock()) photoRestorePending(PHOTO_OWNER);
@@ -4449,7 +4526,8 @@ SCREENS.stationEdit = (arg)=>{
           '#s_le_acc':d.line_end_acc});
         toast('書きかけを戻しました');
       }
-      photosBegin(st, d, {key, survey:svUuid});
+      photosBegin(st, d, {key, survey:svUuid, kind:'箇所',
+        station: arg.uuid||'', nameSel:'#s_name'});
       draftBind(key, collectStation, base);
       onStationMethod();
       // ラインのときは、始点・終点を押さえるために位置を受け続ける
@@ -4657,6 +4735,7 @@ function deleteStation(u){
   // 印を付けるのは箇所1つだけ。中の記録は「親が消えている」ことで隠れる。
   // 何件も書き込むと、途中で失敗したときに迷子の記録が残る
   if(!DB.softDelete(DB.key.st, u)) return;
+  draftClearFor('箇所', u);      // 書きかけが写真を抱えたままにならないように
   toast('削除しました');
   goTo('survey', st ? st.survey_uuid : null);
 }
@@ -5098,7 +5177,7 @@ SCREENS.envMap = (svUuid)=>{
           applySeg('envsub', d.__sub); applySeg('envgr', d.__gr);
           toast('書きかけを戻しました');
         }
-        photosBegin(cur, d, {key, survey:sv.uuid});
+        photosBegin(cur, d, {key, survey:sv.uuid, kind:'箇所'});
         if(ownsLock()) draftBind(key, collectEnvItem, base);
         envShowError(envItemError());
         // 入力のたびに、少し待ってから保存する
@@ -5225,7 +5304,7 @@ function envDelete(u){
   const st = DB.get(DB.key.st, u); if(!st) return;
   if(!confirm(`${st.name} を消します。中の記録も消えます。よろしいですか？`)) return;
   if(DB.softDelete(DB.key.st, u)){
-    draftClear('envitem:'+u);
+    draftClearFor('箇所', u);
     if(ENV_SEL === u) ENV_SEL = null;
     toast('消しました'); render();
   }
@@ -6017,7 +6096,8 @@ SCREENS.catchEdit = (arg)=>{
         applySeg('conf', d.identification_confidence);
         toast('書きかけを戻しました');
       }
-      photosBegin(c, d, {key, survey:(DB.liveStation(stUuid)||{}).survey_uuid||''});
+      photosBegin(c, d, {key, survey:(DB.liveStation(stUuid)||{}).survey_uuid||'',
+        kind:'魚', station:stUuid, species:spId||''});
       draftBind(key, collectCatch, base);
       const el=$('#c_n'); if(el && isNew && !d) el.focus();
     }
@@ -6087,6 +6167,7 @@ function toIndividuals(stUuid, caUuid, spId){
     // （2026-08-17 の監査 Critical）
     photos: (SCREENS._photos||[]).slice()};
   if(!DB.upsert(DB.key.ca, rec)) return;
+  photoOwnerDone(rec.photos);              // 付いたので、印は外す
   draftClear('catch:new:'+stUuid+':'+(spId||''));
   draftUnbind();
   // 履歴に「魚の記録」を残したまま個体入力へ。戻れば尾数の画面に帰る
@@ -6103,7 +6184,10 @@ function catchTotalOf(rec){
 function deleteCatch(u){
   if(!confirm('この記録を削除します。よろしいですか？')) return;
   const c = DB.get(DB.key.ca, u);
-  if(DB.softDelete(DB.key.ca, u)){ toast('削除しました'); goTo('station', c?c.station_uuid:null); }
+  if(DB.softDelete(DB.key.ca, u)){
+    draftClearFor('魚', u);
+    toast('削除しました'); goTo('station', c?c.station_uuid:null);
+  }
 }
 
 /* ---------- 川の環境（測点・河床材の割合・岸のカバー） ---------- */
@@ -6557,7 +6641,7 @@ SCREENS.noteEdit = (arg)=>{
       const base = collectNote();       // 書きかけを戻す前の姿を控える
       const d = draftGet(key);
       if(d){ applyVals({'#n_body':d.content}); toast('書きかけを戻しました'); }
-      photosBegin(n, d, {key, survey:svUuid});
+      photosBegin(n, d, {key, survey:svUuid, kind:'メモ'});
       draftBind(key, collectNote, base);
       const el=$('#n_body'); if(el && isNew && !d) el.focus();
     }
@@ -6584,7 +6668,10 @@ function saveNote(svUuid, uu){
 }
 function deleteNote(uu){
   if(!confirm('このメモを消します。よろしいですか？')) return;
-  if(DB.softDelete(DB.key.nt, uu)){ toast('消しました'); goBack(); }
+  if(DB.softDelete(DB.key.nt, uu)){
+    draftClearFor('メモ', uu);
+    toast('消しました'); goBack();
+  }
 }
 
 /* ---------- 1尾ずつ測る ---------- */
@@ -7394,21 +7481,46 @@ async function pendingPhotoItems(sv){
       species_id:'', species_name:'', time:n.created_at ? fmtTime(n.created_at) : '',
       lat:'', lon:'', rec_id:n.uuid};
   });
-  // まだ記録になっていない画面の分は、書きかけの鍵から種類を読む
+  // まだ記録になっていない画面の分は、写真に付けておいた中身から出す。
+  // 鍵の文字を読むだけだと、どの箇所の何の魚か分からない
+  // （2026-08-18 の11回目の監査 Major）
   const 鍵の種類 = (k)=>{
     const head = String(k||'').split(':')[0];
     if(head==='catch') return '魚';
     if(head==='note')  return 'メモ';
     return '箇所';
   };
+  // 消した記録の分は「まだ付いていない写真」ではない。
+  // 混ぜると、消したはずの写真がZIPに入る（2026-08-18 の12回目の監査 Major）
+  let owners; try{ owners = livePhotoOwners(); }catch(e){ throw e; }
   const 数 = {};
   return recs.filter(r=>r && r.id && r.owner && !saved.has(r.id))
-    .filter(r=>表[r.owner] || r.owner_sv===sv.uuid)
+    .filter(r=>{
+      if(表[r.owner]) return true;                          // 生きている記録の分
+      if(photoOwnerMode(r, owners) !== 'draft') return false; // 消した記録の分
+      return r.owner_sv===sv.uuid && owners.sv.has(sv.uuid);
+    })
     .sort((a,b)=>String(a.added_at||'').localeCompare(String(b.added_at||'')))
     .map(r=>{
-      const base = 表[r.owner] || {kind: 鍵の種類(r.owner), day:sv.survey_date||'',
-        station:'', species_id:'', species_name:'', time:'', lat:'', lon:'',
-        rec_id:r.owner};
+      let base = 表[r.owner];
+      if(!base){
+        // 古い写真には控えが無いので、鍵の形から拾う
+        const 鍵 = String(r.owner||'').split(':');
+        const stId = r.owner_st || (鍵[0]==='catch' && 鍵[1]==='new' ? 鍵[2] : '');
+        const spId = r.owner_sp || (鍵[0]==='catch' && 鍵[1]==='new' ? 鍵[3] : '');
+        // 消した箇所でも、同じ調査のものなら呼び名を出す
+        const st0 = stId ? DB.get(DB.key.st, stId) : null;
+        const st = (st0 && st0.survey_uuid===sv.uuid) ? st0 : null;
+        const sp = spId ? speciesById(spId) : null;
+        base = {kind: r.owner_kind || 鍵の種類(r.owner),
+          day: st ? stationDate(st, sv) : (sv.survey_date||''),
+          station: (st && st.name) || r.owner_st_name || '',
+          species_id: spId||'',
+          species_name: (sp && sp.ja) || r.owner_sp_name || '',
+          time: st ? (st.survey_time_start||'') : '',
+          lat: st ? st.latitude : '', lon: st ? st.longitude : '',
+          rec_id: r.owner};
+      }
       数[r.owner] = (数[r.owner]||0) + 1;
       return Object.assign({p:{id:r.id, ext:r.ext||'', size:r.size||0},
         pending:true, no:数[r.owner]}, base);
