@@ -119,6 +119,8 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 <div id="toast"></div>
 
 <script src="./leaflet.js"></script>
+<!-- 地図を回すための部品。読めなかった端末では、北が上のまま今までどおり動く -->
+<script src="./vendor/leaflet-rotate.js"></script>
 <script>
 /* ============================================================
    魚類調査記録アプリ
@@ -129,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v27';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v28';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1676,7 +1678,8 @@ function envRememberView(svUuid){
   const map = MAPS.main.map; if(!map) return;
   try{
     const c = map.getCenter();
-    ENV_VIEW[svUuid] = {lat:c.lat, lon:c.lng, zoom:map.getZoom()};
+    ENV_VIEW[svUuid] = {lat:c.lat, lon:c.lng, zoom:map.getZoom(),
+                        bearing: mapBearing(map)};
   }catch(e){}
 }
 /* 全体が入るように動かす。押したときだけ */
@@ -1774,6 +1777,72 @@ function envSetKind(k){
   else                     ENV_NEXT = {kind:k, auto:true, line:ENV_NEXT.line, survey:sv};
   if(!envSyncNextUI()) render();
 }
+/* まとめて消すために選んでいる最中。{sv, set} を持つ（2026-08-18 の実機の声） */
+let ENV_PICK = null;
+function envPickOn(){ return !!(ENV_PICK && ENV_PICK.set); }
+function envPickStart(svUuid){
+  if(!writeAllowed()){
+    toast('このタブでは消せません。記録を入れているタブでお試しください', 7000);
+    return;
+  }
+  ENV_PICK = {sv: svUuid, set: new Set()};
+  render();
+}
+function envPickCancel(){ ENV_PICK = null; render(); }
+function envPickToggle(u){
+  if(!envPickOn()) return;
+  if(ENV_PICK.set.has(u)) ENV_PICK.set.delete(u); else ENV_PICK.set.add(u);
+  envPickSync();
+}
+/* 選んだ数と印を、その場で書き替える（画面ごと作り直すと地図がちらつく） */
+function envPickSync(){
+  const n = envPickOn() ? ENV_PICK.set.size : 0;
+  document.querySelectorAll('[data-seg="envsel"] button[data-u]').forEach(b=>{
+    b.classList.toggle('on', !!(envPickOn() && ENV_PICK.set.has(b.dataset.u)));
+  });
+  const btn = $('#envPickDel');
+  if(btn){
+    btn.textContent = n ? `選んだ ${n}件を消す` : '消すものを押してください';
+    btn.disabled = !n;
+  }
+}
+/* まとめて消す。1回の保存で書く。
+   1件ずつ書くと、途中で失敗したときに「消えたもの・残ったもの」が混ざる */
+function envPickDelete(svUuid){
+  if(!envPickOn() || !ENV_PICK.set.size) return;
+  if(!writeAllowed()){
+    toast('このタブでは消せません。記録を入れているタブでお試しください', 7000);
+    return;
+  }
+  const ids = Array.from(ENV_PICK.set);
+  const names = ids.map(u=>(DB.get(DB.key.st, u)||{}).name||'').filter(Boolean);
+  const 並び = names.slice(0,5).join('・') + (names.length>5 ? `ほか${names.length-5}件` : '');
+  if(!confirm(`${並び} の ${ids.length}件を消します。中の記録も一緒に見えなくなります。`
+    + '\nよろしいですか？')) return;
+  let all;
+  try{ all = DB.loadRaw(DB.key.st); }
+  catch(e){ toast('保存された記録を読み取れないため、消せませんでした', 7000); return; }
+  const t = nowISO();
+  let n = 0;
+  all.forEach(x=>{
+    if(x && ENV_PICK.set.has(x.uuid) && x.survey_uuid===svUuid && !x.deleted_at){
+      x.deleted_at = t; n++;
+    }
+  });
+  if(!n){ toast('消せるものがありませんでした'); ENV_PICK = null; render(); return; }
+  if(!DB.save(DB.key.st, all)){
+    toast('消せませんでした（端末の空き容量をご確認ください）', 8000);
+    return;                      // 何も変えない
+  }
+  ids.forEach(u=>{ try{ draftClearFor('箇所', u); }catch(e){} });
+  ENV_PICK = null;
+  if(ENV_SEL && !DB.getAlive(DB.key.st, ENV_SEL)) ENV_SEL = null;
+  if(ENV_NEXT.line && !DB.getAlive(DB.key.st, ENV_NEXT.line)){
+    ENV_NEXT = {kind:ENV_NEXT.kind, auto:ENV_NEXT.auto, line:'', survey:ENV_NEXT.survey};
+  }
+  toast(`${n}件を消しました`);
+  render();
+}
 /* いま選んでいるもの・つなげる・案内の一行を、その場で書き替える。
    画面ごと作り直すと地図がちらつくので、必要なところだけ直す
    （2026-08-18 の実機の声） */
@@ -1864,7 +1933,10 @@ function envAddAt(svUuid, lat, lon, acc){
     // 「閉じる」と「次を始める」を別々に保存すると、片方だけ成功したときに
     // 閉じたのに次が始まっていない半端な状態が残る（2026-08-17 の監査 Major）。
     // 1回の保存でまとめて書く
-    const つなぐ = envChain() && ENV_NEXT.auto;
+    // 交互かどうかに関わらず、「つなげる」が入っていればつなぐ。
+    // 交互をやめた（P を押した等）とたんに、前の終わりから始められなくなっていた
+    // （2026-08-18 の実機の声）
+    const つなぐ = envChain();
     const nx = つなぐ ? {
       uuid: uuid(), survey_uuid: svUuid,
       station_no: 0,          // すぐ下で、いま読んだ一覧から決め直す
@@ -1898,7 +1970,8 @@ function envAddAt(svUuid, lat, lon, acc){
     envAdvance('LE');
     let 続き = '';
     if(nx){
-      ENV_NEXT = {kind:'LE', auto:true, line:nx.uuid, survey:svUuid};
+      // 交互にするかどうかは、人が決めたままにする（勝手に戻さない）
+      ENV_NEXT = {kind:'LE', auto:ENV_NEXT.auto, line:nx.uuid, survey:svUuid};
       続き = `　つづけて ${nx.name} が始まりました`;
     }
     ENV_SEL = st.uuid;          // いま閉じたものを選ぶ（前の記録に書き込ませない）
@@ -2428,6 +2501,7 @@ function baseMapName(){ const v=prefs().basemap; return BASEMAPS[v] ? v : '航�
    別のものになり、画面を離れても地図が残る（同じ場所に2つ目を作れず壊れる） */
 const MAPS = { main:{map:null, layer:null}, off:{map:null, layer:null} };
 function destroyMaps(){
+  compassStop();          // 向きの追いかけを、地図と一緒に止める
   // 片付ける前に、見ている場所を覚えておく。
   // 地図の合図（moveend）で覚えると、片付けの最中に走って落ちることがある
   if(ENV_MAP_SV && MAPS.main && MAPS.main.map){
@@ -2446,13 +2520,151 @@ function destroyMaps(){
 }
 /* 地図を寄せられる上限。タイルは18までなので、その先は引き伸ばして見せる */
 const MAP_MAX_ZOOM = 22;
-function makeMap(elId, center, zoom){
+/* この端末で地図を回せるか。部品が読めていれば回せる */
+function canRotate(){
+  return !!(window.L && L.Map && L.Map.prototype
+    && typeof L.Map.prototype.setBearing === 'function');
+}
+function makeMap(elId, center, zoom, bearing){
   const el = document.getElementById(elId);
   if(!el || !window.L) return null;
-  const m = L.map(el, {zoomControl:true, attributionControl:true,
-                       maxZoom:MAP_MAX_ZOOM})
-             .setView(center||[43.06,141.35], zoom||14);
+  const opt = {zoomControl:true, attributionControl:true, maxZoom:MAP_MAX_ZOOM};
+  if(canRotate()){
+    // 指2本でひねると回る。自前の向きボタンを出すので、部品のボタンは出さない
+    opt.rotate = true; opt.rotateControl = false;
+    opt.touchRotate = true; opt.shiftKeyRotate = true;
+    opt.bearing = numOf(bearing)==='' ? 0 : numOf(bearing);
+  }
+  const m = L.map(el, opt).setView(center||[43.06,141.35], zoom||14);
+  if(canRotate()) addCompassControls(m);
   return m;
+}
+/* 地図の向き（北から時計回りの度）。回せない端末では 0 */
+function mapBearing(map){
+  try{ return (map && typeof map.getBearing==='function') ? map.getBearing() : 0; }
+  catch(e){ return 0; }
+}
+/* 方位。北の針（押すと北が上に戻る）と、自分の向きに合わせる印 */
+let COMPASS_ON = false, COMPASS_HANDLER = null, COMPASS_EV = 'deviceorientation';
+let COMPASS_GEN = 0;
+function addCompassControls(map){
+  const C = L.Control.extend({
+    options:{position:'topright'},
+    onAdd(){
+      const d = L.DomUtil.create('div','leaflet-bar mapicons');
+      // 北の針。地図が回れば、北もその分だけ回った先にある
+      const n = L.DomUtil.create('a','',d);
+      n.href='#'; n.title='北を上に戻す'; n.setAttribute('aria-label','北を上に戻す');
+      n.innerHTML = iconSvg('north');
+      const upd = ()=>{
+        const g = n.querySelector('svg');
+        if(g) g.style.transform = 'rotate(' + mapBearing(map) + 'deg)';
+      };
+      map.on('rotate', upd); upd();
+      L.DomEvent.on(n,'click',ev=>{
+        L.DomEvent.stop(ev);
+        compassStop();
+        try{ map.setBearing(0); }catch(e){}
+        upd();
+        toast('北を上に戻しました');
+      });
+      // 自分の向きを上にする
+      const c = L.DomUtil.create('a','',d);
+      c.href='#'; c.title='自分の向きを上にする';
+      c.setAttribute('aria-label','自分の向きを上にする');
+      c.dataset.k = 'compass';
+      c.innerHTML = iconSvg('compass');
+      if(COMPASS_ON) c.classList.add('on');
+      L.DomEvent.on(c,'click',ev=>{ L.DomEvent.stop(ev); compassToggle(map); });
+      L.DomEvent.disableClickPropagation(d);
+      return d;
+    }
+  });
+  const ctl = new C();
+  ctl.addTo(map);
+  return ctl;
+}
+function compassMark(on){
+  document.querySelectorAll('.mapicons a[data-k="compass"]').forEach(a=>{
+    a.classList.toggle('on', !!on);
+  });
+}
+function compassStop(){
+  if(COMPASS_HANDLER){
+    try{ window.removeEventListener(COMPASS_EV, COMPASS_HANDLER); }catch(e){}
+    COMPASS_HANDLER = null;
+  }
+  COMPASS_ON = false;
+  COMPASS_GEN++;            // 待っている許可が、あとから効かないように
+  compassMark(false);
+}
+/* 端末の向き（北から時計回りの度）を出す。
+   水平に持ったときは「上端の向き」、立てて持ったときは「画面の裏＝見ている向き」を使う。
+   どちらか一方だけだと、持ち方によって出せない・大きくずれる */
+function headingOf(e){
+  if(typeof e.webkitCompassHeading === 'number' && isFinite(e.webkitCompassHeading)){
+    return e.webkitCompassHeading;
+  }
+  if(!(e.absolute === true || COMPASS_EV === 'deviceorientationabsolute')) return null;
+  const a = e.alpha, b = e.beta, g = e.gamma;
+  if(!isFinite(a)) return null;
+  if(!isFinite(b) || !isFinite(g)) return (360 - a) % 360;
+  const d = Math.PI/180;
+  const cA=Math.cos(a*d), sA=Math.sin(a*d), cB=Math.cos(b*d), sB=Math.sin(b*d),
+        cG=Math.cos(g*d), sG=Math.sin(g*d);
+  const Ey = -sA*cB, Ny = cA*cB;                    // 端末の上端が向く方向
+  if(Math.hypot(Ey, Ny) > 0.15) return (Math.atan2(Ey, Ny)/d + 360) % 360;
+  const Ez = sG*cA + sB*cG*sA, Nz = sG*sA - sB*cG*cA;   // ほぼ立てて持っているとき
+  return (Math.atan2(-Ez, -Nz)/d + 360) % 360;
+}
+function compassStart(map){
+  const gen = ++COMPASS_GEN;
+  COMPASS_EV = ('ondeviceorientationabsolute' in window)
+    ? 'deviceorientationabsolute' : 'deviceorientation';
+  let 届いた = false, 前 = null;
+  COMPASS_HANDLER = (e)=>{
+    if(gen !== COMPASS_GEN) return;
+    const h = headingOf(e);
+    if(h === null) return;
+    if(!届いた){
+      届いた = true;
+      compassMark(true);
+      toast('自分の向きが画面の上になります（もう一度押すと戻ります）', 6000);
+    }
+    // 2度未満の揺れは無視する（じっとしていても地図が震える）
+    if(前 !== null && Math.abs(((h - 前 + 540) % 360) - 180) < 2) return;
+    前 = h;
+    try{ map.setBearing(-h); }catch(err){}
+  };
+  window.addEventListener(COMPASS_EV, COMPASS_HANDLER);
+  COMPASS_ON = true;
+  compassMark(true);
+  toast('方位を確かめています…');
+  // 何も届かない端末（方位計が無い等）では、そのまま待たせない
+  setTimeout(()=>{
+    if(gen === COMPASS_GEN && COMPASS_ON && !届いた){
+      compassStop();
+      toast('この端末では方位を取れませんでした。指2本でひねると手で回せます', 9000);
+    }
+  }, 4000);
+}
+function compassToggle(map){
+  if(COMPASS_ON || COMPASS_HANDLER){
+    compassStop();
+    toast('向きに合わせるのをやめました（地図の向きはそのまま）', 5000);
+    return;
+  }
+  if(!canRotate()){ toast('この端末では地図を回せません'); return; }
+  // iPhone は、押した流れの中でしか許可を聞けない
+  const D = window.DeviceOrientationEvent;
+  if(D && typeof D.requestPermission === 'function'){
+    D.requestPermission().then(r=>{
+      if(r === 'granted') compassStart(map);
+      else toast('方位を使う許可が下りませんでした', 7000);
+    }).catch(()=>toast('方位を使えませんでした', 7000));
+    return;
+  }
+  compassStart(map);
 }
 function applyBaseMap(slot, name){
   const s = MAPS[slot];
@@ -2578,6 +2790,13 @@ const MAP_ICONS = {
   // いまいる場所に足す（狙いの輪＋十字）
   addHere: '<circle cx="12" cy="12" r="5"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>'
     + '<circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/>',
+  // 北の針（上が北。地図が回ると一緒に回る）
+  north: '<path d="M12 2.5 L16.5 21 L12 17 L7.5 21 Z" fill="currentColor" stroke="none"/>'
+    + '<path d="M12 17 L12 2.5" stroke-width="1.2"/>',
+  // 自分の向きに合わせる（方位計）
+  compass: '<circle cx="12" cy="12" r="9"/>'
+    + '<path d="M15.5 8.5 L10.5 10.5 L8.5 15.5 L13.5 13.5 Z"'
+    + ' fill="currentColor" stroke="none"/>',
   // つなげる（鎖）
   chain: '<path d="M9.5 14.5 L14.5 9.5"/>'
     + '<path d="M13 6.5l1.5-1.5a3.5 3.5 0 0 1 5 5L18 11.5"/>'
@@ -5079,8 +5298,11 @@ SCREENS.envMap = (svUuid)=>{
   const chip = (st)=>{
     const k = envKindOf(st);
     const half = (k==='L' && !linePt(st,'end'));
-    return `<button type="button" class="${st.uuid===ENV_SEL?'on':''}"
-      onclick="envSelect('${st.uuid}')">${esc(st.name||'')}${half?'…':''}</button>`;
+    const 選ぶ = envPickOn();
+    const on = 選ぶ ? ENV_PICK.set.has(st.uuid) : (st.uuid===ENV_SEL);
+    const act = 選ぶ ? `envPickToggle('${st.uuid}')` : `envSelect('${st.uuid}')`;
+    return `<button type="button" data-u="${st.uuid}" class="${on?'on':''}"
+      onclick="${act}">${選ぶ && on ? '&check; ' : ''}${esc(st.name||'')}${half?'…':''}</button>`;
   };
 
   const g = k => (cur && cur[k]!==undefined && cur[k]!=='' ? cur[k] : '');
@@ -5117,8 +5339,15 @@ SCREENS.envMap = (svUuid)=>{
       <div class="card">
         <h3 style="margin-top:0">記録</h3>
         ${list.length
-          ? `<div class="seg" data-seg="envsel">${list.map(chip).join('')}</div>`
-          : '<div class="dim small">まだありません。地図をタップするか「いまここに追加」で置いてください。</div>'}
+          ? `<div class="seg" data-seg="envsel">${list.map(chip).join('')}</div>
+             ${envPickOn() ? `
+               <button class="btn ng sm" id="envPickDel"
+                 onclick="envPickDelete('${svUuid}')">消すものを押してください</button>
+               <button class="btn sm" onclick="envPickCancel()">やめる</button>
+               <div class="dim small">消すものを押して選んでください。
+                 選んでいるあいだは、新しく置けません。</div>`
+             : `<button class="btn sm" onclick="envPickStart('${svUuid}')">選んで消す</button>`}`
+          : '<div class="dim small">まだありません。地図をタップするか、地図の右下の狙いの印で置いてください。</div>'}
       </div>
 
       ${!cur ? '' : `
@@ -5235,6 +5464,7 @@ SCREENS.envMap = (svUuid)=>{
         drawMe('main');          // いる場所を追いかける
       }, 2000);
 
+      if(ENV_PICK && ENV_PICK.sv !== svUuid) ENV_PICK = null;
       ENV_FORM = cur ? cur.uuid : '';
       ENV_DIRTY = false;
       if(cur){
@@ -5275,7 +5505,7 @@ SCREENS.envMap = (svUuid)=>{
       // 地図。前に見ていた場所があればそこへ戻す（勝手に動かさない）
       const v = ENV_VIEW[svUuid];
       const c = v ? [v.lat, v.lon] : envMapCenter(sv, cur);
-      MAPS.main.map = makeMap('envmap', c, v ? v.zoom : 17);
+      MAPS.main.map = makeMap('envmap', c, v ? v.zoom : 17, v ? v.bearing : 0);
       const map = MAPS.main.map;
       if(!map) return;
       applyBaseMap('main', baseMapName());
@@ -5300,7 +5530,10 @@ SCREENS.envMap = (svUuid)=>{
       envDrawAll(svUuid);
       drawMe('main');            // 開いた時点でも、いる場所を出す
       ENV_MAP_SV = svUuid;      // 片付ける直前に、見ている場所を覚えるため
-      map.on('click', e=>{ envAddAt(svUuid, e.latlng.lat, e.latlng.lng, null); render(); });
+      map.on('click', e=>{
+        if(envPickOn()){ toast('消すものを選んでいます。先に「やめる」を押してください', 6000); return; }
+        envAddAt(svUuid, e.latlng.lat, e.latlng.lng, null); render();
+      });
       // はじめて開いたときだけ、置いてあるものが入るようにする
       if(!v){
         const pts = envAllPoints(svUuid);
@@ -5369,6 +5602,10 @@ function envDrawAll(svUuid){
 
 /* いまいる場所に足す */
 function envAddHere(svUuid){
+  if(envPickOn()){
+    toast('消すものを選んでいます。先に「やめる」を押してください', 6000);
+    return;
+  }
   toast('現在地を取っています…');
   getFixOnce(f=>{
     if(!f){ toast('現在地を取れませんでした。地図をタップしても置けます', 6000); return; }
