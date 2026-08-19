@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v31';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v32';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1864,7 +1864,15 @@ function envSyncNextUI(){
   const hint = $('#envHint');
   if(hint){
     const 名 = envKindWord(ENV_NEXT.kind);
-    hint.innerHTML = `つぎ：<b>${esc(名)}</b>　地図をタップ／狙いの印で置けます`
+    let 行き先 = '';
+    if(ENV_NEXT.kind === 'V'){
+      // どのラインに付くのかを出す。つなげたときは、選ばれているものと違うことがある
+      const t = envBendTarget(ENV_NEXT.survey);
+      行き先 = t ? `　<b>${esc(t.name||'')}</b> に足します`
+                 : '　<span class="pill ng">どのラインに足すか決められません</span>';
+    }
+    hint.innerHTML = `つぎ：<b>${esc(名)}</b>${行き先}`
+      + `　地図をタップ／狙いの印で置けます`
       + (ENV_NEXT.auto ? '（始まり→終わりで交互）' : '（同じものが続きます）');
   }
   const box = $('#envPending');
@@ -1979,6 +1987,7 @@ function envAddAt(svUuid, lat, lon, acc){
     if(!DB.save(DB.key.st, all)) return null;   // 保存できていないので、何も変えない
     envHistPush({type:'終わり', sv:svUuid, uuid:st.uuid, name:st.name,
       next: nx ? nx.uuid : '', prevTime: 前の終了時刻, prevEnded: 前のended});
+    envMarkPlaced();
 
     envAdvance('LE');
     let 続き = '';
@@ -2739,7 +2748,15 @@ function dotIcon(color, size){
    1) 埋め込んだ表にあれば、その川の調査範囲へ
    2) 無ければ、電波があるときだけ地名検索
    何も見つからなければ動かさない（現場で勝手に飛ばない） */
+/* 川の名前を打ち替えるたびに呼ばれる。
+   電波で探しているあいだに次の名前を打つと、前の名前の答えが遅れて届く。
+   そのまま使うと、いまの表示を上書きして前の川へ飛んでしまう
+   （2026-08-19 に、テストの揺れとして表に出た） */
+let FIT_RIVER_SEQ = 0;
 function fitRiver(map, name, msgSel){
+  const my = ++FIT_RIVER_SEQ;
+  const gen = screenGen();
+  const 古い = () => my !== FIT_RIVER_SEQ || screenStale(gen) || map !== MAPS.main.map;
   const say = t => { const el = msgSel && $(msgSel); if(el) el.textContent = t; };
   const b = riverBounds(name);
   if(b){
@@ -2751,6 +2768,7 @@ function fitRiver(map, name, msgSel){
   }
   say(`${esc(name)}：記録に無い川です。電波があれば探します…`);
   return searchPlace(name).then(hit=>{
+    if(古い()) return false;      // もっと新しい名前で探し直している
     if(!hit){ say(`${esc(name)}：場所が分かりませんでした。地図を動かして決めてください`); return false; }
     try{ map.setView([hit.lat, hit.lon], 13); }catch(e){}
     say(`${esc(hit.title)} のあたりに合わせました（地名検索）`);
@@ -5733,6 +5751,7 @@ function envSelect(u){
   if(ENV_SEL === u) return;
   envFlush();            // 打ちかけの分を、切り替える前に書いてしまう
   ENV_SEL = u;
+  envMarkSelected();     // 人が選んだ。曲がりの行き先は、これを先に見る
   render();
 }
 function envDelete(u){
@@ -5914,20 +5933,32 @@ function envUndo(svUuid){
   }
   return false;
 }
+/* 「選んだ」のと「置いた」のと、どちらが後かを覚えておく。
+   つなげたときは、閉じたラインが選ばれたまま次のラインが始まるので、
+   選ばれているほうを先に見ると、曲がりが前のラインに付く
+   （2026-08-19 の実機の声） */
+let ENV_SEQ = 0, ENV_SEL_SEQ = 0, ENV_PLACE_SEQ = 0;
+function envMarkSelected(){ ENV_SEL_SEQ = ++ENV_SEQ; }
+function envMarkPlaced(){ ENV_PLACE_SEQ = ++ENV_SEQ; }
 /* 曲がりを足す相手のライン。
-   1) いま選んでいるライン（終わっていてもよい。あとから形を整えられる）
-   2) 直前に置いた始まり
-   3) 終わっていないラインがちょうど1本ならそれ */
+   1) 人が選び直した直後なら、その記録（古いラインの形を整えたいとき）
+   2) いま引いている途中のライン
+   3) 選んでいるライン（終わっていてもよい）
+   4) 終わっていないラインがちょうど1本ならそれ
+   5) ラインがちょうど1本ならそれ */
 function envBendTarget(svUuid){
   const 線 = st => st && isLine(st) && linePt(st,'start');
+  const 未完 = st => 線(st) && !linePt(st,'end');
   const sel = ENV_SEL ? DB.getAlive(DB.key.st, ENV_SEL) : null;
-  if(線(sel) && sel.survey_uuid===svUuid) return sel;
+  const この調査 = st => st && st.survey_uuid===svUuid;
+  if(ENV_SEL_SEQ > ENV_PLACE_SEQ && 線(sel) && この調査(sel)) return sel;
   if(ENV_NEXT.line){
     const st = DB.getAlive(DB.key.st, ENV_NEXT.line);
-    if(線(st) && st.survey_uuid===svUuid) return st;
+    if(未完(st) && この調査(st)) return st;
   }
-  const 未完 = DB.stationsOf(svUuid).filter(x=>線(x) && !linePt(x,'end'));
-  if(未完.length===1) return 未完[0];
+  if(線(sel) && この調査(sel)) return sel;
+  const 未完たち = DB.stationsOf(svUuid).filter(未完);
+  if(未完たち.length===1) return 未完たち[0];
   const 線ぜんぶ = DB.stationsOf(svUuid).filter(線);
   return 線ぜんぶ.length===1 ? 線ぜんぶ[0] : null;
 }
@@ -5949,6 +5980,8 @@ function envAddBend(svUuid, la, lo, acc){
   }
   ENV_SEL = st.uuid;
   envHistPush({type:'曲がり', sv:svUuid, uuid:st.uuid, name:st.name});
+  // 曲がりは「置いた」に数えない。数えると、ラインを選んで曲がりを1つ足しただけで、
+  // つぎの曲がりが別のライン（引いている途中のもの）へ行ってしまう
   toast(`${st.name||''} に曲がりを置きました（${(st.line_via||[]).length}個目）`);
   return st.uuid;
 }
