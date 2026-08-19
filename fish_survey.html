@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v34';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v35';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -5702,6 +5702,178 @@ function fishFitAll(svUuid){
   try{ map.fitBounds(L.latLngBounds(pts).pad(0.3), {animate:false}); }catch(e){}
   fishRememberView(svUuid);
 }
+/* 入力欄のつなぎ込み（書きかけ・写真・自動保存）。
+   物理環境の地図でも、魚の地図でも同じものを使う */
+function envItemFormWire(cur, sv){
+  ENV_FORM = cur ? cur.uuid : '';
+  ENV_DIRTY = false;
+  if(!cur) return;
+  const key = 'envitem:'+cur.uuid;
+  SCREENS._photos = ((cur.photos)||[]).slice();
+  const base = collectEnvItem();
+  // 見ているだけのタブでは、書きかけを持たない。
+  // 持つと、記録を入れているタブの書きかけを上書きしてしまう（監査 Major）
+  const d = ownsLock() ? draftGet(key) : null;
+  if(d){
+    applySels(d);
+    applySegRaw('envhab', d.__hab);
+    applySeg('envsub', d.__sub); applySeg('envgr', d.__gr);
+    toast('書きかけを戻しました');
+  }
+  photosBegin(cur, d, {key, survey:sv.uuid, kind:'箇所'});
+  if(ownsLock()) draftBind(key, collectEnvItem, base);
+  envShowError(envItemError());
+  // 入力のたびに、少し待ってから保存する
+  const box = $('#envItemForm');
+  if(box && ownsLock()){
+    box.addEventListener('input',  ()=>envAutoSave(cur.uuid));
+    box.addEventListener('change', ()=>envAutoSave(cur.uuid));
+    // 選ぶボタン（環境区分・河床材料・礫の状況）は input も change も出さない。
+    // 拾わないと、押したのに記録にも書き出しにも入らない
+    // （2026-08-17 の監査 Critical）
+    // 押したボタンそのものだけを拾う（枠の余白を押しても数えない）。
+    // pickSeg はボタン自身の onclick なので、ここへ来る時点で選び終わっている。
+    // ひと呼吸置くと、その間に画面が変わって取りこぼす（2026-08-18 の監査 Major）
+    box.addEventListener('click', e=>{
+      if(e.target && e.target.closest && e.target.closest('[data-seg] button')){
+        envAutoSave(cur.uuid);
+      }
+    });
+  }
+}
+/* 選んだ記録の入力欄。物理環境の地図でも、魚の地図でも同じものを使う。
+   別の画面へ跳ばずに、その場で入れられるようにするため（2026-08-19 の実機の声） */
+function envItemFormHtml(cur, sv, opt){
+  const g = k => (cur && cur[k]!==undefined && cur[k]!=='' ? cur[k] : '');
+  const pct = cur ? substratePct(cur) : {};
+  if(!cur) return '';
+  return `
+      <div id="envItemForm">
+${(opt && opt.head === false) ? '' : `      <div class="card">
+        <div class="row">
+          <div class="grow"><div style="font-weight:700;font-size:18px">${esc(cur.name||'')}</div>
+            <div class="dim small">${envKindOf(cur)==='L'
+              ? (linePt(cur,'end') ? '区間 '+esc(fmtDist(lineDist(cur)))
+                    + (lineVias(cur).length ? `　曲がり ${lineVias(cur).length}個` : '')
+                                   : '<span class="pill warn">終わりがまだ</span>'
+                    + (lineVias(cur).length ? `　曲がり ${lineVias(cur).length}個` : ''))
+              : (!stationPt(cur) ? '<span class="pill ng">位置なし</span>'
+                 : esc(fixCoord(cur.latitude)+', '+fixCoord(cur.longitude)))}
+              ${cur.survey_time_start ? '　'+esc(cur.survey_time_start) : ''}${
+                cur.survey_time_end ? '〜'+esc(cur.survey_time_end) : ''}</div>
+          </div>
+          <button class="btn sm ng" style="width:auto;margin:0"
+            onclick="envDelete('${cur.uuid}')">消す</button>
+        </div>
+
+        ${(envFixFold(cur.uuid), '')}${foldHtml('envfix', '位置と時刻を直す',
+          `<span class="fsub">${envKindOf(cur)==='L' ? '始点・終点・時刻' : '位置・時刻'}</span>`,
+          (envKindOf(cur)==='L' ? ['始点','終点'] : ['点']).map(w=>{
+            const ある = w==='点' ? !!stationPt(cur)
+                       : !!linePt(cur, w==='始点' ? 'start' : 'end');
+            const 待ち = envMoveOn(cur.uuid, w);
+            return `<div class="row" style="margin-bottom:6px">
+              <div class="grow"><div class="dim small">${esc(w)}</div>
+                <div>${ある
+                  ? esc(w==='点' ? fixCoord(cur.latitude)+', '+fixCoord(cur.longitude)
+                      : fixCoord(cur['line_'+(w==='始点'?'start':'end')+'_lat'])+', '
+                        +fixCoord(cur['line_'+(w==='始点'?'start':'end')+'_lon']))
+                  : '<span class="pill ng">まだありません</span>'}</div></div>
+              <button class="btn sm ok" style="width:auto;margin:0"
+                onclick="envGrabHere('${cur.uuid}','${w}')">いまここ</button>
+              <button class="btn sm ${待ち?'ng':''}" style="width:auto;margin:0"
+                onclick="envMoveStart('${cur.uuid}','${w}')">${待ち?'やめる':'地図で直す'}</button>
+            </div>`;
+          }).join('')
+          + (envKindOf(cur)==='L' ? `<div class="row" style="margin-top:6px">
+              <div class="grow"><div class="dim small">曲がり</div>
+                <div>${lineVias(cur).length}個</div></div>
+              <button class="btn sm" style="width:auto;margin:0"
+                onclick="if(envUndoBend('${cur.uuid}')) render()">最後を取り消す</button>
+              <button class="btn sm ng" style="width:auto;margin:0"
+                onclick="if(envClearBends('${cur.uuid}')) render()">全部消す</button>
+            </div>` : '')
+          + `<div class="dim small">「地図で直す」を押してから、地図をタップしてください。</div>
+          <div class="row" style="margin-top:8px">
+            <div class="grow"><label>開始時刻</label>
+              <input type="time" id="ev_t1" value="${esc(cur.survey_time_start||'')}"></div>
+            ${envKindOf(cur)==='L' ? `<div class="grow"><label>終了時刻</label>
+              <input type="time" id="ev_t2" value="${esc(cur.survey_time_end||'')}"></div>` : ''}
+          </div>`, envMoveOn(cur.uuid))}
+`}
+        <label>環境区分</label>
+        <div class="seg" data-seg="envhab">
+          ${['なし'].concat(OPT.habitat).map(o=>{
+            const short = o==='なし' ? 'なし' : habitatShort(o);
+            const on = (o==='なし' ? !g('habitat_type') : g('habitat_type')===o);
+            return `<button type="button" class="${on?'on':''}"
+              onclick="pickSeg(this)" title="${esc(o)}">${esc(short)}</button>`;
+          }).join('')}
+        </div>
+
+        <label>河床材料</label>
+        ${segHtml('envsub', OPT.substrate, g('substrate1'), true)}
+
+        <label>礫の状況</label>
+        ${segHtml('envgr', OPT.gravel, g('gravel_condition'), true)}
+
+        <div class="row" style="margin-top:10px">
+          <div class="grow">
+            <label>流速（m/s）</label>
+            <input id="ev_v" inputmode="decimal" value="${esc(cmToMDisp(cur.velocity_rep_cms))}"
+              placeholder="例）0.253">
+          </div>
+          <div class="grow">
+            <label>水深（m）</label>
+            <input id="ev_d" inputmode="decimal" value="${esc(cmToMDisp(cur.depth_rep_cm))}"
+              placeholder="例）0.25">
+          </div>
+        </div>
+        <div class="dim small">淀みの流速0・干出の水深0も、そのまま入れてください。</div>
+
+        ${foldHtml('envpct', '河床材料の割合', '<span class="fsub">分かるときだけ</span>', `
+          ${OPT.substrate.map(k=>`
+            <div class="row" style="margin-top:6px">
+              <div class="grow dim">${esc(k)}
+                <span class="small">${esc(SUBSTRATE_NOTE[k]||'')}</span></div>
+              <div style="width:92px">
+                <input id="evp_${SUBSTRATE_NO[k]}" inputmode="decimal"
+                  value="${esc(pct[k]!==undefined?pct[k]:'')}"></div>
+            </div>`).join('')}
+          <div class="dim small" style="margin-top:6px">合計100％が目安です。</div>`)}
+
+        ${foldHtml('envcov', 'カバー（左右岸）', '', `
+          ${['left','right'].map(side=>{
+            const label = side==='left' ? '左岸' : '右岸';
+            const cl = coverList(cur, side);
+            return `<h3>${label}</h3>
+              ${[0,1,2].map(i=>{
+                const c = cl[i] || {};
+                const opts = ['<option value="">（選ばない）</option>'].concat(
+                  OPT.cover.map(o=>`<option value="${esc(o)}"${o===c.type?' selected':''}>${esc(o)}</option>`)
+                ).join('');
+                return `<div class="row" style="margin-top:8px">
+                  <div class="grow"><select id="evc_${side}_${i}_t">${opts}</select></div>
+                  <div style="width:92px">
+                    <input id="evc_${side}_${i}" inputmode="decimal" placeholder="割合%"
+                      value="${esc(c.pct!==undefined?c.pct:'')}"></div>
+                </div>`;
+              }).join('')}
+              <label>${label}のカバー長（m）</label>
+              <input id="evc_${side}_len" inputmode="decimal"
+                value="${esc(cur['cover_'+side+'_length_m']!==undefined?cur['cover_'+side+'_length_m']:'')}">`;
+          }).join('')}`)}
+
+        <label>メモ</label>
+        <textarea id="ev_memo">${esc(g('memo'))}</textarea>
+        <div id="ev_err"></div>
+      </div>
+
+      ${photoPanelHtml('この点・区間のようす。', true)}
+      </div>
+      <div class="dim small" id="ev_saved">入れたそばから、自動で保存されます。</div>
+      <button class="btn pri" onclick="saveEnvItem('${cur.uuid}')">保存する</button>`;
+}
 SCREENS.fishMap = (svUuid)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
@@ -5743,7 +5915,7 @@ SCREENS.fishMap = (svUuid)=>{
           大きい単位は、中に入っているものの集計になります。</div>
       </div>
 
-      ${!cur ? '' : `<div class="card">
+      ${!cur ? '' : `<div class="card" id="fishUnitCard">
         <div class="row">
           <div class="grow">
             <div style="font-weight:700;font-size:18px">${esc(cur.name||'')}</div>
@@ -5764,10 +5936,7 @@ SCREENS.fishMap = (svUuid)=>{
             ${子.length ? `<div class="grow"><div class="dim small">中の単位</div>
               <div class="big">${t.単位 - 1}</div></div>` : ''}
           </div>`;
-          if(!子.length){
-            return 数 + `<button class="btn pri" onclick="nav('station','${cur.uuid}')">
-              この${esc(UNIT_MARK[unitKindOf(cur)]||'')}に記録する</button>`;
-          }
+          if(!子.length) return 数;
           const 内訳 = 子.map(c=>{
             const ct = unitTotals(c.uuid, list);
             return `<button type="button" class="btn sm" style="text-align:left"
@@ -5777,7 +5946,40 @@ SCREENS.fishMap = (svUuid)=>{
           return 数 + `<div class="dim small">中に入っているものの集計です。
             記録は、その中の小さい単位に入れてください。</div>${内訳}`;
         })()}
-      </div>`}
+      </div>
+
+      ${子.length ? '' : `
+      ${foldHtml('fishcatch', '魚を記録する',
+        `<span class="fsub">${(()=>{ const t = unitTotals(cur.uuid, list);
+          return `${t.種}種 ${t.尾}尾`; })()}</span>`,
+        (()=>{
+          const cs = DB.catchesOf(cur.uuid);
+          return `<button class="btn pri" onclick="nav('speciesPick','${cur.uuid}')">
+            魚を足す（種類を選ぶ）</button>
+          ${cs.length ? cs.map(c=>`<button class="btn sm" style="text-align:left"
+              onclick="nav('catchEdit',{uuid:'${c.uuid}'})">
+              ${esc(c.species_name||c.species_id||'（種なし）')}
+              <span class="fsub">${catchTotal(c)}尾${
+                (c.photos||[]).length ? '　写真'+(c.photos||[]).length : ''}</span></button>`).join('')
+            : '<div class="dim small">まだありません。「魚を足す」から入れてください。</div>'}`;
+        })(), true)}
+
+      ${isDetail(sv) ? '' : foldHtml('fisheffort', 'とった労力',
+        `<span class="fsub">通電 <b id="effClock">${esc(fmtDur(effortSeconds(cur)))}</b></span>`,
+        `<button class="btn ${effortRunning(cur)?'ng':'ok'}"
+          onclick="toggleEffort('${cur.uuid}')">${effortRunning(cur)?'ストップ':'スタート'}</button>
+        <label>流した回数</label>
+        <input id="e_passes" inputmode="numeric"
+          value="${esc(cur.effort_passes!==undefined?cur.effort_passes:'')}">
+        <label>平均の川幅（m）</label>
+        <input id="e_width" inputmode="decimal"
+          value="${esc(cur.width_m!==undefined?cur.width_m:'')}">
+        <button class="btn" onclick="saveEffort('${cur.uuid}')">労力を保存する</button>`)}
+
+      ${foldHtml('fishenv', '川の環境',
+        `<span class="fsub">${esc(habitatShort(cur.habitat_type||'')||'—')}</span>`,
+        envItemFormHtml(cur, sv, {head:false}), false)}
+      `}`}
     `,
     onMount(){
       startGps();
@@ -5810,6 +6012,15 @@ SCREENS.fishMap = (svUuid)=>{
         {icon:'polyClose', title:'囲いを閉じる',
          tap:()=>{ if(fishClosePoly(svUuid)) render(); }},
       ], 'bottomright');
+      envItemFormWire(子.length ? null : cur, sv);
+      if(cur && !子.length && !isDetail(sv) && effortRunning(cur)){
+        EFFORT_TIMER = setInterval(()=>{
+          const el = $('#effClock');
+          const now = DB.getAlive(DB.key.st, cur.uuid);
+          if(!el || !now || !effortRunning(now)){ clearInterval(EFFORT_TIMER); EFFORT_TIMER=null; return; }
+          el.textContent = fmtDur(effortSeconds(now));
+        }, 1000);
+      }
       fishSyncHint();
       fishDrawAll(svUuid);
       drawMe('main');
@@ -5939,133 +6150,7 @@ SCREENS.envMap = (svUuid)=>{
           : '<div class="dim small">まだありません。地図をタップするか、地図の右下の狙いの印で置いてください。</div>'}
       </div>
 
-      ${!cur ? '' : `
-      <div id="envItemForm">
-      <div class="card">
-        <div class="row">
-          <div class="grow"><div style="font-weight:700;font-size:18px">${esc(cur.name||'')}</div>
-            <div class="dim small">${envKindOf(cur)==='L'
-              ? (linePt(cur,'end') ? '区間 '+esc(fmtDist(lineDist(cur)))
-                    + (lineVias(cur).length ? `　曲がり ${lineVias(cur).length}個` : '')
-                                   : '<span class="pill warn">終わりがまだ</span>'
-                    + (lineVias(cur).length ? `　曲がり ${lineVias(cur).length}個` : ''))
-              : (!stationPt(cur) ? '<span class="pill ng">位置なし</span>'
-                 : esc(fixCoord(cur.latitude)+', '+fixCoord(cur.longitude)))}
-              ${cur.survey_time_start ? '　'+esc(cur.survey_time_start) : ''}${
-                cur.survey_time_end ? '〜'+esc(cur.survey_time_end) : ''}</div>
-          </div>
-          <button class="btn sm ng" style="width:auto;margin:0"
-            onclick="envDelete('${cur.uuid}')">消す</button>
-        </div>
-
-        ${(envFixFold(cur.uuid), '')}${foldHtml('envfix', '位置と時刻を直す',
-          `<span class="fsub">${envKindOf(cur)==='L' ? '始点・終点・時刻' : '位置・時刻'}</span>`,
-          (envKindOf(cur)==='L' ? ['始点','終点'] : ['点']).map(w=>{
-            const ある = w==='点' ? !!stationPt(cur)
-                       : !!linePt(cur, w==='始点' ? 'start' : 'end');
-            const 待ち = envMoveOn(cur.uuid, w);
-            return `<div class="row" style="margin-bottom:6px">
-              <div class="grow"><div class="dim small">${esc(w)}</div>
-                <div>${ある
-                  ? esc(w==='点' ? fixCoord(cur.latitude)+', '+fixCoord(cur.longitude)
-                      : fixCoord(cur['line_'+(w==='始点'?'start':'end')+'_lat'])+', '
-                        +fixCoord(cur['line_'+(w==='始点'?'start':'end')+'_lon']))
-                  : '<span class="pill ng">まだありません</span>'}</div></div>
-              <button class="btn sm ok" style="width:auto;margin:0"
-                onclick="envGrabHere('${cur.uuid}','${w}')">いまここ</button>
-              <button class="btn sm ${待ち?'ng':''}" style="width:auto;margin:0"
-                onclick="envMoveStart('${cur.uuid}','${w}')">${待ち?'やめる':'地図で直す'}</button>
-            </div>`;
-          }).join('')
-          + (envKindOf(cur)==='L' ? `<div class="row" style="margin-top:6px">
-              <div class="grow"><div class="dim small">曲がり</div>
-                <div>${lineVias(cur).length}個</div></div>
-              <button class="btn sm" style="width:auto;margin:0"
-                onclick="if(envUndoBend('${cur.uuid}')) render()">最後を取り消す</button>
-              <button class="btn sm ng" style="width:auto;margin:0"
-                onclick="if(envClearBends('${cur.uuid}')) render()">全部消す</button>
-            </div>` : '')
-          + `<div class="dim small">「地図で直す」を押してから、地図をタップしてください。</div>
-          <div class="row" style="margin-top:8px">
-            <div class="grow"><label>開始時刻</label>
-              <input type="time" id="ev_t1" value="${esc(cur.survey_time_start||'')}"></div>
-            ${envKindOf(cur)==='L' ? `<div class="grow"><label>終了時刻</label>
-              <input type="time" id="ev_t2" value="${esc(cur.survey_time_end||'')}"></div>` : ''}
-          </div>`, envMoveOn(cur.uuid))}
-
-        <label>環境区分</label>
-        <div class="seg" data-seg="envhab">
-          ${['なし'].concat(OPT.habitat).map(o=>{
-            const short = o==='なし' ? 'なし' : habitatShort(o);
-            const on = (o==='なし' ? !g('habitat_type') : g('habitat_type')===o);
-            return `<button type="button" class="${on?'on':''}"
-              onclick="pickSeg(this)" title="${esc(o)}">${esc(short)}</button>`;
-          }).join('')}
-        </div>
-
-        <label>河床材料</label>
-        ${segHtml('envsub', OPT.substrate, g('substrate1'), true)}
-
-        <label>礫の状況</label>
-        ${segHtml('envgr', OPT.gravel, g('gravel_condition'), true)}
-
-        <div class="row" style="margin-top:10px">
-          <div class="grow">
-            <label>流速（m/s）</label>
-            <input id="ev_v" inputmode="decimal" value="${esc(cmToMDisp(cur.velocity_rep_cms))}"
-              placeholder="例）0.253">
-          </div>
-          <div class="grow">
-            <label>水深（m）</label>
-            <input id="ev_d" inputmode="decimal" value="${esc(cmToMDisp(cur.depth_rep_cm))}"
-              placeholder="例）0.25">
-          </div>
-        </div>
-        <div class="dim small">淀みの流速0・干出の水深0も、そのまま入れてください。</div>
-
-        ${foldHtml('envpct', '河床材料の割合', '<span class="fsub">分かるときだけ</span>', `
-          ${OPT.substrate.map(k=>`
-            <div class="row" style="margin-top:6px">
-              <div class="grow dim">${esc(k)}
-                <span class="small">${esc(SUBSTRATE_NOTE[k]||'')}</span></div>
-              <div style="width:92px">
-                <input id="evp_${SUBSTRATE_NO[k]}" inputmode="decimal"
-                  value="${esc(pct[k]!==undefined?pct[k]:'')}"></div>
-            </div>`).join('')}
-          <div class="dim small" style="margin-top:6px">合計100％が目安です。</div>`)}
-
-        ${foldHtml('envcov', 'カバー（左右岸）', '', `
-          ${['left','right'].map(side=>{
-            const label = side==='left' ? '左岸' : '右岸';
-            const cl = coverList(cur, side);
-            return `<h3>${label}</h3>
-              ${[0,1,2].map(i=>{
-                const c = cl[i] || {};
-                const opts = ['<option value="">（選ばない）</option>'].concat(
-                  OPT.cover.map(o=>`<option value="${esc(o)}"${o===c.type?' selected':''}>${esc(o)}</option>`)
-                ).join('');
-                return `<div class="row" style="margin-top:8px">
-                  <div class="grow"><select id="evc_${side}_${i}_t">${opts}</select></div>
-                  <div style="width:92px">
-                    <input id="evc_${side}_${i}" inputmode="decimal" placeholder="割合%"
-                      value="${esc(c.pct!==undefined?c.pct:'')}"></div>
-                </div>`;
-              }).join('')}
-              <label>${label}のカバー長（m）</label>
-              <input id="evc_${side}_len" inputmode="decimal"
-                value="${esc(cur['cover_'+side+'_length_m']!==undefined?cur['cover_'+side+'_length_m']:'')}">`;
-          }).join('')}`)}
-
-        <label>メモ</label>
-        <textarea id="ev_memo">${esc(g('memo'))}</textarea>
-        <div id="ev_err"></div>
-      </div>
-
-      ${photoPanelHtml('この点・区間のようす。', true)}
-      </div>
-      <div class="dim small" id="ev_saved">入れたそばから、自動で保存されます。</div>
-      <button class="btn pri" onclick="saveEnvItem('${cur.uuid}')">保存する</button>
-      `}
+      ${envItemFormHtml(cur, sv)}
 
       <div class="hr"></div>
       <div class="card">
@@ -6093,42 +6178,7 @@ SCREENS.envMap = (svUuid)=>{
       if(ENV_PICK && ENV_PICK.sv !== svUuid) ENV_PICK = null;
       if(ENV_MOVE && !DB.liveStation(ENV_MOVE.uuid)) ENV_MOVE = null;
       envHistClear(svUuid);       // ほかの調査の分は持ち越さない
-      ENV_FORM = cur ? cur.uuid : '';
-      ENV_DIRTY = false;
-      if(cur){
-        const key = 'envitem:'+cur.uuid;
-        SCREENS._photos = ((cur.photos)||[]).slice();
-        const base = collectEnvItem();
-        // 見ているだけのタブでは、書きかけを持たない。
-        // 持つと、記録を入れているタブの書きかけを上書きしてしまう（監査 Major）
-        const d = ownsLock() ? draftGet(key) : null;
-        if(d){
-          applySels(d);
-          applySegRaw('envhab', d.__hab);
-          applySeg('envsub', d.__sub); applySeg('envgr', d.__gr);
-          toast('書きかけを戻しました');
-        }
-        photosBegin(cur, d, {key, survey:sv.uuid, kind:'箇所'});
-        if(ownsLock()) draftBind(key, collectEnvItem, base);
-        envShowError(envItemError());
-        // 入力のたびに、少し待ってから保存する
-        const box = $('#envItemForm');
-        if(box && ownsLock()){
-          box.addEventListener('input',  ()=>envAutoSave(cur.uuid));
-          box.addEventListener('change', ()=>envAutoSave(cur.uuid));
-          // 選ぶボタン（環境区分・河床材料・礫の状況）は input も change も出さない。
-          // 拾わないと、押したのに記録にも書き出しにも入らない
-          // （2026-08-17 の監査 Critical）
-          // 押したボタンそのものだけを拾う（枠の余白を押しても数えない）。
-          // pickSeg はボタン自身の onclick なので、ここへ来る時点で選び終わっている。
-          // ひと呼吸置くと、その間に画面が変わって取りこぼす（2026-08-18 の監査 Major）
-          box.addEventListener('click', e=>{
-            if(e.target && e.target.closest && e.target.closest('[data-seg] button')){
-              envAutoSave(cur.uuid);
-            }
-          });
-        }
-      }
+      envItemFormWire(cur, sv);
 
       // 地図。前に見ていた場所があればそこへ戻す（勝手に動かさない）
       const v = ENV_VIEW[svUuid];
