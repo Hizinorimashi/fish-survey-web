@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v36';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v37';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2541,9 +2541,22 @@ function navReplace(name, arg){
 
 let EFFORT_TIMER = null;
 let ENV_GPS_TIMER = null;
+/* いま出ている画面の見分け。同じ画面を作り直すときは、見ていた位置を保つ */
+let SCREEN_AT = '';
+function screenKey(cur){
+  if(!cur) return '';
+  let a = '';
+  try{ a = (cur.arg && typeof cur.arg === 'object') ? JSON.stringify(cur.arg)
+                                                    : String(cur.arg||''); }catch(e){ a = ''; }
+  return cur.name + '|' + a;
+}
 function render(){
   // 物理環境の画面で打ちかけの分があれば、先に書いてしまう
   try{ if(typeof envFlush==='function') envFlush(); }catch(e){}
+  // 同じ画面を作り直すときのために、見ていた位置を控える。
+  // 押すたびに先頭へ戻ると、下のほうの入力が打てない（2026-08-20 の実機の声）
+  const 前の画面 = SCREEN_AT;
+  const 前の位置 = window.scrollY || window.pageYOffset || 0;
   try{
     ENV_FORM = ''; ENV_DIRTY = false; PHOTO_OWNER = ''; PHOTO_OWNER_SV = '';
     PHOTO_OWNER_INFO = {mode:'', kind:'', station:'', species:''};
@@ -2573,7 +2586,10 @@ function render(){
     `<span class="pill ${s.cls||''}">${esc(s.text)}</span>`).join('');
   $('#main').innerHTML = (window.READ_ONLY
       ? `<div class="ngbox">${esc(LOCK_WHY)}</div>` : '') + (v.html || '');
-  window.scrollTo(0,0);
+  const いまの画面 = screenKey(STACK[STACK.length-1]);
+  SCREEN_AT = いまの画面;
+  // 同じ画面なら、見ていた位置に戻す。別の画面なら先頭から
+  window.scrollTo(0, (いまの画面 && いまの画面 === 前の画面) ? 前の位置 : 0);
   if(v.onMount) try{ v.onMount(); }catch(e){ console.error(e); }
 }
 
@@ -5878,7 +5894,18 @@ ${(opt && opt.head === false) ? '' : `      <div class="card">
 let FISH_PICK = '';        // 種選びを開いている記録のID
 function fishPickOpen(stUuid){
   FISH_PICK = (FISH_PICK === stUuid) ? '' : stUuid;
-  render();
+  // 画面ごと作り直すと、見ていた場所から離れてしまう。ここだけ出し入れする
+  const box = $('#fishPickBox');
+  const btn = $('#fishPickBtn');
+  if(!box || !btn){ render(); return; }
+  const 開く = FISH_PICK === stUuid;
+  box.style.display = 開く ? '' : 'none';
+  btn.textContent = 開く ? '種を選ぶのをやめる' : '魚を足す（種類を選ぶ）';
+  btn.classList.toggle('pri', !開く);
+  if(開く){
+    fishPickList(stUuid);
+    const q = $('#fishSpq'); if(q) q.focus();
+  }
 }
 /* 種の一覧を、その場に描く */
 function fishPickList(stUuid){
@@ -6037,13 +6064,15 @@ SCREENS.fishMap = (svUuid)=>{
         (()=>{
           const cs = DB.catchesOf(cur.uuid);
           const 選び中 = FISH_PICK === cur.uuid;
-          return `<button class="btn ${選び中?'':'pri'}"
+          return `<button class="btn ${選び中?'':'pri'}" id="fishPickBtn"
             onclick="fishPickOpen('${cur.uuid}')">${選び中?'種を選ぶのをやめる':'魚を足す（種類を選ぶ）'}</button>
-          ${選び中 ? `<input id="fishSpq" placeholder="和名・科名・昔の呼び名で探す"
+          <div id="fishPickBox" style="display:${選び中?'':'none'}">
+            <input id="fishSpq" placeholder="和名・科名・昔の呼び名で探す"
               oninput="fishPickList('${cur.uuid}')" autocomplete="off">
             <div class="dim small">昔の呼び名（エゾイワナ・ヤマメなど）でも探せます。
               保存されるのは正式な種です。</div>
-            <div id="fishSplist"></div>` : ''}
+            <div id="fishSplist"></div>
+          </div>
           ${cs.length ? cs.map(c=>{
             const n = DB.individualsOf(c.uuid).length;
             return `<div class="card" style="margin-top:8px">
