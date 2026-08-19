@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v30';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v31';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1933,6 +1933,8 @@ function envAddAt(svUuid, lat, lon, acc){
         : 'つなぐラインがありません。先に LS（ラインのスタート）を足してください', 8000);
       return null;
     }
+    const 前の終了時刻 = st.survey_time_end || '';
+    const 前のended = st.ended_at || '';
     st.line_end_lat = la; st.line_end_lon = lo;
     st.line_end_acc = (acc===undefined || acc===null) ? '' : Math.round(acc);
     if(!st.survey_time_end) st.survey_time_end = now;
@@ -1975,6 +1977,8 @@ function envAddAt(svUuid, lat, lon, acc){
       all.push(nx);
     }
     if(!DB.save(DB.key.st, all)) return null;   // 保存できていないので、何も変えない
+    envHistPush({type:'終わり', sv:svUuid, uuid:st.uuid, name:st.name,
+      next: nx ? nx.uuid : '', prevTime: 前の終了時刻, prevEnded: 前のended});
 
     envAdvance('LE');
     let 続き = '';
@@ -2015,6 +2019,7 @@ function envAddAt(svUuid, lat, lon, acc){
   if(no2===null){ toast('番号が大きすぎて、これ以上置けません', 7000); return null; }
   rec.station_no = no2;
   if(!DB.upsert(DB.key.st, rec)) return null;
+  envHistPush({type:'置いた', sv:svUuid, uuid:rec.uuid, name:rec.name});
   envAdvance(k, rec.uuid);
   // 置いたものをそのまま選ぶ。選ばないと、前の記録の入力欄が出たままになり、
   // 新しい点のつもりで前の記録に書き込んでしまう（監査 Major）
@@ -2821,6 +2826,9 @@ const MAP_ICONS = {
   lineEnd: '<path d="M3 12 H13.5" stroke-dasharray="3.5 3"/>'
     + '<rect x="14.5" y="7.8" width="8.4" height="8.4" rx="1.5"'
     + ' fill="currentColor" stroke="none"/>',
+  // 1つ戻す（左へ回る矢印）
+  undo: '<path d="M4 9 H14a5.5 5.5 0 0 1 0 11H9"/>'
+    + '<path d="M4 9 L8.5 4.5 M4 9 L8.5 13.5"/>',
   // ラインの曲がり（カクッと折れた線）
   lineBend: '<path d="M3 19 L10 19 L10 9 L21 9" stroke-dasharray="0"/>'
     + '<circle cx="10" cy="9" r="2.6" fill="currentColor" stroke="none"/>',
@@ -5410,7 +5418,7 @@ SCREENS.envMap = (svUuid)=>{
             onclick="envDelete('${cur.uuid}')">消す</button>
         </div>
 
-        ${foldHtml('envfix', '位置と時刻を直す',
+        ${(envFixFold(cur.uuid), '')}${foldHtml('envfix', '位置と時刻を直す',
           `<span class="fsub">${envKindOf(cur)==='L' ? '始点・終点・時刻' : '位置・時刻'}</span>`,
           (envKindOf(cur)==='L' ? ['始点','終点'] : ['点']).map(w=>{
             const ある = w==='点' ? !!stationPt(cur)
@@ -5544,6 +5552,7 @@ SCREENS.envMap = (svUuid)=>{
 
       if(ENV_PICK && ENV_PICK.sv !== svUuid) ENV_PICK = null;
       if(ENV_MOVE && !DB.liveStation(ENV_MOVE.uuid)) ENV_MOVE = null;
+      envHistClear(svUuid);       // ほかの調査の分は持ち越さない
       ENV_FORM = cur ? cur.uuid : '';
       ENV_DIRTY = false;
       if(cur){
@@ -5605,6 +5614,8 @@ SCREENS.envMap = (svUuid)=>{
         {icon:'addHere', title:'いまいる場所に足す', tap:()=>envAddHere(svUuid)},
         {icon:'chain',   key:'chain', title:'ラインをつなげる／つなげない',
          tap:()=>envSetChain(!envChain())},
+        {icon:'undo', title:'1つ戻す（直前に置いた・動かした分）',
+         tap:()=>{ if(envUndo(svUuid)) render(); }},
       ], 'bottomright');
       envSyncNextUI();
       envDrawAll(svUuid);
@@ -5817,6 +5828,92 @@ function envSavePhotosNow(){
   if(mark) mark.textContent = '写真を保存しました（' + timeValue() + '）';
   return true;
 }
+/* 直前にしたことを控えておき、1つずつ戻せるようにする。
+   置き間違いは現場で必ず起きる（2026-08-19 の実機の声）。
+   アプリを閉じるまでの間だけ覚える（記録そのものは消さずに、印を付け外しする） */
+let ENV_HIST = [];
+const ENV_HIST_MAX = 30;
+function envHistPush(item){
+  if(!item) return;
+  ENV_HIST.push(item);
+  if(ENV_HIST.length > ENV_HIST_MAX) ENV_HIST.shift();
+}
+function envHistClear(svUuid){
+  ENV_HIST = ENV_HIST.filter(x=>x && x.sv === svUuid);
+}
+function envCanUndo(svUuid){
+  return ENV_HIST.some(x=>x && x.sv === svUuid);
+}
+/* 1つ戻す。戻せたら true */
+function envUndo(svUuid){
+  if(!writeAllowed()){
+    toast('このタブでは戻せません。記録を入れているタブでお試しください', 7000);
+    return false;
+  }
+  let i = ENV_HIST.length - 1;
+  while(i >= 0 && !(ENV_HIST[i] && ENV_HIST[i].sv === svUuid)) i--;
+  if(i < 0){ toast('戻せるものがありません'); return false; }
+  const h = ENV_HIST[i];
+  ENV_HIST.splice(i, 1);
+
+  if(h.type === '置いた'){
+    const st = DB.liveStation(h.uuid);
+    if(!st){ toast('その記録はもうありません'); return true; }
+    if(!DB.softDelete(DB.key.st, h.uuid)){
+      toast('戻せませんでした（端末の空き容量をご確認ください）', 8000);
+      return false;
+    }
+    draftClearFor('箇所', h.uuid);
+    if(ENV_SEL === h.uuid) ENV_SEL = null;
+    if(ENV_NEXT.line === h.uuid){
+      ENV_NEXT = {kind:ENV_NEXT.kind, auto:ENV_NEXT.auto, line:'', survey:ENV_NEXT.survey};
+    }
+    toast(`${h.name||''} を取り消しました`);
+    return true;
+  }
+  if(h.type === '終わり'){
+    const st = DB.liveStation(h.uuid);
+    if(!st){ toast('その記録はもうありません'); return true; }
+    let all;
+    try{ all = DB.loadRaw(DB.key.st); }
+    catch(e){ toast('保存された記録を読み取れないため、戻せませんでした', 7000); return false; }
+    const t = nowISO();
+    all.forEach(x=>{
+      if(!x) return;
+      if(x.uuid === h.uuid){
+        x.line_end_lat = ''; x.line_end_lon = ''; x.line_end_acc = '';
+        x.survey_time_end = h.prevTime || '';
+        x.ended_at = h.prevEnded || '';
+        x.updated_at = t;
+      }
+      // つなげるで自動的に始まったラインも、一緒に取り消す
+      if(h.next && x.uuid === h.next && !x.deleted_at) x.deleted_at = t;
+    });
+    if(!DB.save(DB.key.st, all)){
+      toast('戻せませんでした（端末の空き容量をご確認ください）', 8000);
+      return false;
+    }
+    if(h.next){
+      draftClearFor('箇所', h.next);
+      if(ENV_SEL === h.next) ENV_SEL = h.uuid;
+    }
+    ENV_NEXT = {kind:'LE', auto:ENV_NEXT.auto, line:h.uuid, survey:svUuid};
+    toast(`${h.name||''} の終わりを取り消しました`);
+    return true;
+  }
+  if(h.type === '曲がり'){
+    if(!envUndoBend(h.uuid)) return false;
+    return true;
+  }
+  if(h.type === '動かした'){
+    const st = DB.liveStation(h.uuid);
+    if(!st){ toast('その記録はもうありません'); return true; }
+    if(!envMoveTo(h.uuid, h.which, h.prev.lat, h.prev.lon, h.prev.acc, true)) return false;
+    toast(`${h.name||''} の${h.which}を元に戻しました`);
+    return true;
+  }
+  return false;
+}
 /* 曲がりを足す相手のライン。
    1) いま選んでいるライン（終わっていてもよい。あとから形を整えられる）
    2) 直前に置いた始まり
@@ -5851,6 +5948,7 @@ function envAddBend(svUuid, la, lo, acc){
     return null;
   }
   ENV_SEL = st.uuid;
+  envHistPush({type:'曲がり', sv:svUuid, uuid:st.uuid, name:st.name});
   toast(`${st.name||''} に曲がりを置きました（${(st.line_via||[]).length}個目）`);
   return st.uuid;
 }
@@ -5916,6 +6014,15 @@ function envSnapTell(sn){
   if(!sn) return;
   toast(`${sn.name}${sn.w ? 'の'+sn.w : ''} に重ねました`, 4000);
 }
+/* 「位置と時刻を直す」を開いたままにしておく相手。
+   別の記録を選んだら、たたんだ状態で出す（2026-08-19 の実機の声） */
+let ENV_FIX_FOR = '';
+function envFixFold(u){
+  if(!u) return;
+  if(ENV_FIX_FOR === u) return;
+  ENV_FIX_FOR = u;
+  try{ if(foldOpen('envfix', false)) foldSet('envfix', false); }catch(e){}
+}
 /* いま「地図をタップして直す」を待っている相手。
    {uuid, which} which は '点' / '始点' / '終点'（2026-08-18 の実機の声） */
 let ENV_MOVE = null;
@@ -5933,9 +6040,13 @@ function envMoveStart(u, which){
   render();
 }
 /* 位置を書き替える。lat/lon が空なら「位置なし」に戻す */
-function envMoveTo(u, which, la, lo, acc){
+function envMoveTo(u, which, la, lo, acc, 戻すとき){
   const st = DB.liveStation(u); if(!st) return false;
   const a = (acc===undefined || acc===null || acc==='') ? '' : Math.round(acc);
+  // 動かす前の場所を控える（1つ戻すため）
+  const 前 = which === '始点' ? {lat:st.line_start_lat, lon:st.line_start_lon, acc:st.line_start_acc}
+           : which === '終点' ? {lat:st.line_end_lat, lon:st.line_end_lon, acc:st.line_end_acc}
+           : {lat:st.latitude, lon:st.longitude, acc:st.gps_accuracy};
   if(which === '始点'){
     st.line_start_lat = la; st.line_start_lon = lo; st.line_start_acc = a;
   }else if(which === '終点'){
@@ -5950,7 +6061,10 @@ function envMoveTo(u, which, la, lo, acc){
     return false;
   }
   ENV_MOVE = null;
-  toast(`${st.name||''} の${which}を直しました`);
+  if(!戻すとき){
+    envHistPush({type:'動かした', sv:st.survey_uuid, uuid:u, which, name:st.name, prev:前});
+    toast(`${st.name||''} の${which}を直しました`);
+  }
   return true;
 }
 /* いまいる場所へ直す */
