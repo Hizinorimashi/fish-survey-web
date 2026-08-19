@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v33';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v34';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2143,6 +2143,11 @@ function unitParentOf(st, list){
 function unitChildren(u, list){
   return (list||[]).filter(x=>x && x.parent_uuid === u);
 }
+/* 囲いを1つの文字にする。「緯度 経度;緯度 経度;…」の並び。
+   表計算でもGISでも読めるように、余計な記号を入れない */
+function polyText(st){
+  return polyPts(st).map(v=>fixCoord(v[0]) + ' ' + fixCoord(v[1])).join(';');
+}
 /* 名前は種類ごとの通し番号（E1・P/F1・P1） */
 function unitAutoName(svUuid, kind, all){
   const list = (all || DB.stationsOf(svUuid)).filter(x=>unitKindOf(x)===kind);
@@ -2179,9 +2184,11 @@ function unitTotals(u, list, snap){
   const 種 = new Set();
   let 尾 = 0;
   みんな.forEach(st=>{
-    尾 += stationTotal(st);
-    (snap ? snap.ca.filter(c=>c.station_uuid===st.uuid) : DB.catchesOf(st.uuid))
-      .forEach(c=>{ if(c.species_id) 種.add(c.species_id); });
+    const cs = snap ? snap.ca.filter(c=>c.station_uuid===st.uuid) : DB.catchesOf(st.uuid);
+    cs.forEach(c=>{
+      尾 += catchTotal(c, snap);
+      if(c.species_id) 種.add(c.species_id);
+    });
   });
   return {尾, 種: 種.size, 単位: みんな.length};
 }
@@ -4098,6 +4105,14 @@ function buildStationRows(sv, snap){
       '始点GPS精度m': numOf(st.line_start_acc),
       '終点緯度': fixCoord(st.line_end_lat), '終点経度': fixCoord(st.line_end_lon),
       '終点GPS精度m': numOf(st.line_end_acc),
+      '記録の単位': UNIT_MARK[unitKindOf(st)] || '',
+      '単位の呼び名': UNIT_WORD[unitKindOf(st)] || '',
+      '親の単位': st.parent_uuid ? ((snap.st.find(x=>x.uuid===st.parent_uuid)||{}).name||'') : '',
+      '囲いの角数': isUnitPoly(st) ? polyPts(st).length : '',
+      '囲い座標': isUnitPoly(st) ? polyText(st) : '',
+      // 親子は調査の中でしか結ばないので、ここで調査ごとに絞る必要はない
+      '中の記録の種数': unitKindOf(st) ? unitTotals(st.uuid, snap.st, snap).種 : '',
+      '中の記録の尾数': unitKindOf(st) ? unitTotals(st.uuid, snap.st, snap).尾 : '',
       '距離_始終点直線m': round1(lineStraight(st)),
       '距離_区間折れ線m': round1(stationLengths(st).line),
       '曲がり数': isLine(st) ? lineVias(st).length : '',
@@ -4242,6 +4257,8 @@ const FS_IND_COLS = ['調査日','河川名','地点名','箇所','種ID','種�
 const FS_STATION_COLS = ['調査日','河川名','地点名','箇所','記録のしかた',
   '調べたもの','環境の取り方','向き',
   '始点緯度','始点経度','始点GPS精度m','終点緯度','終点経度','終点GPS精度m',
+  '記録の単位','単位の呼び名','親の単位','囲いの角数','囲い座標',
+  '中の記録の種数','中の記録の尾数',
   '距離_始終点直線m','距離_区間折れ線m','曲がり数','流量',
   'メッシュ縦間隔m','メッシュ横分割数','メッシュ行数','メッシュ列数','メッシュ入力済み数',
   'メッシュ前の格子のマス数','メッシュ格子ID','メッシュ縦m','メッシュ横m',
@@ -4726,11 +4743,27 @@ function deleteSurvey(u){
 /* ---------- 調査ハブ ---------- */
 /* 物理環境の調査は、地図が主役の画面に差し替える。
    箇所のフォームと「川の環境」を通らずに、地図の上で点と線を足していく */
+/* その調査を、地図から開くか。
+   一度でも「地図で記録する」を使った調査だけ、つぎからは地図で開く。
+   前からある調査を勝手に変えない（2026-08-19） */
+function fishMapEntry(sv){
+  return !!(sv && !isEnvSurvey(sv) && sv.entry === 'map');
+}
+function fishUseMap(svUuid, on){
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return false;
+  sv.entry = on ? 'map' : 'list';
+  if(!DB.upsert(DB.key.sv, sv)){
+    toast('切り替えられませんでした（端末の空き容量をご確認ください）', 8000);
+    return false;
+  }
+  return true;
+}
 SCREENS.survey = (svUuid)=>{
   const sv0 = DB.getAlive(DB.key.sv, svUuid);
   if(isEnvSurvey(sv0) && !isMesh({env_method: sv0.env_method_default})){
     return SCREENS.envMap(svUuid);
   }
+  if(fishMapEntry(sv0)) return SCREENS.fishMap(svUuid);
   return SCREENS.surveyHub(svUuid);
 };
 SCREENS.surveyHub = (svUuid)=>{
@@ -4777,8 +4810,8 @@ SCREENS.surveyHub = (svUuid)=>{
         ? `<button class="btn pri" onclick="nav('station','${running.uuid}')">記録中の ${esc(running.name)} を開く</button>`
         : `<button class="btn pri" onclick="newStation('${svUuid}')">${W}を追加する</button>`}
       ${envOnly ? '' : `<button class="btn ${単位あり?'ok':''}"
-        onclick="nav('fishMap','${svUuid}')">地図で記録する${
-          単位あり ? '（つづきから）' : '（調査範囲・瀬淵・ポイント）'}</button>`}
+        onclick="if(fishUseMap('${svUuid}', true)) navReplace('fishMap','${svUuid}')"
+        >地図で記録する${単位あり ? '（つづきから）' : '（調査範囲・瀬淵・ポイント）'}</button>`}
 
       <div class="card">
         <div class="row">
@@ -5697,6 +5730,9 @@ SCREENS.fishMap = (svUuid)=>{
         style="height:${envMapBig()?'80vh':'46vh'};min-height:260px"></div>
       <div class="dim small" id="fishHint"></div>
       <div class="dim small" id="fishGps"></div>
+
+      <button class="btn" onclick="if(fishUseMap('${svUuid}', false)) navReplace('surveyHub','${svUuid}')"
+        >一覧で見る（箇所の並び）</button>
 
       <div class="card">
         <h3 style="margin-top:0">記録の単位</h3>
