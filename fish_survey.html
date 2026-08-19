@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v32';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v33';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2054,6 +2054,150 @@ function linePt(st, which){
   const pt = [la, lo];
   return validPt(pt) ? pt : null;
 }
+/* ============================================================
+   魚の調査の記録の単位（魚類調査イメージ.pptx）
+     E  … 調査範囲（囲い）
+     PF … 河川区分・瀬淵（囲い）
+     P  … ポイント（点）
+   記録は「いちばん小さい単位」にだけ入れる。
+   大きい単位は、中に入っている小さい単位の集計を出すだけ
+   ============================================================ */
+const UNIT_WORD = {E:'調査範囲', PF:'河川区分（瀬淵）', P:'ポイント'};
+const UNIT_MARK = {E:'E', PF:'P/F', P:'P'};
+function unitKindOf(st){
+  const k = st && st.unit_kind;
+  return (k==='E' || k==='PF' || k==='P') ? k : '';
+}
+function isUnitPoly(st){ const k = unitKindOf(st); return k==='E' || k==='PF'; }
+/* 囲いの角。3つ以上そろって、はじめて囲いになる */
+function polyPts(st){
+  return ((st && st.poly) || []).map(v=>{
+    const la = numOf(v && v.lat), lo = numOf(v && v.lon);
+    if(la==='' || lo==='') return null;
+    const pt = [la, lo];
+    return validPt(pt) ? pt : null;
+  }).filter(Boolean);
+}
+function polyClosed(st){ return polyPts(st).length >= 3; }
+/* その点が囲いの中か（へりを横切る回数で決める）。
+   圏外地図の pointInPoly(lat, lon, poly) とは別物なので、名前を分ける */
+function ptInPoly(pt, poly){
+  if(!validPt(pt) || !poly || poly.length < 3) return false;
+  const [y, x] = pt;
+  let 中 = false;
+  for(let i=0, j=poly.length-1; i<poly.length; j=i++){
+    const yi = poly[i][0], xi = poly[i][1];
+    const yj = poly[j][0], xj = poly[j][1];
+    const またぐ = (yi > y) !== (yj > y);
+    if(またぐ && x < (xj - xi) * (y - yi) / (yj - yi) + xi) 中 = !中;
+  }
+  return 中;
+}
+/* 囲いの真ん中（角の平均）。囲い同士の入れ子を見るために使う */
+function polyCenter(pts){
+  if(!pts || !pts.length) return null;
+  const n = pts.length;
+  return [pts.reduce((a,p)=>a+p[0],0)/n, pts.reduce((a,p)=>a+p[1],0)/n];
+}
+/* その単位の代表の点。点はそのまま、囲いは真ん中 */
+function unitPoint(st){
+  if(unitKindOf(st)==='P') return stationPt(st);
+  return polyCenter(polyPts(st));
+}
+/* 囲いの広さのめやす（同じ点を囲う囲いが複数あるとき、小さいほうを親にする） */
+function polyArea(pts){
+  if(!pts || pts.length < 3) return 0;
+  let a = 0;
+  for(let i=0, j=pts.length-1; i<pts.length; j=i++){
+    a += (pts[j][1] + pts[i][1]) * (pts[j][0] - pts[i][0]);
+  }
+  return Math.abs(a/2);
+}
+/* その単位が、その囲いの中にすっかり入っているか。
+   真ん中だけで見ると、大きい囲いの真ん中に小さい囲いがあるとき、
+   大きいほうが「中にある」と判じられてしまう（角を全部見る） */
+function unitInside(st, pts){
+  if(!pts || pts.length < 3) return false;
+  if(unitKindOf(st) === 'P'){
+    const pt = stationPt(st);
+    return !!pt && ptInPoly(pt, pts);
+  }
+  const mine = polyPts(st);
+  if(!mine.length) return false;
+  return mine.every(v=>ptInPoly(v, pts));
+}
+/* いちばん内側の、その単位を囲んでいる囲い */
+function unitParentOf(st, list){
+  let 親 = '', 広さ = Infinity;
+  (list||[]).forEach(o=>{
+    if(!o || o.uuid===st.uuid || !isUnitPoly(o)) return;
+    const pts = polyPts(o);
+    if(pts.length < 3) return;
+    if(!unitInside(st, pts)) return;
+    const a = polyArea(pts);
+    if(a < 広さ){ 広さ = a; 親 = o.uuid; }
+  });
+  return 親;
+}
+/* その単位の中に入っている単位（1つ下だけ） */
+function unitChildren(u, list){
+  return (list||[]).filter(x=>x && x.parent_uuid === u);
+}
+/* 名前は種類ごとの通し番号（E1・P/F1・P1） */
+function unitAutoName(svUuid, kind, all){
+  const list = (all || DB.stationsOf(svUuid)).filter(x=>unitKindOf(x)===kind);
+  const mark = UNIT_MARK[kind] || '';
+  let n = 0;
+  list.forEach(x=>{
+    const m = String(x.name||'').match(new RegExp('^' + mark.replace('/','\\/') + '(\\d+)$'));
+    if(m) n = Math.max(n, +m[1]);
+  });
+  return mark + (n + 1);
+}
+/* その単位の中に入っているもの（孫も）。輪になっていても止まる */
+function unitDescendants(u, list){
+  const out = [];
+  const 見た = new Set([u]);
+  let 今 = [u];
+  while(今.length){
+    const 次 = [];
+    今.forEach(x=>{
+      unitChildren(x, list).forEach(c=>{
+        if(見た.has(c.uuid)) return;
+        見た.add(c.uuid); out.push(c); 次.push(c.uuid);
+      });
+    });
+    今 = 次;
+  }
+  return out;
+}
+/* その単位の集計。中に入っているものを、ぜんぶ足す。
+   記録は小さい単位にだけ入るので、足し合わせても二重にならない */
+function unitTotals(u, list, snap){
+  const 自分 = (list||[]).find(x=>x && x.uuid===u) || DB.liveStation(u);
+  const みんな = (自分 ? [自分] : []).concat(unitDescendants(u, list));
+  const 種 = new Set();
+  let 尾 = 0;
+  みんな.forEach(st=>{
+    尾 += stationTotal(st);
+    (snap ? snap.ca.filter(c=>c.station_uuid===st.uuid) : DB.catchesOf(st.uuid))
+      .forEach(c=>{ if(c.species_id) 種.add(c.species_id); });
+  });
+  return {尾, 種: 種.size, 単位: みんな.length};
+}
+/* 親子を、いまの囲いの形から付け直す。形を変えるたびに呼ぶ */
+function unitRelink(svUuid){
+  let all;
+  try{ all = DB.loadRaw(DB.key.st); }catch(e){ return false; }
+  const この調査 = all.filter(x=>x && !x.deleted_at && x.survey_uuid===svUuid && unitKindOf(x));
+  let 変わった = false;
+  この調査.forEach(st=>{
+    const 親 = unitParentOf(st, この調査);
+    if((st.parent_uuid||'') !== 親){ st.parent_uuid = 親; 変わった = true; }
+  });
+  if(!変わった) return true;
+  return DB.save(DB.key.st, all);
+}
 /* ラインの途中の曲がり。川の形に沿わせるために置く（2026-08-19 の実機の声） */
 function lineVias(st){
   return ((st && st.line_via) || []).map(v=>{
@@ -2555,9 +2699,13 @@ function destroyMaps(){
   if(ENV_MAP_SV && MAPS.main && MAPS.main.map){
     try{ envRememberView(ENV_MAP_SV); }catch(e){}
   }
-  ENV_MAP_SV = '';
+  if(FISH_MAP_SV && MAPS.main && MAPS.main.map){
+    try{ fishRememberView(FISH_MAP_SV); }catch(e){}
+  }
+  ENV_MAP_SV = ''; FISH_MAP_SV = '';
   MESHLAYER = [];
   ENVLAYER = [];
+  FISHLAYER = [];
   MEMARK = [];
   Object.keys(MAPS).forEach(k=>{
     const s = MAPS[k];
@@ -2847,6 +2995,13 @@ const MAP_ICONS = {
   // 1つ戻す（左へ回る矢印）
   undo: '<path d="M4 9 H14a5.5 5.5 0 0 1 0 11H9"/>'
     + '<path d="M4 9 L8.5 4.5 M4 9 L8.5 13.5"/>',
+  // 調査範囲（大きい囲い）
+  areaBig: '<path d="M3 7 L9 3 L21 6 L18 20 L6 19 Z"/>',
+  // 河川区分・瀬淵（小さい囲い）
+  areaSmall: '<path d="M5 9 L11 5 L19 8 L16 17 L8 16 Z" stroke-dasharray="3 2"/>',
+  // 囲いを閉じる
+  polyClose: '<path d="M4 8 L10 4 L20 7 L17 18 L7 17 Z"/>'
+    + '<path d="M9 12 L11.5 14.5 L16 9.5" stroke-width="2.4"/>',
   // ラインの曲がり（カクッと折れた線）
   lineBend: '<path d="M3 19 L10 19 L10 9 L21 9" stroke-dasharray="0"/>'
     + '<circle cx="10" cy="9" r="2.6" fill="currentColor" stroke="none"/>',
@@ -4581,6 +4736,7 @@ SCREENS.survey = (svUuid)=>{
 SCREENS.surveyHub = (svUuid)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
+  const 単位あり = DB.stationsOf(svUuid).some(x=>unitKindOf(x));
   const stations = DB.stationsOf(svUuid);
   // 「記録中」は、いま現場にいるときだけの言い方。
   // あとから書き起こしているときに「記録中」と出ると、何かが動いている誤解になる。
@@ -4620,6 +4776,9 @@ SCREENS.surveyHub = (svUuid)=>{
       ${running
         ? `<button class="btn pri" onclick="nav('station','${running.uuid}')">記録中の ${esc(running.name)} を開く</button>`
         : `<button class="btn pri" onclick="newStation('${svUuid}')">${W}を追加する</button>`}
+      ${envOnly ? '' : `<button class="btn ${単位あり?'ok':''}"
+        onclick="nav('fishMap','${svUuid}')">地図で記録する${
+          単位あり ? '（つづきから）' : '（調査範囲・瀬淵・ポイント）'}</button>`}
 
       <div class="card">
         <div class="row">
@@ -5348,6 +5507,333 @@ function reopenStation(u){
 let ENVLAYER = [];
 let ENV_SEL = null;          // いま選んでいる記録のID
 
+/* 魚の調査の地図。囲い（E・P/F）と点（P）を置く（魚類調査イメージ.pptx） */
+let FISH_NEXT = {kind:'PF', draw:'', survey:''};
+function fishUseSurvey(svUuid){
+  if(FISH_NEXT.survey !== svUuid) FISH_NEXT = {kind:'PF', draw:'', survey:svUuid};
+}
+function fishSetKind(k){
+  FISH_NEXT = {kind:k, draw:FISH_NEXT.draw, survey:FISH_NEXT.survey};
+  render();
+}
+/* いま描いている途中の囲い */
+function fishDrawing(){
+  if(!FISH_NEXT.draw) return null;
+  const st = DB.liveStation(FISH_NEXT.draw);
+  return (st && isUnitPoly(st)) ? st : null;
+}
+/* 置く。囲いは角を1つずつ足していく */
+function fishAddAt(svUuid, lat, lon, acc){
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return null;
+  if(!writeAllowed()){
+    toast('このタブでは追加できません。記録を入れているタブでお試しください', 6000);
+    return null;
+  }
+  const la = +(+lat).toFixed(6), lo = +(+lon).toFixed(6);
+  if(!validPt([la, lo])){ toast('位置がおかしいので追加できません'); return null; }
+  const now = timeValue();
+  const 描き中 = fishDrawing();
+
+  if(描き中){
+    描き中.poly = (描き中.poly||[]).concat([{lat:la, lon:lo}]);
+    if(!DB.upsert(DB.key.st, 描き中)){
+      toast('置けませんでした（端末の空き容量をご確認ください）', 8000);
+      return null;
+    }
+    toast(`${描き中.name} の角を置きました（${(描き中.poly||[]).length}個目）`);
+    return 描き中.uuid;
+  }
+
+  const k = FISH_NEXT.kind;
+  const all = DB.stationsOf(svUuid);
+  const no = nextStationNo(svUuid);
+  if(no===null){ toast('番号が大きすぎて、これ以上置けません', 7000); return null; }
+  const rec = {
+    uuid: uuid(), survey_uuid: svUuid, station_no: no,
+    unit_kind: k, name: unitAutoName(svUuid, k, all),
+    started_at: nowISO(), survey_time_start: now,
+    survey_type: sv.survey_type_default || '目視',
+    env_points: [],
+  };
+  if(k === 'P'){
+    rec.latitude = la; rec.longitude = lo;
+    rec.gps_accuracy = (acc===undefined || acc===null) ? '' : Math.round(acc);
+    rec.position_source = (acc===undefined || acc===null) ? '地図' : 'GPS';
+    rec.survey_time_end = now; rec.ended_at = nowISO();
+  }else{
+    rec.poly = [{lat:la, lon:lo}];
+  }
+  if(!DB.upsert(DB.key.st, rec)) return null;
+  if(k === 'P'){
+    unitRelink(svUuid);
+    toast(`${rec.name} を置きました`);
+  }else{
+    FISH_NEXT = {kind:k, draw:rec.uuid, survey:svUuid};
+    toast(`${rec.name} を描きはじめました。角をタップして、囲いを閉じてください`, 7000);
+  }
+  FISH_SEL = rec.uuid;
+  return rec.uuid;
+}
+/* 囲いを閉じる */
+function fishClosePoly(svUuid){
+  const st = fishDrawing();
+  if(!st){ toast('いま描いている囲いがありません'); return false; }
+  if(!polyClosed(st)){
+    toast('角が3つ以上ないと、囲いになりません', 7000);
+    return false;
+  }
+  FISH_NEXT = {kind:FISH_NEXT.kind, draw:'', survey:svUuid};
+  unitRelink(svUuid);
+  const 中 = unitChildren(st.uuid, DB.stationsOf(svUuid)).length;
+  toast(`${st.name} を閉じました` + (中 ? `（中に ${中}件）` : ''), 5000);
+  return true;
+}
+/* 描いている途中の囲いを、まるごとやめる */
+function fishCancelPoly(){
+  const st = fishDrawing();
+  if(!st) return false;
+  if(!confirm(`${st.name} を描くのをやめます。よろしいですか？`)) return false;
+  if(!DB.softDelete(DB.key.st, st.uuid)) return false;
+  FISH_NEXT = {kind:FISH_NEXT.kind, draw:'', survey:FISH_NEXT.survey};
+  if(FISH_SEL === st.uuid) FISH_SEL = null;
+  toast('やめました');
+  return true;
+}
+let FISH_SEL = null, FISHLAYER = [], FISH_VIEW = {}, FISH_MAP_SV = '';
+function fishSelect(u){
+  if(FISH_SEL === u) return;
+  FISH_SEL = u;
+  render();
+}
+function fishRememberView(svUuid){
+  const map = MAPS.main.map; if(!map) return;
+  try{
+    const c = map.getCenter();
+    FISH_VIEW[svUuid] = {lat:c.lat, lon:c.lng, zoom:map.getZoom(), bearing:mapBearing(map)};
+  }catch(e){}
+}
+/* 地図に、囲いと点を描く */
+function fishDrawAll(svUuid){
+  const map = MAPS.main.map; if(!map) return;
+  try{ FISHLAYER.forEach(x=>map.removeLayer(x)); }catch(e){}
+  FISHLAYER = [];
+  const list = DB.stationsOf(svUuid).filter(x=>unitKindOf(x));
+  list.forEach(st=>{
+    const k = unitKindOf(st);
+    const on = st.uuid === FISH_SEL;
+    const col = on ? '#f0883e' : (k==='E' ? '#a371f7' : (k==='PF' ? '#4aa3ff' : '#3fb950'));
+    if(k === 'P'){
+      const pt = stationPt(st);
+      if(!pt) return;
+      FISHLAYER.push(L.marker(pt, {icon:envBadge(st.name||'', col, on?30:24, on, false),
+        zIndexOffset: on ? 1000 : 0})
+        .on('click', e=>{ L.DomEvent.stop(e); fishSelect(st.uuid); }).addTo(map));
+      return;
+    }
+    const pts = polyPts(st);
+    if(!pts.length) return;
+    const 描き中 = FISH_NEXT.draw === st.uuid;
+    if(pts.length >= 3 && !描き中){
+      FISHLAYER.push(L.polygon(pts, {color:col, weight:on?4:3, opacity:.95,
+        fillColor:col, fillOpacity:on?.22:.12, bubblingMouseEvents:false})
+        .on('click', e=>{ L.DomEvent.stop(e); fishSelect(st.uuid); }).addTo(map));
+    }else{
+      FISHLAYER.push(L.polyline(pts, {color:col, weight:3, opacity:.9,
+        dashArray:'6 4', bubblingMouseEvents:false})
+        .on('click', e=>{ L.DomEvent.stop(e); fishSelect(st.uuid); }).addTo(map));
+    }
+    pts.forEach(v=>{
+      FISHLAYER.push(L.circleMarker(v, {radius:描き中?6:4, color:'#fff', weight:2,
+        fillColor:col, fillOpacity:1, bubblingMouseEvents:false})
+        .on('click', e=>{ L.DomEvent.stop(e); fishSelect(st.uuid); }).addTo(map));
+    });
+    // 名前は、いちばん北の角に置く。真ん中に置くと、入れ子の囲いどうしで重なる
+    const c = pts.slice().sort((a,b)=>b[0]-a[0])[0];
+    if(c) FISHLAYER.push(L.marker(c, {icon:envBadge(st.name||'', col, on?30:24, on, true),
+      zIndexOffset: on ? 1000 : 0})
+      .on('click', e=>{ L.DomEvent.stop(e); fishSelect(st.uuid); }).addTo(map));
+  });
+}
+function fishAllPoints(svUuid){
+  const pts = [];
+  DB.stationsOf(svUuid).filter(x=>unitKindOf(x)).forEach(st=>{
+    if(unitKindOf(st)==='P'){ const p = stationPt(st); if(p) pts.push(p); }
+    else polyPts(st).forEach(v=>pts.push(v));
+  });
+  return pts;
+}
+function fishFitAll(svUuid){
+  const map = MAPS.main.map; if(!map) return;
+  const pts = fishAllPoints(svUuid);
+  if(!pts.length){ toast('まだ何も置かれていません'); return; }
+  try{ map.fitBounds(L.latLngBounds(pts).pad(0.3), {animate:false}); }catch(e){}
+  fishRememberView(svUuid);
+}
+SCREENS.fishMap = (svUuid)=>{
+  const sv = DB.getAlive(DB.key.sv, svUuid);
+  if(!sv) return null;
+  fishUseSurvey(svUuid);
+  const list = DB.stationsOf(svUuid).filter(x=>unitKindOf(x));
+  const 描き中 = fishDrawing();
+  if(FISH_SEL && !DB.liveStation(FISH_SEL)) FISH_SEL = null;
+  const cur = FISH_SEL ? DB.liveStation(FISH_SEL) : null;
+  const 子 = cur ? unitChildren(cur.uuid, list) : [];
+  const chip = (st)=>{
+    const k = unitKindOf(st);
+    const 中 = unitChildren(st.uuid, list).length;
+    const 未完 = isUnitPoly(st) && !polyClosed(st);
+    return `<button type="button" data-u="${st.uuid}" class="${st.uuid===FISH_SEL?'on':''}"
+      onclick="fishSelect('${st.uuid}')">${esc(st.name||'')}${未完?'…':''}${
+        中 ? `<span class="fsub">中に${中}</span>` : ''}</button>`;
+  };
+  return {
+    title: `${sv.river_name||''} ${sv.site_name||''}`.trim() || '魚の調査',
+    sub:[{text:surveyPeriodText(sv)},
+         {text:sv.status||'未開始', cls: sv.status==='調査中'?'ok':''},
+         {text:`${list.length}件`}],
+    html:`
+      ${baseMapButtonsHtml()}
+      <div id="fishmap" class="map"
+        style="height:${envMapBig()?'80vh':'46vh'};min-height:260px"></div>
+      <div class="dim small" id="fishHint"></div>
+      <div class="dim small" id="fishGps"></div>
+
+      <div class="card">
+        <h3 style="margin-top:0">記録の単位</h3>
+        ${list.length
+          ? `<div class="seg" data-seg="fishsel">${list.map(chip).join('')}</div>`
+          : '<div class="dim small">まだありません。左下の記号を選んで、地図をタップしてください。</div>'}
+        <div class="dim small">記録は、いちばん小さい単位に入れます。
+          大きい単位は、中に入っているものの集計になります。</div>
+      </div>
+
+      ${!cur ? '' : `<div class="card">
+        <div class="row">
+          <div class="grow">
+            <div style="font-weight:700;font-size:18px">${esc(cur.name||'')}</div>
+            <div class="dim small">${esc(UNIT_WORD[unitKindOf(cur)]||'')}${
+              isUnitPoly(cur) ? `　角 ${polyPts(cur).length}個` : ''}${
+              cur.parent_uuid ? `　${esc((DB.liveStation(cur.parent_uuid)||{}).name||'')} の中` : ''}</div>
+          </div>
+          <button class="btn sm ng" style="width:auto;margin:0"
+            onclick="fishDelete('${cur.uuid}')">消す</button>
+        </div>
+        ${(()=>{
+          const t = unitTotals(cur.uuid, list);
+          const 数 = `<div class="row" style="margin:6px 0">
+            <div class="grow"><div class="dim small">種数</div>
+              <div class="big">${t.種}</div></div>
+            <div class="grow"><div class="dim small">尾数</div>
+              <div class="big">${t.尾}</div></div>
+            ${子.length ? `<div class="grow"><div class="dim small">中の単位</div>
+              <div class="big">${t.単位 - 1}</div></div>` : ''}
+          </div>`;
+          if(!子.length){
+            return 数 + `<button class="btn pri" onclick="nav('station','${cur.uuid}')">
+              この${esc(UNIT_MARK[unitKindOf(cur)]||'')}に記録する</button>`;
+          }
+          const 内訳 = 子.map(c=>{
+            const ct = unitTotals(c.uuid, list);
+            return `<button type="button" class="btn sm" style="text-align:left"
+              onclick="fishSelect('${c.uuid}')">${esc(c.name||'')}
+              <span class="fsub">${ct.種}種 ${ct.尾}尾</span></button>`;
+          }).join('');
+          return 数 + `<div class="dim small">中に入っているものの集計です。
+            記録は、その中の小さい単位に入れてください。</div>${内訳}`;
+        })()}
+      </div>`}
+    `,
+    onMount(){
+      startGps();
+      const box = $('#fishGps');
+      if(box) ENV_GPS_TIMER = setInterval(()=>{
+        if(!document.body.contains(box)){ clearInterval(ENV_GPS_TIMER); ENV_GPS_TIMER=null; return; }
+        box.textContent = gpsHint();
+        drawMe('main');
+      }, 2000);
+
+      const v = FISH_VIEW[svUuid];
+      const c = v ? [v.lat, v.lon] : envMapCenter(sv, cur);
+      MAPS.main.map = makeMap('fishmap', c, v ? v.zoom : 16, v ? v.bearing : 0);
+      const map = MAPS.main.map;
+      if(!map) return;
+      applyBaseMap('main', baseMapName());
+      addLocateControl(map);
+      addMapIconBar(map, [
+        {icon: envMapBig()?'shrink':'expand',
+         title: envMapBig()?'地図を小さく':'地図を大きく', tap:()=>envToggleBig()},
+        {icon:'fitAll', title:'置いたものが全部入るように', tap:()=>fishFitAll(svUuid)},
+      ], 'topright');
+      addMapIconBar(map, [
+        {icon:'areaBig',   key:'E',  title:'つぎは調査範囲（囲い）', tap:()=>fishSetKind('E')},
+        {icon:'areaSmall', key:'PF', title:'つぎは河川区分・瀬淵（囲い）', tap:()=>fishSetKind('PF')},
+        {icon:'point',     key:'P',  title:'つぎはポイント（点）', tap:()=>fishSetKind('P')},
+      ], 'bottomleft');
+      addMapIconBar(map, [
+        {icon:'addHere', title:'いまいる場所に足す', tap:()=>fishAddHere(svUuid)},
+        {icon:'polyClose', title:'囲いを閉じる',
+         tap:()=>{ if(fishClosePoly(svUuid)) render(); }},
+      ], 'bottomright');
+      fishSyncHint();
+      fishDrawAll(svUuid);
+      drawMe('main');
+      FISH_MAP_SV = svUuid;
+      map.on('click', e=>{
+        fishAddAt(svUuid, e.latlng.lat, e.latlng.lng, null);
+        render();
+      });
+      map.on('moveend zoomend', ()=>fishRememberView(svUuid));
+      if(!v){
+        const pts = fishAllPoints(svUuid);
+        if(pts.length>1){
+          try{ map.fitBounds(L.latLngBounds(pts).pad(0.3), {animate:false}); }catch(e){}
+        }
+        fishRememberView(svUuid);
+      }
+    }
+  };
+};
+/* いまの状態を、地図の下の一行に出す */
+function fishSyncHint(){
+  const el = $('#fishHint'); if(!el) return;
+  const 描き中 = fishDrawing();
+  document.querySelectorAll('#fishmap .mapicons a[data-k]').forEach(a=>{
+    a.classList.toggle('on', a.dataset.k === FISH_NEXT.kind);
+  });
+  if(描き中){
+    el.innerHTML = `<b>${esc(描き中.name)}</b> を描いています（角 ${polyPts(描き中).length}個）。`
+      + `地図をタップして角を足し、右下の「囲いを閉じる」で閉じてください`;
+    return;
+  }
+  el.innerHTML = `つぎ：<b>${esc(UNIT_WORD[FISH_NEXT.kind]||'')}</b>　`
+    + (FISH_NEXT.kind==='P' ? '地図をタップすると置けます'
+                            : '地図をタップすると、囲いを描きはじめます');
+}
+function fishAddHere(svUuid){
+  toast('現在地を取っています…');
+  getFixOnce(f=>{
+    if(!f){ toast('現在地を取れませんでした。地図をタップしても置けます', 6000); return; }
+    if(f.acc > GPS_MAX_ACC){
+      toast(`いまの位置は ±${Math.round(f.acc)}m と粗いので置いていません`, 8000);
+      return;
+    }
+    fishAddAt(svUuid, f.lat, f.lon, f.acc);
+    render();
+  });
+}
+function fishDelete(u){
+  const st = DB.liveStation(u); if(!st) return;
+  const 中 = unitChildren(u, DB.stationsOf(st.survey_uuid)).length;
+  if(!confirm(`${st.name} を消します。${中?`中の ${中}件は残りますが、囲いの外に出ます。`:''}`
+    + '中の記録も一緒に見えなくなります。よろしいですか？')) return;
+  if(!DB.softDelete(DB.key.st, u)) return;
+  draftClearFor('箇所', u);
+  if(FISH_SEL === u) FISH_SEL = null;
+  if(FISH_NEXT.draw === u) FISH_NEXT = {kind:FISH_NEXT.kind, draw:'', survey:FISH_NEXT.survey};
+  unitRelink(st.survey_uuid);
+  toast('消しました');
+  render();
+}
 SCREENS.envMap = (svUuid)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
