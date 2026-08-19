@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v35';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v36';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -5874,6 +5874,88 @@ ${(opt && opt.head === false) ? '' : `      <div class="card">
       <div class="dim small" id="ev_saved">入れたそばから、自動で保存されます。</div>
       <button class="btn pri" onclick="saveEnvItem('${cur.uuid}')">保存する</button>`;
 }
+/* 種を選ぶのも、尾数を入れるのも、地図の下でする（2026-08-20 の実機の声） */
+let FISH_PICK = '';        // 種選びを開いている記録のID
+function fishPickOpen(stUuid){
+  FISH_PICK = (FISH_PICK === stUuid) ? '' : stUuid;
+  render();
+}
+/* 種の一覧を、その場に描く */
+function fishPickList(stUuid){
+  const box = $('#fishSplist'); if(!box) return;
+  const q = strVal('#fishSpq');
+  const list = speciesSearch(q).slice(0, 60);
+  const もう入れた = new Set(DB.catchesOf(stUuid).map(c=>c.species_id));
+  if(!list.length){
+    box.innerHTML = '<div class="dim small">見つかりませんでした。'
+      + '魚類データベースの種リストに無い種かもしれません。</div>';
+    return;
+  }
+  box.innerHTML = '<div class="splist">' + list.map(sp=>{
+    const al = speciesAliasOf(sp.id);
+    return `<div class="spitem" onclick="fishAddSpecies('${stUuid}','${sp.id}')">
+      ${esc(sp.ja)}${もう入れた.has(sp.id)?'<span class="pill ok">入力済み</span>':''}
+      <span class="fam">${esc(sp.fam||'')}</span>
+      ${al.length?`<div class="dim small">別名：${esc(al.join('・'))}</div>`:''}
+    </div>`;
+  }).join('') + '</div>';
+}
+/* 選んだ種を、その場で足す。同じ種がもうあればそれを使う */
+function fishAddSpecies(stUuid, spId){
+  const st = DB.liveStation(stUuid); if(!st) return;
+  if(!writeAllowed()){
+    toast('このタブでは足せません。記録を入れているタブでお試しください', 7000);
+    return;
+  }
+  const 同じ = DB.catchesOf(stUuid).find(c=>c.species_id===spId);
+  if(同じ){ toast(`${同じ.species_name||''} はもう入っています`); FISH_PICK=''; render(); return; }
+  const sp = speciesById(spId);
+  const rec = {uuid:uuid(), survey_uuid:st.survey_uuid, station_uuid:stUuid,
+    recorded_at:nowISO(),
+    species_id:spId||'', species_name:sp?sp.ja:'', species_family:sp?sp.fam:'',
+    count_unmeasured:'', identification_confidence:'確実', notes:''};
+  if(!DB.upsert(DB.key.ca, rec)){
+    toast('足せませんでした（端末の空き容量をご確認ください）', 8000);
+    return;
+  }
+  FISH_PICK = '';
+  toast(`${rec.species_name} を足しました。尾数を入れてください`);
+  render();
+}
+/* 尾数を、その場で保存する */
+function fishSaveCount(caUuid){
+  const c = DB.getAlive(DB.key.ca, caUuid); if(!c) return false;
+  if(!writeAllowed()){
+    toast('このタブでは入れられません。記録を入れているタブでお試しください', 7000);
+    return false;
+  }
+  const v = strVal('#fc_'+caUuid);
+  if(v !== '' && countOf(v) === null){
+    toast('尾数は0以上の整数で入れてください（空でも構いません）', 6000);
+    return false;
+  }
+  c.count_unmeasured = v === '' ? '' : countOf(v);
+  if(!DB.upsert(DB.key.ca, c)){
+    toast('保存できませんでした（端末の空き容量をご確認ください）', 8000);
+    return false;
+  }
+  const mark = $('#fc_saved_'+caUuid);
+  if(mark) mark.textContent = '保存しました（' + timeValue() + '）';
+  return true;
+}
+function fishSetConf(caUuid, v){
+  const c = DB.getAlive(DB.key.ca, caUuid); if(!c) return false;
+  if(!writeAllowed()) return false;
+  c.identification_confidence = v;
+  if(!DB.upsert(DB.key.ca, c)) return false;
+  render();
+  return true;
+}
+function fishDelCatch(caUuid){
+  const c = DB.getAlive(DB.key.ca, caUuid); if(!c) return;
+  if(!confirm(`${c.species_name||''} の記録を消します。よろしいですか？`)) return;
+  if(DB.softDelete(DB.key.ca, caUuid)){ toast('消しました'); render(); }
+}
 SCREENS.fishMap = (svUuid)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
@@ -5954,13 +6036,43 @@ SCREENS.fishMap = (svUuid)=>{
           return `${t.種}種 ${t.尾}尾`; })()}</span>`,
         (()=>{
           const cs = DB.catchesOf(cur.uuid);
-          return `<button class="btn pri" onclick="nav('speciesPick','${cur.uuid}')">
-            魚を足す（種類を選ぶ）</button>
-          ${cs.length ? cs.map(c=>`<button class="btn sm" style="text-align:left"
-              onclick="nav('catchEdit',{uuid:'${c.uuid}'})">
-              ${esc(c.species_name||c.species_id||'（種なし）')}
-              <span class="fsub">${catchTotal(c)}尾${
-                (c.photos||[]).length ? '　写真'+(c.photos||[]).length : ''}</span></button>`).join('')
+          const 選び中 = FISH_PICK === cur.uuid;
+          return `<button class="btn ${選び中?'':'pri'}"
+            onclick="fishPickOpen('${cur.uuid}')">${選び中?'種を選ぶのをやめる':'魚を足す（種類を選ぶ）'}</button>
+          ${選び中 ? `<input id="fishSpq" placeholder="和名・科名・昔の呼び名で探す"
+              oninput="fishPickList('${cur.uuid}')" autocomplete="off">
+            <div class="dim small">昔の呼び名（エゾイワナ・ヤマメなど）でも探せます。
+              保存されるのは正式な種です。</div>
+            <div id="fishSplist"></div>` : ''}
+          ${cs.length ? cs.map(c=>{
+            const n = DB.individualsOf(c.uuid).length;
+            return `<div class="card" style="margin-top:8px">
+              <div class="row">
+                <div class="grow">
+                  <div style="font-weight:700">${esc(c.species_name||c.species_id||'（種なし）')}</div>
+                  <div class="dim small">合わせて ${catchTotal(c)}尾${n?`（測った ${n}尾）`:''}</div>
+                </div>
+                <button class="btn sm ng" style="width:auto;margin:0"
+                  onclick="fishDelCatch('${c.uuid}')">消す</button>
+              </div>
+              <label>数えただけの尾数（測らない分）</label>
+              <input id="fc_${c.uuid}" inputmode="numeric" value="${esc(
+                c.count_unmeasured!==undefined?c.count_unmeasured:'')}"
+                onchange="fishSaveCount('${c.uuid}')" placeholder="例）30">
+              <div class="dim small" id="fc_saved_${c.uuid}"></div>
+              <label>同定の確からしさ</label>
+              <div class="seg">${OPT.confidence.map(o=>`<button type="button"
+                class="${(c.identification_confidence||'確実')===o?'on':''}"
+                onclick="fishSetConf('${c.uuid}','${esc(o)}')">${esc(o)}</button>`).join('')}</div>
+              <div class="btn2">
+                <button class="btn sm ok"
+                  onclick="toIndividuals('${cur.uuid}','${c.uuid}','${c.species_id||''}')"
+                  >1尾ずつ測る${n?`（${n}）`:''}</button>
+                <button class="btn sm" onclick="nav('catchEdit',{uuid:'${c.uuid}'})"
+                  >写真・備考</button>
+              </div>
+            </div>`;
+          }).join('')
             : '<div class="dim small">まだありません。「魚を足す」から入れてください。</div>'}`;
         })(), true)}
 
@@ -6013,6 +6125,10 @@ SCREENS.fishMap = (svUuid)=>{
          tap:()=>{ if(fishClosePoly(svUuid)) render(); }},
       ], 'bottomright');
       envItemFormWire(子.length ? null : cur, sv);
+      if(cur && FISH_PICK === cur.uuid){
+        fishPickList(cur.uuid);
+        const q = $('#fishSpq'); if(q) q.focus();
+      }
       if(cur && !子.length && !isDetail(sv) && effortRunning(cur)){
         EFFORT_TIMER = setInterval(()=>{
           const el = $('#effClock');
