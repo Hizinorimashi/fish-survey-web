@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v29';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v30';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1769,11 +1769,18 @@ function envUseSurvey(svUuid){
     ENV_SEL = null;
   }
 }
+/* 足せるもの。V は「曲がり」 */
+function envKindWord(k){
+  return k==='P' ? 'ポイント' : k==='LS' ? 'ラインの始まり'
+       : k==='LE' ? 'ラインの終わり' : '曲がり';
+}
 function envSetKind(k){
   const sv = ENV_NEXT.survey;
   // 同じものをもう一度押したら、入れ替えをやめる（同じものを続けて足したいとき）
   if(ENV_NEXT.kind === k) ENV_NEXT = {kind:k, auto:false, line:ENV_NEXT.line, survey:sv};
   else if(k === 'P')       ENV_NEXT = {kind:'P', auto:false, line:'', survey:sv};
+  // 曲がりは、続けて置くもの。交互には入れない
+  else if(k === 'V')       ENV_NEXT = {kind:'V', auto:false, line:ENV_NEXT.line, survey:sv};
   else                     ENV_NEXT = {kind:k, auto:true, line:ENV_NEXT.line, survey:sv};
   if(!envSyncNextUI()) render();
 }
@@ -1856,8 +1863,7 @@ function envSyncNextUI(){
   });
   const hint = $('#envHint');
   if(hint){
-    const 名 = ENV_NEXT.kind==='P' ? 'ポイント'
-             : ENV_NEXT.kind==='LS' ? 'ラインの始まり' : 'ラインの終わり';
+    const 名 = envKindWord(ENV_NEXT.kind);
     hint.innerHTML = `つぎ：<b>${esc(名)}</b>　地図をタップ／狙いの印で置けます`
       + (ENV_NEXT.auto ? '（始まり→終わりで交互）' : '（同じものが続きます）');
   }
@@ -1912,6 +1918,9 @@ function envAddAt(svUuid, lat, lon, acc){
   if(!validPt([la, lo])){ toast('位置がおかしいので追加できません'); return null; }
   const now = timeValue();
 
+  if(k === 'V'){
+    return envAddBend(svUuid, la, lo, acc);
+  }
   if(k === 'LE'){
     // 開始だけのラインにつなぐ。無ければ足さない（勝手に線を作らない）
     const st = envLineTarget(svUuid);
@@ -2031,10 +2040,35 @@ function linePt(st, which){
   const pt = [la, lo];
   return validPt(pt) ? pt : null;
 }
-/* 始点から終点までの直線。歩いた向きは距離に関係しない */
-function lineDist(st){
+/* ラインの途中の曲がり。川の形に沿わせるために置く（2026-08-19 の実機の声） */
+function lineVias(st){
+  return ((st && st.line_via) || []).map(v=>{
+    const la = numOf(v && v.lat), lo = numOf(v && v.lon);
+    if(la==='' || lo==='') return null;
+    const pt = [la, lo];
+    return validPt(pt) ? pt : null;
+  }).filter(Boolean);
+}
+/* 始点 → 曲がり… → 終点。終点がまだなら、そこまでの形を返す */
+function linePath(st){
+  const a = linePt(st,'start');
+  if(!a) return [];
+  const b = linePt(st,'end');
+  return [a].concat(lineVias(st), b ? [b] : []);
+}
+/* 始点から終点までの直線。曲がりを置いても、この値は変わらない
+   （書き出しの「距離_始終点直線m」は、これまでと同じ意味のまま） */
+function lineStraight(st){
   const a = linePt(st,'start'), b = linePt(st,'end');
   return (a && b) ? distMeters(a, b) : '';
+}
+/* 区間の長さ。曲がりを置いてあれば、その折れ線に沿って測る。
+   歩いた向きは距離に関係しない */
+function lineDist(st){
+  const b = linePt(st,'end');
+  if(!b) return '';
+  const path = linePath(st);
+  return path.length >= 2 ? pathLength(path) : '';
 }
 function stationLengths(st){
   const track = (st.track||[]).filter(validPt);
@@ -2787,6 +2821,9 @@ const MAP_ICONS = {
   lineEnd: '<path d="M3 12 H13.5" stroke-dasharray="3.5 3"/>'
     + '<rect x="14.5" y="7.8" width="8.4" height="8.4" rx="1.5"'
     + ' fill="currentColor" stroke="none"/>',
+  // ラインの曲がり（カクッと折れた線）
+  lineBend: '<path d="M3 19 L10 19 L10 9 L21 9" stroke-dasharray="0"/>'
+    + '<circle cx="10" cy="9" r="2.6" fill="currentColor" stroke="none"/>',
   // いまいる場所に足す（狙いの輪＋十字）
   addHere: '<circle cx="12" cy="12" r="5"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>'
     + '<circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/>',
@@ -3880,7 +3917,9 @@ function buildStationRows(sv, snap){
       '始点GPS精度m': numOf(st.line_start_acc),
       '終点緯度': fixCoord(st.line_end_lat), '終点経度': fixCoord(st.line_end_lon),
       '終点GPS精度m': numOf(st.line_end_acc),
-      '距離_始終点直線m': round1(stationLengths(st).line),
+      '距離_始終点直線m': round1(lineStraight(st)),
+      '距離_区間折れ線m': round1(stationLengths(st).line),
+      '曲がり数': isLine(st) ? lineVias(st).length : '',
       '流量': numOf(st.flow_rate),
       'メッシュ縦間隔m': numOf(st.mesh_row_m), 'メッシュ横分割数': countOf(st.mesh_cols),
       'メッシュ行数': mg ? mg.rows : '', 'メッシュ列数': mg ? mg.cols : '',
@@ -4022,7 +4061,7 @@ const FS_IND_COLS = ['調査日','河川名','地点名','箇所','種ID','種�
 const FS_STATION_COLS = ['調査日','河川名','地点名','箇所','記録のしかた',
   '調べたもの','環境の取り方','向き',
   '始点緯度','始点経度','始点GPS精度m','終点緯度','終点経度','終点GPS精度m',
-  '距離_始終点直線m','流量',
+  '距離_始終点直線m','距離_区間折れ線m','曲がり数','流量',
   'メッシュ縦間隔m','メッシュ横分割数','メッシュ行数','メッシュ列数','メッシュ入力済み数',
   'メッシュ前の格子のマス数','メッシュ格子ID','メッシュ縦m','メッシュ横m',
   '緯度','経度','GPS精度m','位置の決め方',
@@ -5093,8 +5132,10 @@ SCREENS.station = (stUuid)=>{
         <div class="row">
           <div class="grow"><div class="dim small">向き</div>
             <div>${esc(st.line_direction||'—')}</div></div>
-          <div class="grow"><div class="dim small">始点から終点</div>
-            <div>${len.line===''?'—':esc(fmtDist(len.line))}</div></div>
+          <div class="grow"><div class="dim small">${
+            lineVias(st).length ? '折れ線に沿って' : '始点から終点'}</div>
+            <div>${len.line===''?'—':esc(fmtDist(len.line))}${
+              lineVias(st).length ? `<span class="dim small">　曲がり ${lineVias(st).length}個</span>` : ''}</div></div>
           <div class="grow"><div class="dim small">使う長さ</div>
             <div style="font-weight:700">${esc(fmtDist(len.used))}</div></div>
         </div>
@@ -5357,7 +5398,9 @@ SCREENS.envMap = (svUuid)=>{
           <div class="grow"><div style="font-weight:700;font-size:18px">${esc(cur.name||'')}</div>
             <div class="dim small">${envKindOf(cur)==='L'
               ? (linePt(cur,'end') ? '区間 '+esc(fmtDist(lineDist(cur)))
-                                   : '<span class="pill warn">終わりがまだ</span>')
+                    + (lineVias(cur).length ? `　曲がり ${lineVias(cur).length}個` : '')
+                                   : '<span class="pill warn">終わりがまだ</span>'
+                    + (lineVias(cur).length ? `　曲がり ${lineVias(cur).length}個` : ''))
               : (!stationPt(cur) ? '<span class="pill ng">位置なし</span>'
                  : esc(fixCoord(cur.latitude)+', '+fixCoord(cur.longitude)))}
               ${cur.survey_time_start ? '　'+esc(cur.survey_time_start) : ''}${
@@ -5386,6 +5429,14 @@ SCREENS.envMap = (svUuid)=>{
                 onclick="envMoveStart('${cur.uuid}','${w}')">${待ち?'やめる':'地図で直す'}</button>
             </div>`;
           }).join('')
+          + (envKindOf(cur)==='L' ? `<div class="row" style="margin-top:6px">
+              <div class="grow"><div class="dim small">曲がり</div>
+                <div>${lineVias(cur).length}個</div></div>
+              <button class="btn sm" style="width:auto;margin:0"
+                onclick="if(envUndoBend('${cur.uuid}')) render()">最後を取り消す</button>
+              <button class="btn sm ng" style="width:auto;margin:0"
+                onclick="if(envClearBends('${cur.uuid}')) render()">全部消す</button>
+            </div>` : '')
           + `<div class="dim small">「地図で直す」を押してから、地図をタップしてください。</div>
           <div class="row" style="margin-top:8px">
             <div class="grow"><label>開始時刻</label>
@@ -5548,6 +5599,7 @@ SCREENS.envMap = (svUuid)=>{
         {icon:'point',     key:'P',  title:'つぎはポイント', tap:()=>envSetKind('P')},
         {icon:'lineStart', key:'LS', title:'つぎはラインの始まり', tap:()=>envSetKind('LS')},
         {icon:'lineEnd',   key:'LE', title:'つぎはラインの終わり', tap:()=>envSetKind('LE')},
+        {icon:'lineBend',  key:'V',  title:'つぎはラインの曲がり', tap:()=>envSetKind('V')},
       ], 'bottomleft');
       addMapIconBar(map, [
         {icon:'addHere', title:'いまいる場所に足す', tap:()=>envAddHere(svUuid)},
@@ -5562,11 +5614,17 @@ SCREENS.envMap = (svUuid)=>{
         // 直す待ちのときは、新しく置かずに動かす
         if(ENV_MOVE){
           const m = ENV_MOVE;
-          if(envMoveTo(m.uuid, m.which, e.latlng.lat, e.latlng.lng, null)) render();
+          // すぐ近くに置いてあるものがあれば、そこへ重ねる
+          const sn = envSnapTo(svUuid, e.latlng.lat, e.latlng.lng, m.uuid);
+          const la = sn ? sn.lat : e.latlng.lat, lo = sn ? sn.lon : e.latlng.lng;
+          if(envMoveTo(m.uuid, m.which, la, lo, null)){ envSnapTell(sn); render(); }
           return;
         }
         if(envPickOn()){ toast('消すものを選んでいます。先に「やめる」を押してください', 6000); return; }
-        envAddAt(svUuid, e.latlng.lat, e.latlng.lng, null); render();
+        const sn = envSnapTo(svUuid, e.latlng.lat, e.latlng.lng, null);
+        const la = sn ? sn.lat : e.latlng.lat, lo = sn ? sn.lon : e.latlng.lng;
+        if(envAddAt(svUuid, la, lo, null)) envSnapTell(sn);
+        render();
       });
       // はじめて開いたときだけ、置いてあるものが入るようにする
       if(!v){
@@ -5622,7 +5680,15 @@ function envDrawAll(svUuid){
       const a = linePt(st,'start'), b = linePt(st,'end');
       if(a) put(a, nm, false);
       if(b) put(b, '終', true);
-      if(a && b) ENVLAYER.push(L.polyline([a,b],
+      // 曲がりは小さな丸で出す。名前は付けない（数が増えると読めなくなる）
+      lineVias(st).forEach(v=>{
+        ENVLAYER.push(L.circleMarker(v, {radius:on?6:4, color:'#fff', weight:2,
+          fillColor:col, fillOpacity:1, bubblingMouseEvents:false})
+          .on('click', e=>{ L.DomEvent.stop(e); envSelect(st.uuid); }).addTo(map));
+        pts.push(v);
+      });
+      const path = linePath(st);
+      if(path.length >= 2) ENVLAYER.push(L.polyline(path,
         {color:col, weight:on?6:4, opacity:.9, bubblingMouseEvents:false})
         .on('click', e=>{ L.DomEvent.stop(e); envSelect(st.uuid); }).addTo(map));
     }else{
@@ -5750,6 +5816,105 @@ function envSavePhotosNow(){
   const mark = $('#ev_saved');
   if(mark) mark.textContent = '写真を保存しました（' + timeValue() + '）';
   return true;
+}
+/* 曲がりを足す相手のライン。
+   1) いま選んでいるライン（終わっていてもよい。あとから形を整えられる）
+   2) 直前に置いた始まり
+   3) 終わっていないラインがちょうど1本ならそれ */
+function envBendTarget(svUuid){
+  const 線 = st => st && isLine(st) && linePt(st,'start');
+  const sel = ENV_SEL ? DB.getAlive(DB.key.st, ENV_SEL) : null;
+  if(線(sel) && sel.survey_uuid===svUuid) return sel;
+  if(ENV_NEXT.line){
+    const st = DB.getAlive(DB.key.st, ENV_NEXT.line);
+    if(線(st) && st.survey_uuid===svUuid) return st;
+  }
+  const 未完 = DB.stationsOf(svUuid).filter(x=>線(x) && !linePt(x,'end'));
+  if(未完.length===1) return 未完[0];
+  const 線ぜんぶ = DB.stationsOf(svUuid).filter(線);
+  return 線ぜんぶ.length===1 ? 線ぜんぶ[0] : null;
+}
+/* 曲がりを1つ足す。終点があるラインでは、終点の手前に入れる */
+function envAddBend(svUuid, la, lo, acc){
+  const st = envBendTarget(svUuid);
+  if(!st){
+    toast('どのラインを曲げるか決められません。'
+      + '先にラインを選ぶか、ラインの始まりを置いてください', 8000);
+    return null;
+  }
+  const v = {lat: la, lon: lo};
+  const a = (acc===undefined || acc===null || acc==='') ? '' : Math.round(acc);
+  if(a!=='') v.acc = a;
+  st.line_via = (st.line_via||[]).concat([v]);
+  if(!DB.upsert(DB.key.st, st)){
+    toast('曲がりを置けませんでした（端末の空き容量をご確認ください）', 8000);
+    return null;
+  }
+  ENV_SEL = st.uuid;
+  toast(`${st.name||''} に曲がりを置きました（${(st.line_via||[]).length}個目）`);
+  return st.uuid;
+}
+/* 直前に置いた曲がりを取り消す */
+function envUndoBend(u){
+  const st = DB.liveStation(u); if(!st) return false;
+  const via = (st.line_via||[]).slice();
+  if(!via.length){ toast('取り消す曲がりがありません'); return false; }
+  via.pop();
+  st.line_via = via;
+  if(!DB.upsert(DB.key.st, st)){
+    toast('取り消せませんでした（端末の空き容量をご確認ください）', 8000);
+    return false;
+  }
+  toast(`曲がりを1つ取り消しました（残り ${via.length}個）`);
+  return true;
+}
+function envClearBends(u){
+  const st = DB.liveStation(u); if(!st) return false;
+  const n = (st.line_via||[]).length;
+  if(!n){ toast('消す曲がりがありません'); return false; }
+  if(!confirm(`${st.name||''} の曲がり ${n}個をすべて消します。よろしいですか？`)) return false;
+  st.line_via = [];
+  if(!DB.upsert(DB.key.st, st)){
+    toast('消せませんでした（端末の空き容量をご確認ください）', 8000);
+    return false;
+  }
+  toast('曲がりをすべて消しました');
+  return true;
+}
+/* 指では、すでにある点とまったく同じ場所を狙えない。
+   すぐ近く（指1本ぶん）に置いてあるものがあれば、そこへぴったり重ねる
+   （2026-08-19 の実機の声）。
+   もっと寄れば、この幅は実際の距離としては小さくなるので、
+   近くに別の点を置きたいときは地図を拡大すればよい */
+const ENV_SNAP_PX = 18;
+function envSnapTo(svUuid, lat, lon, 除く){
+  const map = MAPS.main.map;
+  if(!map || typeof map.latLngToContainerPoint !== 'function') return null;
+  let here; try{ here = map.latLngToContainerPoint([lat, lon]); }catch(e){ return null; }
+  let 近い = null, 距離 = ENV_SNAP_PX;
+  DB.stationsOf(svUuid).filter(x=>!isMesh(x)).forEach(st=>{
+    if(除く && st.uuid === 除く) return;
+    const 角 = [];
+    if(envKindOf(st) === 'L'){
+      const a = linePt(st,'start'), b = linePt(st,'end');
+      if(a) 角.push({pt:a, w:'始点'});
+      if(b) 角.push({pt:b, w:'終点'});
+    }else{
+      const pt = stationPt(st);
+      if(pt) 角.push({pt, w:''});
+    }
+    角.forEach(c=>{
+      let d;
+      try{ d = here.distanceTo(map.latLngToContainerPoint(c.pt)); }catch(e){ return; }
+      if(d <= 距離){ 距離 = d; 近い = {lat:c.pt[0], lon:c.pt[1], name:st.name||'', w:c.w}; }
+    });
+  });
+  return 近い;
+}
+/* 重ねたことを知らせる。何に重ねたか分からないと、狙いどおりか確かめられない */
+function envSnapTell(sn){
+  if(!sn) return;
+  toast(`${sn.name}${sn.w ? 'の'+sn.w : ''} に重ねました`, 4000);
 }
 /* いま「地図をタップして直す」を待っている相手。
    {uuid, which} which は '点' / '始点' / '終点'（2026-08-18 の実機の声） */
