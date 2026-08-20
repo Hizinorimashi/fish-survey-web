@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v38';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v39';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2587,6 +2587,7 @@ function render(){
   $('#main').innerHTML = (window.READ_ONLY
       ? `<div class="ngbox">${esc(LOCK_WHY)}</div>` : '') + (v.html || '');
   const いまの画面 = screenKey(STACK[STACK.length-1]);
+  if(いまの画面 !== 前の画面) PICK_SET = null;   // 画面を移ったら、選ぶのはやめる
   SCREEN_AT = いまの画面;
   // 同じ画面なら、見ていた位置に戻す。別の画面なら先頭から
   window.scrollTo(0, (いまの画面 && いまの画面 === 前の画面) ? 前の位置 : 0);
@@ -4359,6 +4360,13 @@ SCREENS.home = ()=>{
     const nSt = DB.stationsOf(s.uuid).length;
     const nSp = speciesCount(DB.catchesOfSurvey(s.uuid), null);
     const cls = s.status==='調査中' ? 'ok' : (s.status==='終了' ? '' : 'warn');
+    if(pickOn()){
+      return `<button type="button" class="btn sm" data-pick="${s.uuid}"
+        style="text-align:left" onclick="pickToggle('${s.uuid}')">
+        ${esc(s.river_name||'(河川名なし)')} ${esc(s.site_name||'')}
+        <span class="fsub">${esc(surveyPeriodText(s))}　箇所${nSt}　${nSp}種 ${surveyTotal(s)}尾</span>
+      </button>`;
+    }
     return `<div class="card tap" onclick="nav('survey','${s.uuid}')">
       <div class="row">
         <div class="grow">
@@ -4372,11 +4380,21 @@ SCREENS.home = ()=>{
     title:'魚類調査記録',
     sub:[{text:`調査 ${list.length}件`}, {text:`魚種 ${SPECIES.length}`}],
     html:`
-      <button class="btn pri" onclick="nav('surveyEdit',null)">新しい調査をはじめる</button>
+      ${pickOn()
+        ? `<div class="card">
+             <button class="btn ng" data-pickn="選んだ N件をごみ箱へ"
+               onclick="if(pickTrashSurveys()) render()" disabled>消すものを押してください</button>
+             <button class="btn" onclick="pickCancel()">やめる</button>
+             <div class="dim small">いらない調査を押して選んでください。ごみ箱から戻せます。</div>
+           </div>`
+        : `<button class="btn pri" onclick="nav('surveyEdit',null)">新しい調査をはじめる</button>`}
       ${list.length ? cards : '<div class="card dim">まだ調査がありません。上のボタンから作ってください。</div>'}
+      ${list.length && !pickOn()
+        ? `<button class="btn" onclick="pickStart()">いらない調査を選んで消す</button>` : ''}
       <button class="btn" onclick="nav('sites',null)">地点を登録・確認する（${DB.sites().length}件）</button>
       ${(()=>{ const n = trashCount(); return n
         ? `<button class="btn" onclick="nav('trash',null)">ごみ箱（${n}件）</button>` : ''; })()}
+      <button class="btn" onclick="nav('cloud',null)">クラウド保存（Googleドライブ）</button>
       <div class="hr"></div>
       <div class="card">
         <div class="row">
@@ -6116,6 +6134,329 @@ function trashInside(k, uuid){
   const t = trashTargets(k, uuid);
   return t.sv.size + t.st.size + t.ca.size + t.nt.size + (t.in ? t.in.size : 0) - 1;
 }
+/* まとめて選ぶ。ホームの調査と、ごみ箱の両方で使う（2026-08-20 の実機の声）。
+   印は「種類:ID」の形で持つ（ごみ箱は種類が混ざるため） */
+let PICK_SET = null;
+function pickOn(){ return !!PICK_SET; }
+function pickStart(){
+  if(!writeAllowed()){
+    toast('このタブでは消せません。記録を入れているタブでお試しください', 7000);
+    return;
+  }
+  PICK_SET = new Set(); render();
+}
+function pickCancel(){ PICK_SET = null; render(); }
+function pickToggle(id){
+  if(!PICK_SET) return;
+  if(PICK_SET.has(id)) PICK_SET.delete(id); else PICK_SET.add(id);
+  document.querySelectorAll('[data-pick]').forEach(b=>{
+    b.classList.toggle('on', PICK_SET.has(b.dataset.pick));
+  });
+  document.querySelectorAll('[data-pickn]').forEach(b=>{
+    const n = PICK_SET.size;
+    b.textContent = String(b.dataset.pickn).replace('N', n);
+    b.disabled = !n;
+  });
+}
+/* 選んだ調査を、まとめてごみ箱へ */
+function pickTrashSurveys(){
+  if(!pickOn() || !PICK_SET.size) return false;
+  if(!writeAllowed()){
+    toast('このタブでは消せません。記録を入れているタブでお試しください', 7000);
+    return false;
+  }
+  const ids = Array.from(PICK_SET);
+  const 名 = ids.map(u=>{
+    const x = DB.getAlive(DB.key.sv, u) || {};
+    return `${x.river_name||''} ${x.site_name||''}`.trim() || '（名前なし）';
+  });
+  if(!confirm(`${名.slice(0,5).join('・')}${名.length>5?`ほか${名.length-5}件`:''} の `
+    + `${ids.length}件をごみ箱に入れます。よろしいですか？\n（ごみ箱から戻せます）`)) return false;
+  let all;
+  try{ all = DB.loadRaw(DB.key.sv); }
+  catch(e){ toast('保存された記録を読み取れないため、消せませんでした', 7000); return false; }
+  const t = nowISO();
+  let n = 0;
+  all.forEach(x=>{ if(x && PICK_SET.has(x.uuid) && !x.deleted_at){ x.deleted_at = t; n++; } });
+  if(!n){ toast('消せるものがありませんでした'); PICK_SET = null; return true; }
+  if(!DB.save(DB.key.sv, all)){
+    toast('消せませんでした（端末の空き容量をご確認ください）', 8000);
+    return false;
+  }
+  PICK_SET = null;
+  toast(`${n}件をごみ箱に入れました`);
+  return true;
+}
+/* ごみ箱で、選んだものをまとめて戻す／完全に消す */
+function pickTrashDo(どうする){
+  if(!pickOn() || !PICK_SET.size) return false;
+  if(!writeAllowed()){
+    toast('このタブでは触れません。記録を入れているタブでお試しください', 7000);
+    return false;
+  }
+  const ids = Array.from(PICK_SET).map(x=>{
+    const i = x.indexOf(':');
+    return {k:x.slice(0,i), uuid:x.slice(i+1)};
+  });
+  if(どうする === '消す'){
+    let 中 = 0;
+    ids.forEach(x=>{ 中 += trashInside(x.k, x.uuid); });
+    if(!confirm(`選んだ ${ids.length}件を完全に消します。`
+      + (中 ? `中の記録 ${中}件も一緒に消えます。` : '')
+      + '\nもう戻せません。よろしいですか？')) return false;
+  }
+  let ok = 0, ng = 0;
+  const 元confirm = window.confirm;
+  window.confirm = ()=>true;          // 1件ずつ聞き直さない（まとめて確かめた）
+  try{
+    ids.forEach(x=>{
+      const r = (どうする === '消す') ? trashPurge(x.k, x.uuid) : trashRestore(x.k, x.uuid);
+      if(r) ok++; else ng++;
+    });
+  }finally{ window.confirm = 元confirm; }
+  PICK_SET = null;
+  toast(ng ? `${ok}件を${どうする === '消す' ? '完全に消しました' : '戻しました'}。`
+             + `${ng}件はできませんでした`
+           : `${ok}件を${どうする === '消す' ? '完全に消しました' : '戻しました'}`);
+  return true;
+}
+/* ============================================================
+   クラウド保存（Googleドライブ）
+   鳥アプリと同じ仕組み。押したときだけ Google の部品を読むので、
+   ふだんはこれまでどおり電波が無くても動く。
+   置き場は鳥アプリと分ける（フォルダ名もファイル名も別）
+   ============================================================ */
+const GD_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const GD_FOLDER = '魚類調査バックアップ';
+const GD_FILE = 'fish_survey_backup.json';
+const GD_CLIENT_ID = '39266503709-hqoe2kpd60r59dn5s1ql7ltjs7nu31h0.apps.googleusercontent.com';
+let GD_TOKEN = null;
+function gdTokenLoad(){
+  try{
+    const t = JSON.parse(localStorage.getItem('fs_gdrive_token')||'null');
+    return (t && t.access_token && Date.now() < t.expiry-60000) ? t : null;
+  }catch(e){ return null; }
+}
+function gdTokenSave(t){
+  GD_TOKEN = t;
+  try{ localStorage.setItem('fs_gdrive_token', JSON.stringify(t)); }catch(e){}
+}
+function gdTokenClear(){
+  GD_TOKEN = null;
+  try{ localStorage.removeItem('fs_gdrive_token'); }catch(e){}
+}
+GD_TOKEN = gdTokenLoad();
+function gdSignedIn(){
+  return !!(GD_TOKEN && GD_TOKEN.access_token && Date.now() < GD_TOKEN.expiry-60000);
+}
+function gisReady(){ return !!(window.google && google.accounts && google.accounts.oauth2); }
+/* Google の部品は、押したときだけ読む（ふだんはオフラインのまま） */
+function gisLoad(){
+  return new Promise((res, rej)=>{
+    if(gisReady()) return res();
+    const el = document.createElement('script');
+    el.src = 'https://accounts.google.com/gsi/client';
+    el.async = true;
+    el.onload = ()=>res();
+    el.onerror = ()=>rej(new Error('Googleの部品を読めませんでした（電波をご確認ください）'));
+    document.head.appendChild(el);
+  });
+}
+async function gdGetToken(){
+  if(gdSignedIn()) return GD_TOKEN.access_token;
+  await gisLoad();
+  return new Promise((res, rej)=>{
+    try{
+      const tc = google.accounts.oauth2.initTokenClient({
+        client_id: GD_CLIENT_ID, scope: GD_SCOPE, prompt: 'select_account',
+        callback: (r)=>{
+          if(r && r.access_token){
+            gdTokenSave({access_token:r.access_token, expiry: Date.now()+((r.expires_in||3600)*1000)});
+            res(r.access_token);
+          }else rej(new Error('サインインできませんでした'));
+        },
+        error_callback: (e)=>rej(new Error((e && e.type) || 'サインインをやめました')),
+      });
+      tc.requestAccessToken();
+    }catch(e){ rej(e); }
+  });
+}
+async function gdFetch(path, opts, token){
+  opts = opts || {};
+  opts.headers = Object.assign({Authorization:'Bearer '+token}, opts.headers||{});
+  const res = await fetch('https://www.googleapis.com/'+path, opts);
+  if(res.status === 401) gdTokenClear();
+  if(!res.ok){
+    const t = await res.text().catch(()=>'');
+    throw new Error('ドライブ '+res.status+' '+t.slice(0,120));
+  }
+  return res.json();
+}
+/* 置き場のフォルダ。同じ名前が2つできても、いちばん古いものに寄せる */
+async function gdFolder(token){
+  const q = encodeURIComponent("mimeType='application/vnd.google-apps.folder' and name='"
+    + GD_FOLDER + "' and trashed=false");
+  const url = 'drive/v3/files?spaces=drive&orderBy=createdTime&fields=files(id)&q=' + q;
+  const list = await gdFetch(url, {}, token);
+  if(list.files && list.files.length) return list.files[0].id;
+  const made = await gdFetch('drive/v3/files?fields=id', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name:GD_FOLDER, mimeType:'application/vnd.google-apps.folder'})}, token);
+  const again = await gdFetch(url, {}, token);
+  return (again.files && again.files.length) ? again.files[0].id : made.id;
+}
+/* このアプリの記録を、ひとまとめの文字にする */
+const CLOUD_KEYS = ['sv','st','ca','ind','nt','si','mc'];
+function cloudPack(){
+  const box = {};
+  CLOUD_KEYS.forEach(k=>{ box[k] = DB.loadRaw(DB.key[k]); });   // 読めなければ例外
+  return JSON.stringify({app:'fish_survey', version:APP_VERSION,
+    saved_at: nowISO(), data: box});
+}
+/* 読んだ文字が、このアプリの控えとして使えるか */
+function cloudCheck(text){
+  let o;
+  try{ o = JSON.parse(text); }catch(e){ return {ok:false, why:'中身を読めませんでした'}; }
+  if(!o || o.app !== 'fish_survey' || !o.data){
+    return {ok:false, why:'このアプリの控えではありません'};
+  }
+  const 数 = {};
+  for(const k of CLOUD_KEYS){
+    if(o.data[k] !== undefined && !Array.isArray(o.data[k])){
+      return {ok:false, why:'中身の形がちがいます'};
+    }
+    数[k] = (o.data[k]||[]).length;
+  }
+  return {ok:true, saved_at:o.saved_at||'', version:o.version||'', 数, data:o.data};
+}
+/* 控えで置き換える。いまの記録は消えるので、必ず確かめてから呼ぶ */
+function cloudApply(data){
+  const 元 = {};
+  try{ CLOUD_KEYS.forEach(k=>{ 元[k] = DB.loadRaw(DB.key[k]); }); }
+  catch(e){ toast('いまの記録を読み取れないため、戻せませんでした', 8000); return false; }
+  for(const k of CLOUD_KEYS){
+    if(!DB.save(DB.key[k], data[k] || [])){
+      // 途中で失敗したら、書いた分を戻す（半端な状態を残さない）。
+      // 空き容量が尽きていると、戻すことすらできない。
+      // そのときは「元のまま」と言ってはいけない（2026-08-20 のテストで判明）
+      let 戻せた = true;
+      CLOUD_KEYS.forEach(kk=>{
+        try{ if(!DB.save(DB.key[kk], 元[kk])) 戻せた = false; }catch(e){ 戻せた = false; }
+      });
+      toast(戻せた
+        ? '戻せませんでした（端末の空き容量をご確認ください）。いまの記録はそのままです'
+        : '戻せませんでした。しかも元にも戻せず、一部が書き換わったままです。'
+          + '空きを作ってから、もう一度ドライブから戻してください', 12000);
+      return false;
+    }
+  }
+  return true;
+}
+async function cloudSave(){
+  if(!writeAllowed()){
+    toast('このタブでは保存できません。記録を入れているタブでお試しください', 7000);
+    return;
+  }
+  let text;
+  try{ text = cloudPack(); }
+  catch(e){ toast('記録を読み取れないため、保存できませんでした', 8000); return; }
+  toast('ドライブに保存しています…', 8000);
+  try{
+    const token = await gdGetToken();
+    const folder = await gdFolder(token);
+    const q = encodeURIComponent("name='"+GD_FILE+"' and '"+folder+"' in parents and trashed=false");
+    const list = await gdFetch('drive/v3/files?spaces=drive&fields=files(id)&q='+q, {}, token);
+    let id = (list.files && list.files.length) ? list.files[0].id : '';
+    if(!id){
+      const made = await gdFetch('drive/v3/files?fields=id', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name:GD_FILE, parents:[folder]})}, token);
+      id = made.id;
+    }
+    await gdFetch('upload/drive/v3/files/'+id+'?uploadType=media&fields=id,modifiedTime',
+      {method:'PATCH', headers:{'Content-Type':'application/json'}, body:text}, token);
+    try{ localStorage.setItem('fs_gdrive_last', nowISO()); }catch(e){}
+    toast('ドライブに保存しました');
+  }catch(e){
+    toast('保存できませんでした：' + ((e && e.message) || e), 10000);
+  }
+  render();
+}
+async function cloudRestore(){
+  if(!writeAllowed()){
+    toast('このタブでは戻せません。記録を入れているタブでお試しください', 7000);
+    return;
+  }
+  toast('ドライブから読んでいます…', 8000);
+  try{
+    const token = await gdGetToken();
+    const folder = await gdFolder(token);
+    const q = encodeURIComponent("name='"+GD_FILE+"' and '"+folder+"' in parents and trashed=false");
+    const list = await gdFetch('drive/v3/files?spaces=drive&fields=files(id,modifiedTime)&q='+q,
+      {}, token);
+    if(!list.files || !list.files.length){
+      toast('ドライブに控えがありませんでした', 8000); return;
+    }
+    const res = await fetch('https://www.googleapis.com/drive/v3/files/'
+      + list.files[0].id + '?alt=media', {headers:{Authorization:'Bearer '+token}});
+    if(!res.ok) throw new Error('ドライブ ' + res.status);
+    const text = await res.text();
+    const 中 = cloudCheck(text);
+    if(!中.ok){ toast('戻せませんでした：' + 中.why, 9000); return; }
+    const いま = CLOUD_KEYS.reduce((a,k)=>a + DB.load(DB.key[k]).length, 0);
+    const 控え = CLOUD_KEYS.reduce((a,k)=>a + 中.数[k], 0);
+    if(!confirm(`ドライブの控え（${String(中.saved_at).slice(0,16).replace('T',' ')}／`
+      + `${控え}件）で、いまの記録（${いま}件）を置き換えます。\n`
+      + 'いまの記録は消えます。よろしいですか？')) return;
+    if(cloudApply(中.data)){
+      toast('ドライブの控えで置き換えました');
+      reset('home');
+      return;
+    }
+  }catch(e){
+    toast('戻せませんでした：' + ((e && e.message) || e), 10000);
+  }
+  render();
+}
+function cloudSignOut(){
+  gdTokenClear();
+  toast('サインアウトしました');
+  render();
+}
+SCREENS.cloud = ()=>{
+  let 件数 = 0;
+  try{ 件数 = CLOUD_KEYS.reduce((a,k)=>a + DB.loadRaw(DB.key[k]).length, 0); }catch(e){ 件数 = -1; }
+  const 前回 = localStorage.getItem('fs_gdrive_last') || '';
+  return {
+    title:'クラウド保存',
+    sub:[{text: gdSignedIn() ? 'サインイン中' : '未サインイン',
+          cls: gdSignedIn() ? 'ok' : 'warn'}],
+    html:`
+      <div class="card">
+        <h3 style="margin-top:0">Googleドライブに預ける</h3>
+        <div class="dim small">この端末の記録を、まるごと1つのファイルにして
+          ご自分のドライブ（「${esc(GD_FOLDER)}」フォルダ）へ保存します。
+          端末を替えるときや、壊れたときに戻せます。</div>
+        <div class="row" style="margin-top:8px">
+          <div class="grow"><div class="dim small">いまの記録</div>
+            <div class="big">${件数 < 0 ? '読めません' : 件数 + '件'}</div></div>
+          <div class="grow"><div class="dim small">前回の保存</div>
+            <div>${前回 ? esc(String(前回).slice(0,16).replace('T',' ')) : 'まだ'}</div></div>
+        </div>
+        <button class="btn pri" onclick="cloudSave()">ドライブに保存する</button>
+        <button class="btn" onclick="cloudRestore()">ドライブから戻す（いまの記録は消えます）</button>
+        ${gdSignedIn() ? '<button class="btn" onclick="cloudSignOut()">サインアウト</button>' : ''}
+      </div>
+      <div class="card">
+        <div class="dim small">
+          ・押したときだけ、Googleの部品をネットから読みます。ふだんは電波が無くても動きます<br>
+          ・保存されるのは<b>記録の文字だけ</b>です。写真はまだ含まれません<br>
+          ・鳥のアプリとは別のフォルダ・別のファイルなので、混ざりません
+        </div>
+      </div>
+    `,
+  };
+};
 SCREENS.trash = ()=>{
   const l = trashList();
   const 件数 = TRASH_KINDS.reduce((a,t)=>a + (l[t.k]||[]).length, 0);
@@ -6124,17 +6465,28 @@ SCREENS.trash = ()=>{
     if(!list.length) return '';
     return `<div class="card">
       <h3 style="margin-top:0">${esc(t.word)}（${list.length}）</h3>
-      ${list.slice(0, 100).map(x=>`<div class="row" style="margin-bottom:8px">
-        <div class="grow">
-          <div style="font-weight:700">${esc(trashName(t.k, x))}</div>
-          <div class="dim small">消した日 ${esc(String(x.deleted_at||'').slice(0,10))}${
-            trashInside(t.k, x.uuid) ? `　中に ${trashInside(t.k, x.uuid)}件` : ''}</div>
-        </div>
-        <button class="btn sm ok" style="width:auto;margin:0"
-          onclick="if(trashRestore('${t.k}','${x.uuid}')) render()">戻す</button>
-        <button class="btn sm ng" style="width:auto;margin:0"
-          onclick="if(trashPurge('${t.k}','${x.uuid}')) render()">完全に消す</button>
-      </div>`).join('')}
+      ${list.slice(0, 100).map(x=>{
+        const id = t.k + ':' + x.uuid;
+        const 中 = trashInside(t.k, x.uuid);
+        if(pickOn()){
+          return `<button type="button" class="btn sm" data-pick="${id}"
+            style="text-align:left" onclick="pickToggle('${id}')">
+            ${esc(trashName(t.k, x))}
+            <span class="fsub">消した日 ${esc(String(x.deleted_at||'').slice(0,10))}${
+              中 ? `　中に ${中}件` : ''}</span></button>`;
+        }
+        return `<div class="row" style="margin-bottom:8px">
+          <div class="grow">
+            <div style="font-weight:700">${esc(trashName(t.k, x))}</div>
+            <div class="dim small">消した日 ${esc(String(x.deleted_at||'').slice(0,10))}${
+              中 ? `　中に ${中}件` : ''}</div>
+          </div>
+          <button class="btn sm ok" style="width:auto;margin:0"
+            onclick="if(trashRestore('${t.k}','${x.uuid}')) render()">戻す</button>
+          <button class="btn sm ng" style="width:auto;margin:0"
+            onclick="if(trashPurge('${t.k}','${x.uuid}')) render()">完全に消す</button>
+        </div>`;
+      }).join('')}
       ${list.length > 100 ? `<div class="dim small">ほか ${list.length-100}件</div>` : ''}
     </div>`;
   };
@@ -6142,7 +6494,16 @@ SCREENS.trash = ()=>{
     title:'ごみ箱',
     sub:[{text:`${件数}件`}],
     html: 件数
-      ? `<div class="dim small">消したものは、ここに残っています。
+      ? `${pickOn() ? `<div class="card">
+             <button class="btn ok" data-pickn="選んだ N件を戻す"
+               onclick="if(pickTrashDo('戻す')) render()" disabled>選ぶものを押してください</button>
+             <button class="btn ng" data-pickn="選んだ N件を完全に消す"
+               onclick="if(pickTrashDo('消す')) render()" disabled>選ぶものを押してください</button>
+             <button class="btn" onclick="pickCancel()">やめる</button>
+             <div class="dim small">戻すものや、完全に消すものを押して選んでください。</div>
+           </div>`
+         : `<button class="btn" onclick="pickStart()">選んでまとめて片づける</button>`}
+        <div class="dim small">消したものは、ここに残っています。
            戻すと元の場所に出ます。「完全に消す」ともう戻せません。</div>
          ${TRASH_KINDS.map(塊).join('')}`
       : '<div class="card dim">ごみ箱は空です。</div>',
