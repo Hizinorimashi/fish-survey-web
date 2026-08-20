@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v37';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v38';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -4375,6 +4375,8 @@ SCREENS.home = ()=>{
       <button class="btn pri" onclick="nav('surveyEdit',null)">新しい調査をはじめる</button>
       ${list.length ? cards : '<div class="card dim">まだ調査がありません。上のボタンから作ってください。</div>'}
       <button class="btn" onclick="nav('sites',null)">地点を登録・確認する（${DB.sites().length}件）</button>
+      ${(()=>{ const n = trashCount(); return n
+        ? `<button class="btn" onclick="nav('trash',null)">ごみ箱（${n}件）</button>` : ''; })()}
       <div class="hr"></div>
       <div class="card">
         <div class="row">
@@ -5983,6 +5985,169 @@ function fishDelCatch(caUuid){
   if(!confirm(`${c.species_name||''} の記録を消します。よろしいですか？`)) return;
   if(DB.softDelete(DB.key.ca, caUuid)){ toast('消しました'); render(); }
 }
+/* ============================================================
+   ごみ箱
+   消したものは、印（deleted_at）を付けて隠しているだけ。
+   ここで見て、戻すか、完全に消すかを決める（2026-08-20 の実機の声）
+   ============================================================ */
+const TRASH_KINDS = [
+  {k:'sv', key:()=>DB.key.sv, word:'調査'},
+  {k:'st', key:()=>DB.key.st, word:'箇所'},
+  {k:'ca', key:()=>DB.key.ca, word:'魚の記録'},
+  {k:'nt', key:()=>DB.key.nt, word:'メモ'},
+];
+function trashKindOf(k){ return TRASH_KINDS.find(x=>x.k===k); }
+/* 消したものを集める。新しく消したものが上 */
+function trashList(){
+  const out = {};
+  TRASH_KINDS.forEach(t=>{
+    let all = [];
+    try{ all = DB.loadRaw(t.key()); }catch(e){ all = []; }
+    out[t.k] = all.filter(x=>x && x.deleted_at)
+      .sort((a,b)=>String(b.deleted_at||'').localeCompare(String(a.deleted_at||'')));
+  });
+  return out;
+}
+function trashCount(){
+  const l = trashList();
+  return TRASH_KINDS.reduce((a,t)=>a + (l[t.k]||[]).length, 0);
+}
+/* その記録を出すための名前 */
+function trashName(k, x){
+  if(k==='sv') return `${x.river_name||''} ${x.site_name||''}`.trim() || '（名前なし）';
+  if(k==='ca') return x.species_name || x.species_id || '（種なし）';
+  if(k==='nt') return (x.content||'').slice(0,30) || '（写真だけ）';
+  return x.name || '（名前なし）';
+}
+/* 親をたどる。戻すときは、親も一緒に戻さないと見えないままになる */
+function trashParents(k, x){
+  const out = [];
+  if(k==='st' && x.survey_uuid) out.push({k:'sv', uuid:x.survey_uuid});
+  if(k==='nt' && x.survey_uuid) out.push({k:'sv', uuid:x.survey_uuid});
+  if(k==='ca'){
+    if(x.station_uuid) out.push({k:'st', uuid:x.station_uuid});
+    if(x.survey_uuid)  out.push({k:'sv', uuid:x.survey_uuid});
+  }
+  return out;
+}
+/* 戻す。親が消えていれば、親も一緒に戻す */
+function trashRestore(k, uuid){
+  if(!writeAllowed()){
+    toast('このタブでは戻せません。記録を入れているタブでお試しください', 7000);
+    return false;
+  }
+  const t = trashKindOf(k); if(!t) return false;
+  const x = DB.get(t.key(), uuid);
+  if(!x){ toast('その記録はもうありません'); return false; }
+  const 一緒に = [];
+  trashParents(k, x).forEach(pa=>{
+    const p = DB.get(trashKindOf(pa.k).key(), pa.uuid);
+    if(p && p.deleted_at) 一緒に.push(pa);
+  });
+  if(!DB.restore(t.key(), uuid)){
+    toast('戻せませんでした（端末の空き容量をご確認ください）', 8000);
+    return false;
+  }
+  一緒に.forEach(pa=>{ try{ DB.restore(trashKindOf(pa.k).key(), pa.uuid); }catch(e){} });
+  toast(`${trashName(k, x)} を戻しました`
+    + (一緒に.length ? `（${一緒に.map(pa=>trashKindOf(pa.k).word).join('・')}も一緒に）` : ''));
+  return true;
+}
+/* 完全に消す。中に入っているものも一緒に消す（迷子を残さない） */
+function trashPurge(k, uuid){
+  if(!writeAllowed()){
+    toast('このタブでは消せません。記録を入れているタブでお試しください', 7000);
+    return false;
+  }
+  const t = trashKindOf(k); if(!t) return false;
+  const x = DB.get(t.key(), uuid);
+  if(!x){ toast('その記録はもうありません'); return false; }
+  const 中 = trashInside(k, uuid);
+  if(!confirm(`${trashName(k, x)} を完全に消します。`
+    + (中 ? `中の記録 ${中}件も一緒に消えます。` : '')
+    + '\nもう戻せません。よろしいですか？')) return false;
+  const 消す = trashTargets(k, uuid);
+  let ok = true;
+  const 入れ物 = {sv:DB.key.sv, st:DB.key.st, ca:DB.key.ca, nt:DB.key.nt, in:DB.key.ind};
+  Object.keys(入れ物).forEach(kk=>{
+    const ids = 消す[kk];
+    if(!ids || !ids.size) return;
+    let all;
+    try{ all = DB.loadRaw(入れ物[kk]); }catch(e){ ok = false; return; }
+    const 残り = all.filter(r=>!(r && ids.has(r.uuid)));
+    if(!DB.save(入れ物[kk], 残り)) ok = false;
+  });
+  if(!ok){
+    toast('完全に消せませんでした（端末の空き容量をご確認ください）', 8000);
+    return false;
+  }
+  toast('完全に消しました');
+  return true;
+}
+/* 完全に消すとき、一緒に消すもの */
+function trashTargets(k, uuid){
+  const out = {sv:new Set(), st:new Set(), ca:new Set(), nt:new Set(), in:new Set()};
+  const 読む = (kk)=>{ try{ return DB.loadRaw(trashKindOf(kk).key()); }catch(e){ return []; } };
+  if(k==='sv'){
+    out.sv.add(uuid);
+    const sts = 読む('st').filter(x=>x && x.survey_uuid===uuid);
+    sts.forEach(x=>out.st.add(x.uuid));
+    読む('ca').filter(x=>x && (x.survey_uuid===uuid || out.st.has(x.station_uuid)))
+      .forEach(x=>out.ca.add(x.uuid));
+    読む('nt').filter(x=>x && x.survey_uuid===uuid).forEach(x=>out.nt.add(x.uuid));
+  }else if(k==='st'){
+    out.st.add(uuid);
+    読む('ca').filter(x=>x && x.station_uuid===uuid).forEach(x=>out.ca.add(x.uuid));
+  }else if(k==='ca'){
+    out.ca.add(uuid);
+  }else{
+    out.nt.add(uuid);
+  }
+  // 1尾ずつの記録も、魚の記録と一緒に消す
+  if(out.ca.size && DB.key.ind){
+    try{
+      DB.loadRaw(DB.key.ind).filter(x=>x && out.ca.has(x.catch_uuid))
+        .forEach(x=>out.in.add(x.uuid));
+    }catch(e){}
+  }
+  return out;
+}
+function trashInside(k, uuid){
+  const t = trashTargets(k, uuid);
+  return t.sv.size + t.st.size + t.ca.size + t.nt.size + (t.in ? t.in.size : 0) - 1;
+}
+SCREENS.trash = ()=>{
+  const l = trashList();
+  const 件数 = TRASH_KINDS.reduce((a,t)=>a + (l[t.k]||[]).length, 0);
+  const 塊 = (t)=>{
+    const list = l[t.k] || [];
+    if(!list.length) return '';
+    return `<div class="card">
+      <h3 style="margin-top:0">${esc(t.word)}（${list.length}）</h3>
+      ${list.slice(0, 100).map(x=>`<div class="row" style="margin-bottom:8px">
+        <div class="grow">
+          <div style="font-weight:700">${esc(trashName(t.k, x))}</div>
+          <div class="dim small">消した日 ${esc(String(x.deleted_at||'').slice(0,10))}${
+            trashInside(t.k, x.uuid) ? `　中に ${trashInside(t.k, x.uuid)}件` : ''}</div>
+        </div>
+        <button class="btn sm ok" style="width:auto;margin:0"
+          onclick="if(trashRestore('${t.k}','${x.uuid}')) render()">戻す</button>
+        <button class="btn sm ng" style="width:auto;margin:0"
+          onclick="if(trashPurge('${t.k}','${x.uuid}')) render()">完全に消す</button>
+      </div>`).join('')}
+      ${list.length > 100 ? `<div class="dim small">ほか ${list.length-100}件</div>` : ''}
+    </div>`;
+  };
+  return {
+    title:'ごみ箱',
+    sub:[{text:`${件数}件`}],
+    html: 件数
+      ? `<div class="dim small">消したものは、ここに残っています。
+           戻すと元の場所に出ます。「完全に消す」ともう戻せません。</div>
+         ${TRASH_KINDS.map(塊).join('')}`
+      : '<div class="card dim">ごみ箱は空です。</div>',
+  };
+};
 SCREENS.fishMap = (svUuid)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
