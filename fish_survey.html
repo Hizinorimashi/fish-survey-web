@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v43';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v44';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -4846,7 +4846,7 @@ SCREENS.surveyHub = (svUuid)=>{
   const stCards = stations.map(st=>{
     const n = stationTotal(st);
     const sp = DB.catchesOf(st.uuid).length;
-    return `<div class="card tap" onclick="nav('station','${st.uuid}')">
+    return `<div class="card tap" onclick="nav('${envOnly?'station':'spot'}','${st.uuid}')">
       <div class="row">
         <div class="grow">
           <div style="font-weight:700">${esc(st.name)}　<span class="dim small">${esc(st.habitat_type||'区分なし')}</span></div>
@@ -6736,6 +6736,72 @@ SCREENS.cloud = ()=>{
         </div>
       </div>
     `,
+  };
+};
+/* ============================================================
+   地点の画面（魚類調査イメージ.pptx の2枚目）
+   置いた地点ごとに、魚類調査と物理環境調査のどちらへも入れる。
+   いまの画面をそのまま下にぶら下げる（作り直さない）
+   ============================================================ */
+SCREENS.spot = (stUuid)=>{
+  const st = DB.liveStation(stUuid);
+  if(!st) return null;
+  const sv = DB.getAlive(DB.key.sv, st.survey_uuid);
+  if(!sv) return null;
+  const cs = DB.catchesOf(stUuid);
+  const 尾 = stationTotal(st);
+  const 種 = new Set(cs.map(c=>c.species_id).filter(Boolean)).size;
+  const 環境あり = !!(st.habitat_type || st.substrate1 || numOf(st.depth_rep_cm)!==''
+    || numOf(st.velocity_rep_cms)!=='' || (st.env_points||[]).length);
+  const 動いている = effortRunning(st);
+  return {
+    title: st.name || '地点',
+    sub:[{text: sv.river_name||''},
+         {text: st.survey_time_start ? st.survey_time_start : '未開始',
+          cls: st.survey_time_start ? 'ok' : 'warn'}],
+    html:`
+      <div class="card">
+        <div class="row">
+          <div class="grow">
+            <div class="dim small">${動いている ? '記録中です' : 'はじめると、時刻と道筋が残ります'}</div>
+            <div>${esc(st.survey_time_start||'—')}${
+              st.survey_time_end ? ' 〜 '+esc(st.survey_time_end) : ''}
+              <span class="dim small">　通電 ${esc(fmtDur(effortSeconds(st)))}</span></div>
+          </div>
+          <button class="btn ${動いている?'ng':'ok'}" style="width:auto;margin:0"
+            onclick="toggleEffort('${stUuid}')">${動いている?'ストップ':'はじめる'}</button>
+        </div>
+      </div>
+
+      <button class="btn pri" onclick="nav('station','${stUuid}')">
+        魚類調査${種 ? `（${種}種 ${尾}尾）` : ''}</button>
+      <button class="btn ${環境あり?'ok':''}" onclick="nav('env','${stUuid}')">
+        物理環境調査${環境あり ? '（入力済み）' : ''}</button>
+
+      ${foldHtml('spotsum', '集計', `<span class="fsub">${種}種 ${尾}尾</span>`, `
+        <div class="row">
+          <div class="grow"><div class="dim small">種数</div><div class="big">${種}</div></div>
+          <div class="grow"><div class="dim small">尾数</div><div class="big">${尾}</div></div>
+          <div class="grow"><div class="dim small">通電</div>
+            <div class="big">${esc(fmtDur(effortSeconds(st)))}</div></div>
+        </div>
+        ${cs.length ? cs.map(c=>`<div class="row" style="margin-bottom:4px">
+          <div class="grow">${esc(c.species_name||c.species_id||'（種なし）')}</div>
+          <div>${catchTotal(c)}尾</div></div>`).join('')
+          : '<div class="dim small">まだ魚の記録がありません。</div>'}`)}
+
+      <button class="btn" onclick="nav('stationEdit',{uuid:'${stUuid}'})">この地点の設定</button>
+    `,
+    onMount(){
+      if(effortRunning(st)){
+        EFFORT_TIMER = setInterval(()=>{
+          const el = $('#effClock');
+          const now = DB.getAlive(DB.key.st, stUuid);
+          if(!el || !now || !effortRunning(now)){ clearInterval(EFFORT_TIMER); EFFORT_TIMER=null; return; }
+          el.textContent = fmtDur(effortSeconds(now));
+        }, 1000);
+      }
+    }
   };
 };
 SCREENS.trash = ()=>{
