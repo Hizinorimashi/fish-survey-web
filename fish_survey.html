@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v39';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v40';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -6352,6 +6352,116 @@ function cloudApply(data){
   }
   return true;
 }
+/* ============ 写真も預ける ============
+   写真は1枚ずつ別のファイルにする。1つの大きなファイルにまとめると、
+   端末の力が足りずに作れない・送れないことがあるため */
+const GD_PHOTO_FOLDER = '写真';
+/* 記録から指されている写真（保存済みの分だけ）。書きかけの分は預けない */
+function cloudPhotoIds(){
+  return Array.from(savedPhotoIds());
+}
+/* まだドライブに無いもの。名前は「ID.拡張子」 */
+function cloudPhotoNeed(ids, ドライブの名前){
+  const ある = new Set((ドライブの名前||[]).map(n=>String(n).split('.')[0]));
+  return (ids||[]).filter(id=>!ある.has(id));
+}
+/* 記録は指しているのに、この端末に実体が無い写真 */
+async function cloudPhotoMissing(){
+  const ids = cloudPhotoIds();
+  const out = [];
+  for(const id of ids){
+    let r = null;
+    try{ r = await PhotoDB.get(id); }catch(e){}
+    if(!r || !r.blob) out.push(id);
+  }
+  return out;
+}
+async function gdSubFolder(parentId, name, token){
+  const q = encodeURIComponent("mimeType='application/vnd.google-apps.folder' and name='"
+    + name + "' and '" + parentId + "' in parents and trashed=false");
+  const list = await gdFetch('drive/v3/files?spaces=drive&orderBy=createdTime&fields=files(id)&q='
+    + q, {}, token);
+  if(list.files && list.files.length) return list.files[0].id;
+  const made = await gdFetch('drive/v3/files?fields=id', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name, parents:[parentId],
+      mimeType:'application/vnd.google-apps.folder'})}, token);
+  const again = await gdFetch('drive/v3/files?spaces=drive&orderBy=createdTime&fields=files(id)&q='
+    + q, {}, token);
+  return (again.files && again.files.length) ? again.files[0].id : made.id;
+}
+/* フォルダの中のファイル名を、全部集める（何枚あっても最後まで） */
+async function gdListNames(folderId, token){
+  const out = [];
+  let page = '';
+  for(let i=0; i<50; i++){
+    const q = encodeURIComponent("'"+folderId+"' in parents and trashed=false");
+    const url = 'drive/v3/files?spaces=drive&pageSize=1000&fields=nextPageToken,files(id,name)&q='
+      + q + (page ? '&pageToken='+encodeURIComponent(page) : '');
+    const r = await gdFetch(url, {}, token);
+    (r.files||[]).forEach(f=>out.push(f));
+    if(!r.nextPageToken) break;
+    page = r.nextPageToken;
+  }
+  return out;
+}
+/* 写真を預ける。すでにある分は送らない */
+async function cloudSavePhotos(token, folder){
+  const ids = cloudPhotoIds();
+  if(!ids.length) return {送った:0, 全部:0, 失敗:0};
+  const 写真folder = await gdSubFolder(folder, GD_PHOTO_FOLDER, token);
+  const ある = await gdListNames(写真folder, token);
+  const 送る = cloudPhotoNeed(ids, ある.map(f=>f.name));
+  let 送った = 0, 失敗 = 0;
+  for(let i=0; i<送る.length; i++){
+    const id = 送る[i];
+    let rec = null;
+    try{ rec = await PhotoDB.get(id); }catch(e){}
+    if(!rec || !rec.blob){ 失敗++; continue; }
+    try{
+      const made = await gdFetch('drive/v3/files?fields=id', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name: id + '.' + (rec.ext||'jpg'), parents:[写真folder]})}, token);
+      const up = await fetch('https://www.googleapis.com/upload/drive/v3/files/'
+        + made.id + '?uploadType=media', {method:'PATCH',
+        headers:{Authorization:'Bearer '+token,
+                 'Content-Type': rec.blob.type || 'application/octet-stream'},
+        body: rec.blob});
+      if(!up.ok) throw new Error('ドライブ '+up.status);
+      送った++;
+    }catch(e){ 失敗++; }
+    if(i % 5 === 4) toast(`写真を預けています…（${i+1}/${送る.length}）`, 4000);
+  }
+  return {送った, 全部: ids.length, 失敗};
+}
+/* 足りない写真を、ドライブから取り戻す */
+async function cloudRestorePhotos(token, folder){
+  const 足りない = await cloudPhotoMissing();
+  if(!足りない.length) return {戻した:0, 足りない:0};
+  let 写真folder;
+  try{ 写真folder = await gdSubFolder(folder, GD_PHOTO_FOLDER, token); }
+  catch(e){ return {戻した:0, 足りない:足りない.length}; }
+  const ある = await gdListNames(写真folder, token);
+  const 表 = {};
+  ある.forEach(f=>{ 表[String(f.name).split('.')[0]] = f; });
+  let 戻した = 0;
+  for(let i=0; i<足りない.length; i++){
+    const id = 足りない[i];
+    const f = 表[id];
+    if(!f) continue;
+    try{
+      const res = await fetch('https://www.googleapis.com/drive/v3/files/'+f.id+'?alt=media',
+        {headers:{Authorization:'Bearer '+token}});
+      if(!res.ok) throw new Error('ドライブ '+res.status);
+      const blob = await res.blob();
+      const ext = String(f.name).split('.').slice(1).join('.') || 'jpg';
+      await PhotoDB.put({id, blob, ext, size: blob.size, added_at: nowISO()});
+      戻した++;
+    }catch(e){}
+    if(i % 5 === 4) toast(`写真を戻しています…（${i+1}/${足りない.length}）`, 4000);
+  }
+  return {戻した, 足りない: 足りない.length - 戻した};
+}
 async function cloudSave(){
   if(!writeAllowed()){
     toast('このタブでは保存できません。記録を入れているタブでお試しください', 7000);
@@ -6375,8 +6485,14 @@ async function cloudSave(){
     }
     await gdFetch('upload/drive/v3/files/'+id+'?uploadType=media&fields=id,modifiedTime',
       {method:'PATCH', headers:{'Content-Type':'application/json'}, body:text}, token);
+    let 写真 = {送った:0, 全部:0, 失敗:0};
+    try{ 写真 = await cloudSavePhotos(token, folder); }
+    catch(e){ 写真 = {送った:0, 全部:-1, 失敗:-1}; }
     try{ localStorage.setItem('fs_gdrive_last', nowISO()); }catch(e){}
-    toast('ドライブに保存しました');
+    toast('ドライブに保存しました'
+      + (写真.全部 > 0 ? `（写真 ${写真.全部}枚のうち、新しい ${写真.送った}枚を預けました`
+          + (写真.失敗 > 0 ? `／${写真.失敗}枚は預けられませんでした` : '') + '）'
+        : (写真.全部 < 0 ? '（写真は預けられませんでした）' : '')), 8000);
   }catch(e){
     toast('保存できませんでした：' + ((e && e.message) || e), 10000);
   }
@@ -6409,7 +6525,12 @@ async function cloudRestore(){
       + `${控え}件）で、いまの記録（${いま}件）を置き換えます。\n`
       + 'いまの記録は消えます。よろしいですか？')) return;
     if(cloudApply(中.data)){
-      toast('ドライブの控えで置き換えました');
+      let 写真 = {戻した:0, 足りない:0};
+      try{ 写真 = await cloudRestorePhotos(token, folder); }catch(e){}
+      toast('ドライブの控えで置き換えました'
+        + (写真.戻した ? `（写真 ${写真.戻した}枚も戻しました`
+            + (写真.足りない ? `／${写真.足りない}枚は見つかりませんでした` : '') + '）'
+          : (写真.足りない ? `（写真 ${写真.足りない}枚は見つかりませんでした）` : '')), 8000);
       reset('home');
       return;
     }
@@ -6450,7 +6571,8 @@ SCREENS.cloud = ()=>{
       <div class="card">
         <div class="dim small">
           ・押したときだけ、Googleの部品をネットから読みます。ふだんは電波が無くても動きます<br>
-          ・保存されるのは<b>記録の文字だけ</b>です。写真はまだ含まれません<br>
+          ・<b>写真も一緒に預けます</b>（1枚ずつ「写真」フォルダへ。すでにある分は送りません）<br>
+          ・枚数が多いと時間がかかります。電波の良いところでお願いします<br>
           ・鳥のアプリとは別のフォルダ・別のファイルなので、混ざりません
         </div>
       </div>
