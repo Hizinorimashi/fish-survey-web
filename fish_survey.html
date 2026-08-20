@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v41';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v42';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -6089,27 +6089,65 @@ function trashPurge(k, uuid){
   if(!confirm(`${trashName(k, x)} を完全に消します。`
     + (中 ? `中の記録 ${中}件も一緒に消えます。` : '')
     + '\nもう戻せません。よろしいですか？')) return false;
-  const 消す = trashTargets(k, uuid);
-  let ok = true;
-  const 入れ物 = {sv:DB.key.sv, st:DB.key.st, ca:DB.key.ca, nt:DB.key.nt, in:DB.key.ind};
-  Object.keys(入れ物).forEach(kk=>{
-    const ids = 消す[kk];
-    if(!ids || !ids.size) return;
-    let all;
-    try{ all = DB.loadRaw(入れ物[kk]); }catch(e){ ok = false; return; }
-    const 残り = all.filter(r=>!(r && ids.has(r.uuid)));
-    if(!DB.save(入れ物[kk], 残り)) ok = false;
-  });
-  if(!ok){
-    toast('完全に消せませんでした（端末の空き容量をご確認ください）', 8000);
+  return trashPurgeMany([{k, uuid}]);
+}
+/* まとめて完全に消す。
+   先に全部読み、1つでも読めなければ何も消さない。
+   途中で失敗したら、書いた分を元に戻す（親だけ消えて子が残る、を防ぐ）
+   （2026-08-20 の監査 Critical） */
+const PURGE_BOX = {sv:'sv', st:'st', ca:'ca', nt:'nt', in:'ind', mc:'mc'};
+function trashPurgeMany(list){
+  if(!writeAllowed()){
+    toast('このタブでは消せません。記録を入れているタブでお試しください', 7000);
     return false;
+  }
+  // 消すものを、ぜんぶ足し合わせる（親子が重なっても1回で済む）
+  const 消す = {};
+  Object.keys(PURGE_BOX).forEach(kk=>{ 消す[kk] = new Set(); });
+  (list||[]).forEach(x=>{
+    const t = trashTargets(x.k, x.uuid);
+    Object.keys(PURGE_BOX).forEach(kk=>{
+      (t[kk] || new Set()).forEach(id=>消す[kk].add(id));
+    });
+  });
+  // 先に全部読む。1つでも読めなければ、何も消さない
+  const 元 = {};
+  for(const kk of Object.keys(PURGE_BOX)){
+    const key = DB.key[PURGE_BOX[kk]];
+    if(!key) continue;
+    try{ 元[kk] = DB.loadRaw(key); }
+    catch(e){
+      toast('保存された記録を読み取れないため、消しませんでした', 8000);
+      return false;
+    }
+  }
+  const 書いた = [];
+  for(const kk of Object.keys(元)){
+    if(!消す[kk] || !消す[kk].size) continue;
+    const key = DB.key[PURGE_BOX[kk]];
+    const 残り = 元[kk].filter(r=>!(r && 消す[kk].has(r.uuid)));
+    if(!DB.save(key, 残り)){
+      // 書いた分を元に戻す（半端に消えたままにしない）
+      let 戻せた = true;
+      書いた.forEach(k2=>{
+        try{ if(!DB.save(DB.key[PURGE_BOX[k2]], 元[k2])) 戻せた = false; }
+        catch(e){ 戻せた = false; }
+      });
+      toast(戻せた
+        ? '完全に消せませんでした（端末の空き容量をご確認ください）。記録はそのままです'
+        : '完全に消せませんでした。しかも元に戻せず、一部だけ消えたままです。'
+          + '空きを作ってから、ごみ箱をご確認ください', 12000);
+      return false;
+    }
+    書いた.push(kk);
   }
   toast('完全に消しました');
   return true;
 }
 /* 完全に消すとき、一緒に消すもの */
 function trashTargets(k, uuid){
-  const out = {sv:new Set(), st:new Set(), ca:new Set(), nt:new Set(), in:new Set()};
+  const out = {sv:new Set(), st:new Set(), ca:new Set(), nt:new Set(),
+               in:new Set(), mc:new Set()};
   const 読む = (kk)=>{ try{ return DB.loadRaw(trashKindOf(kk).key()); }catch(e){ return []; } };
   if(k==='sv'){
     out.sv.add(uuid);
@@ -6126,6 +6164,13 @@ function trashTargets(k, uuid){
   }else{
     out.nt.add(uuid);
   }
+  // メッシュのマスも、その箇所と一緒に消す（迷子にしない）
+  if(out.st.size && DB.key.mc){
+    try{
+      DB.loadRaw(DB.key.mc).filter(x=>x && out.st.has(x.station_uuid))
+        .forEach(x=>out.mc.add(x.uuid));
+    }catch(e){}
+  }
   // 1尾ずつの記録も、魚の記録と一緒に消す
   if(out.ca.size && DB.key.ind){
     try{
@@ -6137,7 +6182,8 @@ function trashTargets(k, uuid){
 }
 function trashInside(k, uuid){
   const t = trashTargets(k, uuid);
-  return t.sv.size + t.st.size + t.ca.size + t.nt.size + (t.in ? t.in.size : 0) - 1;
+  return t.sv.size + t.st.size + t.ca.size + t.nt.size
+    + (t.in ? t.in.size : 0) + (t.mc ? t.mc.size : 0) - 1;
 }
 /* まとめて選ぶ。ホームの調査と、ごみ箱の両方で使う（2026-08-20 の実機の声）。
    印は「種類:ID」の形で持つ（ごみ箱は種類が混ざるため） */
@@ -6210,19 +6256,15 @@ function pickTrashDo(どうする){
       + (中 ? `中の記録 ${中}件も一緒に消えます。` : '')
       + '\nもう戻せません。よろしいですか？')) return false;
   }
+  if(どうする === '消す'){
+    // まとめて1回で消す（1件ずつだと、途中で失敗して半端に消える）
+    PICK_SET = null;
+    return trashPurgeMany(ids);
+  }
   let ok = 0, ng = 0;
-  const 元confirm = window.confirm;
-  window.confirm = ()=>true;          // 1件ずつ聞き直さない（まとめて確かめた）
-  try{
-    ids.forEach(x=>{
-      const r = (どうする === '消す') ? trashPurge(x.k, x.uuid) : trashRestore(x.k, x.uuid);
-      if(r) ok++; else ng++;
-    });
-  }finally{ window.confirm = 元confirm; }
+  ids.forEach(x=>{ if(trashRestore(x.k, x.uuid)) ok++; else ng++; });
   PICK_SET = null;
-  toast(ng ? `${ok}件を${どうする === '消す' ? '完全に消しました' : '戻しました'}。`
-             + `${ng}件はできませんでした`
-           : `${ok}件を${どうする === '消す' ? '完全に消しました' : '戻しました'}`);
+  toast(ng ? `${ok}件を戻しました。${ng}件はできませんでした` : `${ok}件を戻しました`);
   return true;
 }
 /* ============================================================
@@ -6415,7 +6457,8 @@ async function gdListNames(folderId, token){
   let page = '';
   for(let i=0; i<50; i++){
     const q = encodeURIComponent("'"+folderId+"' in parents and trashed=false");
-    const url = 'drive/v3/files?spaces=drive&pageSize=1000&fields=nextPageToken,files(id,name)&q='
+    const url = 'drive/v3/files?spaces=drive&pageSize=1000'
+      + '&fields=nextPageToken,files(id,name,size)&q='
       + q + (page ? '&pageToken='+encodeURIComponent(page) : '');
     const r = await gdFetch(url, {}, token);
     (r.files||[]).forEach(f=>out.push(f));
@@ -6430,7 +6473,9 @@ async function cloudSavePhotos(token, folder){
   if(!ids.length) return {送った:0, 全部:0, 失敗:0};
   const 写真folder = await gdSubFolder(folder, GD_PHOTO_FOLDER, token);
   const ある = await gdListNames(写真folder, token);
-  const 送る = cloudPhotoNeed(ids, ある.map(f=>f.name));
+  // 中身の入っていない（0バイトの）ファイルは「無い」ものとして送り直す
+  const 使えるある = ある.filter(f=>f.size === undefined || +f.size > 0);
+  const 送る = cloudPhotoNeed(ids, 使えるある.map(f=>f.name));
   let 送った = 0, 失敗 = 0;
   for(let i=0; i<送る.length; i++){
     const id = 送る[i];
@@ -6438,15 +6483,30 @@ async function cloudSavePhotos(token, folder){
     try{ rec = await PhotoDB.get(id); }catch(e){}
     if(!rec || !rec.blob){ 失敗++; continue; }
     try{
-      const made = await gdFetch('drive/v3/files?fields=id', {method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({name: id + '.' + (rec.ext||'jpg'), parents:[写真folder]})}, token);
-      const up = await fetch('https://www.googleapis.com/upload/drive/v3/files/'
-        + made.id + '?uploadType=media', {method:'PATCH',
+      // 入れ物と中身を、1回で送る。
+      // 2段構えだと、中身の送信で切れたとき0バイトのファイルが残り、
+      // 次からは「もうある」と見なして永久に送らない（2026-08-20 の監査 Critical）
+      const 境 = '----fs' + id.replace(/[^A-Za-z0-9]/g,'');
+      const 改行 = String.fromCharCode(13, 10);   // 書き方を間違えやすいので、作って使う
+      const 頭 = '--' + 境 + 改行
+        + 'Content-Type: application/json; charset=UTF-8' + 改行 + 改行
+        + JSON.stringify({name: id + '.' + (rec.ext||'jpg'), parents:[写真folder]})
+        + 改行 + '--' + 境 + 改行
+        + 'Content-Type: ' + (rec.blob.type || 'application/octet-stream')
+        + 改行 + 改行;
+      const 尾 = 改行 + '--' + 境 + '--';
+      const body = new Blob([頭, rec.blob, 尾]);
+      const up = await fetch('https://www.googleapis.com/upload/drive/v3/files'
+        + '?uploadType=multipart&fields=id,size', {method:'POST',
         headers:{Authorization:'Bearer '+token,
-                 'Content-Type': rec.blob.type || 'application/octet-stream'},
-        body: rec.blob});
+                 'Content-Type':'multipart/related; boundary='+境},
+        body});
       if(!up.ok) throw new Error('ドライブ '+up.status);
+      const r2 = await up.json().catch(()=>null);
+      // 送った大きさが合わないものは、送れていないものとして扱う
+      if(r2 && r2.size !== undefined && +r2.size !== rec.blob.size){
+        throw new Error('大きさが合いません');
+      }
       送った++;
     }catch(e){ 失敗++; }
     if(i % 5 === 4) toast(`写真を預けています…（${i+1}/${送る.length}）`, 4000);
@@ -6462,7 +6522,9 @@ async function cloudRestorePhotos(token, folder){
   catch(e){ return {戻した:0, 足りない:足りない.length}; }
   const ある = await gdListNames(写真folder, token);
   const 表 = {};
-  ある.forEach(f=>{ 表[String(f.name).split('.')[0]] = f; });
+  // 0バイトのファイルは写真ではない。取り込むと「開けない写真」が増える
+  ある.filter(f=>f.size === undefined || +f.size > 0)
+    .forEach(f=>{ 表[String(f.name).split('.')[0]] = f; });
   let 戻した = 0;
   for(let i=0; i<足りない.length; i++){
     const id = 足りない[i];
@@ -6473,6 +6535,7 @@ async function cloudRestorePhotos(token, folder){
         {headers:{Authorization:'Bearer '+token}});
       if(!res.ok) throw new Error('ドライブ '+res.status);
       const blob = await res.blob();
+      if(!blob || !blob.size) throw new Error('中身がありません');
       const ext = String(f.name).split('.').slice(1).join('.') || 'jpg';
       await PhotoDB.put({id, blob, ext, size: blob.size, added_at: nowISO()});
       戻した++;
@@ -6544,12 +6607,14 @@ async function cloudRestore(){
       + `${控え}件）で、いまの記録（${いま}件）を置き換えます。\n`
       + 'いまの記録は消えます。よろしいですか？')) return;
     if(cloudApply(中.data)){
-      let 写真 = {戻した:0, 足りない:0};
-      try{ 写真 = await cloudRestorePhotos(token, folder); }catch(e){}
+      let 写真 = {戻した:0, 足りない:0}, 写真の失敗 = '';
+      try{ 写真 = await cloudRestorePhotos(token, folder); }
+      catch(e){ 写真の失敗 = (e && e.message) || String(e); }
       toast('ドライブの控えで置き換えました'
-        + (写真.戻した ? `（写真 ${写真.戻した}枚も戻しました`
-            + (写真.足りない ? `／${写真.足りない}枚は見つかりませんでした` : '') + '）'
-          : (写真.足りない ? `（写真 ${写真.足りない}枚は見つかりませんでした）` : '')), 8000);
+        + (写真の失敗 ? `（ただし写真は戻せませんでした：${写真の失敗}）`
+          : (写真.戻した ? `（写真 ${写真.戻した}枚も戻しました`
+              + (写真.足りない ? `／${写真.足りない}枚は見つかりませんでした` : '') + '）'
+            : (写真.足りない ? `（写真 ${写真.足りない}枚は見つかりませんでした）` : ''))), 9000);
       reset('home');
       return;
     }
