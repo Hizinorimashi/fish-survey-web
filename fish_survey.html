@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v42';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v43';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2081,9 +2081,20 @@ function polyPts(st){
 function polyClosed(st){ return polyPts(st).length >= 3; }
 /* その点が囲いの中か（へりを横切る回数で決める）。
    圏外地図の pointInPoly(lat, lon, poly) とは別物なので、名前を分ける */
+/* 経度を、基準の近くへそろえる。
+   東経179度と西経179度は隣どうしなのに、そのまま引くと地球1周ぶんになる
+   （2026-08-20 の監査 Major） */
+function lonNear(lon, base){
+  let d = lon - base;
+  while(d > 180) d -= 360;
+  while(d < -180) d += 360;
+  return base + d;
+}
 function ptInPoly(pt, poly){
   if(!validPt(pt) || !poly || poly.length < 3) return false;
-  const [y, x] = pt;
+  const [y, x0] = pt;
+  const x = x0;
+  poly = poly.map(v=>[v[0], lonNear(v[1], x)]);
   let 中 = false;
   for(let i=0, j=poly.length-1; i<poly.length; j=i++){
     const yi = poly[i][0], xi = poly[i][1];
@@ -2107,6 +2118,8 @@ function unitPoint(st){
 /* 囲いの広さのめやす（同じ点を囲う囲いが複数あるとき、小さいほうを親にする） */
 function polyArea(pts){
   if(!pts || pts.length < 3) return 0;
+  const base = pts[0][1];
+  pts = pts.map(v=>[v[0], lonNear(v[1], base)]);
   let a = 0;
   for(let i=0, j=pts.length-1; i<pts.length; j=i++){
     a += (pts[j][1] + pts[i][1]) * (pts[j][0] - pts[i][0]);
@@ -2127,10 +2140,16 @@ function unitInside(st, pts){
   return mine.every(v=>ptInPoly(v, pts));
 }
 /* いちばん内側の、その単位を囲んでいる囲い */
+/* 段（E → P/F → P）。親になれるのは、自分より上の段だけ。
+   段を見ないと、P/F が E の親になったり、輪ができたりする
+   （2026-08-20 の監査 Major） */
+const UNIT_RANK = {E:1, PF:2, P:3};
 function unitParentOf(st, list){
+  const 自分の段 = UNIT_RANK[unitKindOf(st)] || 9;
   let 親 = '', 広さ = Infinity;
   (list||[]).forEach(o=>{
     if(!o || o.uuid===st.uuid || !isUnitPoly(o)) return;
+    if((UNIT_RANK[unitKindOf(o)] || 9) >= 自分の段) return;   // 同じ段・下の段は親にしない
     const pts = polyPts(o);
     if(pts.length < 3) return;
     if(!unitInside(st, pts)) return;
@@ -2548,7 +2567,14 @@ function screenKey(cur){
   let a = '';
   try{ a = (cur.arg && typeof cur.arg === 'object') ? JSON.stringify(cur.arg)
                                                     : String(cur.arg||''); }catch(e){ a = ''; }
-  return cur.name + '|' + a;
+  // 地図の画面は、選んでいる記録が変わったら「別の画面」とみなす。
+  // 入れないと、別の単位を選んでも前の位置に戻る（2026-08-20 の監査 Major）
+  let 選び = '';
+  try{
+    if(cur.name === 'fishMap') 選び = '|' + (FISH_SEL || '');
+    else if(cur.name === 'survey' || cur.name === 'envMap') 選び = '|' + (ENV_SEL || '') + (FISH_SEL || '');
+  }catch(e){}
+  return cur.name + '|' + a + 選び;
 }
 function render(){
   // 物理環境の画面で打ちかけの分があれば、先に書いてしまう
@@ -5649,13 +5675,40 @@ function fishAddAt(svUuid, lat, lon, acc){
   return rec.uuid;
 }
 /* 囲いを閉じる */
+/* 囲いとして成り立つか。
+   同じ点ばかり・つぶれた形・辺どうしが交わる形は、中か外かが決まらない
+   （2026-08-20 の監査 Major） */
+function polyProblem(pts){
+  if(!pts || pts.length < 3) return '角が3つ以上ないと、囲いになりません';
+  const 別々 = [];
+  pts.forEach(v=>{
+    if(!別々.some(w=>Math.abs(w[0]-v[0]) < 1e-9 && Math.abs(w[1]-v[1]) < 1e-9)) 別々.push(v);
+  });
+  if(別々.length < 3) return '同じ場所ばかりで、囲いになりません';
+  if(!(polyArea(pts) > 1e-12)) return 'つぶれていて、囲いになりません';
+  // 辺どうしが交わっていないか（角の数は多くないので、総当たりでよい）
+  const n = pts.length;
+  const 交わる = (a,b,c,d)=>{
+    const s = (p,q,r)=>Math.sign((q[0]-p[0])*(r[1]-p[1]) - (q[1]-p[1])*(r[0]-p[0]));
+    const d1=s(a,b,c), d2=s(a,b,d), d3=s(c,d,a), d4=s(c,d,b);
+    return d1!==d2 && d3!==d4;
+  };
+  for(let i=0;i<n;i++){
+    for(let j=i+1;j<n;j++){
+      if(i===j) continue;
+      if((j+1)%n === i || (i+1)%n === j) continue;   // 隣どうしは端を共有する
+      if(交わる(pts[i], pts[(i+1)%n], pts[j], pts[(j+1)%n])){
+        return '線が交わっています。ねじれていない形にしてください';
+      }
+    }
+  }
+  return '';
+}
 function fishClosePoly(svUuid){
   const st = fishDrawing();
   if(!st){ toast('いま描いている囲いがありません'); return false; }
-  if(!polyClosed(st)){
-    toast('角が3つ以上ないと、囲いになりません', 7000);
-    return false;
-  }
+  const 具合 = polyProblem(polyPts(st));
+  if(具合){ toast(具合, 8000); return false; }
   FISH_NEXT = {kind:FISH_NEXT.kind, draw:'', survey:svUuid};
   unitRelink(svUuid);
   const 中 = unitChildren(st.uuid, DB.stationsOf(svUuid)).length;
@@ -6067,11 +6120,26 @@ function trashRestore(k, uuid){
     const p = DB.get(trashKindOf(pa.k).key(), pa.uuid);
     if(p && p.deleted_at) 一緒に.push(pa);
   });
-  if(!DB.restore(t.key(), uuid)){
-    toast('戻せませんでした（端末の空き容量をご確認ください）', 8000);
+  // 親から順に戻す。親が戻らないまま子だけ戻すと、見えない記録になる
+  // （2026-08-20 の監査 Major）
+  const 順 = 一緒に.slice().reverse().concat([{k, uuid}]);
+  const 戻した = [];
+  for(const pa of 順){
+    let r = false;
+    try{ r = DB.restore(trashKindOf(pa.k).key(), pa.uuid); }catch(e){ r = false; }
+    if(r){ 戻した.push(pa); continue; }
+    // 途中で失敗したら、戻した分を消し直す（半端な状態を残さない）
+    let 片付いた = true;
+    戻した.forEach(done=>{
+      try{ if(!DB.softDelete(trashKindOf(done.k).key(), done.uuid)) 片付いた = false; }
+      catch(e){ 片付いた = false; }
+    });
+    toast(片付いた
+      ? '戻せませんでした（端末の空き容量をご確認ください）。ごみ箱のままです'
+      : '戻せませんでした。しかも途中まで戻ってしまいました。'
+        + '空きを作ってから、ごみ箱をご確認ください', 12000);
     return false;
   }
-  一緒に.forEach(pa=>{ try{ DB.restore(trashKindOf(pa.k).key(), pa.uuid); }catch(e){} });
   toast(`${trashName(k, x)} を戻しました`
     + (一緒に.length ? `（${一緒に.map(pa=>trashKindOf(pa.k).word).join('・')}も一緒に）` : ''));
   return true;
@@ -6732,6 +6800,8 @@ SCREENS.fishMap = (svUuid)=>{
   if(FISH_SEL && !list.some(x=>x.uuid===FISH_SEL)) FISH_SEL = null;
   const cur = FISH_SEL ? (list.find(x=>x.uuid===FISH_SEL) || null) : null;
   const 子 = cur ? unitChildren(cur.uuid, list) : [];
+  // 描きかけ（閉じていない囲い）には、記録を入れさせない
+  const 描きかけ = !!(cur && isUnitPoly(cur) && !polyClosed(cur));
   const chip = (st)=>{
     const k = unitKindOf(st);
     const 中 = unitChildren(st.uuid, list).length;
@@ -6797,7 +6867,9 @@ SCREENS.fishMap = (svUuid)=>{
         })()}
       </div>
 
-      ${子.length ? '' : `
+      ${(子.length || 描きかけ) ? (描きかけ
+        ? '<div class="warnbox">この囲いは、まだ閉じていません。'
+          + '角を足して、右下の「囲いを閉じる」で閉じてください。</div>' : '') : `
       ${foldHtml('fishcatch', '魚を記録する',
         `<span class="fsub">${(()=>{ const t = unitTotals(cur.uuid, list);
           return `${t.種}種 ${t.尾}尾`; })()}</span>`,
@@ -6893,7 +6965,7 @@ SCREENS.fishMap = (svUuid)=>{
         {icon:'polyClose', title:'囲いを閉じる',
          tap:()=>{ if(fishClosePoly(svUuid)) render(); }},
       ], 'bottomright');
-      envItemFormWire(子.length ? null : cur, sv);
+      envItemFormWire((子.length || 描きかけ) ? null : cur, sv);
       if(cur && FISH_PICK === cur.uuid){
         fishPickList(cur.uuid);
         const q = $('#fishSpq'); if(q) q.focus();
