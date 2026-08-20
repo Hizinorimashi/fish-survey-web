@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v40';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v41';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -5579,7 +5579,12 @@ let ENV_SEL = null;          // いま選んでいる記録のID
 /* 魚の調査の地図。囲い（E・P/F）と点（P）を置く（魚類調査イメージ.pptx） */
 let FISH_NEXT = {kind:'PF', draw:'', survey:''};
 function fishUseSurvey(svUuid){
-  if(FISH_NEXT.survey !== svUuid) FISH_NEXT = {kind:'PF', draw:'', survey:svUuid};
+  if(FISH_NEXT.survey === svUuid) return;
+  // 別の調査へ移ったら、選んでいたものも外す。
+  // 残すと、別の調査の単位に記録を入れてしまう（2026-08-20 の監査 Critical）
+  FISH_NEXT = {kind:'PF', draw:'', survey:svUuid};
+  FISH_SEL = null;
+  FISH_PICK = '';
 }
 function fishSetKind(k){
   FISH_NEXT = {kind:k, draw:FISH_NEXT.draw, survey:FISH_NEXT.survey};
@@ -6231,21 +6236,12 @@ const GD_FOLDER = '魚類調査バックアップ';
 const GD_FILE = 'fish_survey_backup.json';
 const GD_CLIENT_ID = '39266503709-hqoe2kpd60r59dn5s1ql7ltjs7nu31h0.apps.googleusercontent.com';
 let GD_TOKEN = null;
-function gdTokenLoad(){
-  try{
-    const t = JSON.parse(localStorage.getItem('fs_gdrive_token')||'null');
-    return (t && t.access_token && Date.now() < t.expiry-60000) ? t : null;
-  }catch(e){ return null; }
-}
-function gdTokenSave(t){
-  GD_TOKEN = t;
-  try{ localStorage.setItem('fs_gdrive_token', JSON.stringify(t)); }catch(e){}
-}
-function gdTokenClear(){
-  GD_TOKEN = null;
-  try{ localStorage.removeItem('fs_gdrive_token'); }catch(e){}
-}
-GD_TOKEN = gdTokenLoad();
+/* 鍵（アクセストークン）は、この画面を開いているあいだだけ持つ。
+   端末に書き残すと、同じ端末で動く別の仕掛けから読めてしまう
+   （2026-08-20 の監査 Critical）。開き直したら、もう一度サインインする */
+function gdTokenSave(t){ GD_TOKEN = t; }
+function gdTokenClear(){ GD_TOKEN = null; }
+try{ localStorage.removeItem('fs_gdrive_token'); }catch(e){}   // 前に書いた分を片付ける
 function gdSignedIn(){
   return !!(GD_TOKEN && GD_TOKEN.access_token && Date.now() < GD_TOKEN.expiry-60000);
 }
@@ -6314,18 +6310,41 @@ function cloudPack(){
     saved_at: nowISO(), data: box});
 }
 /* 読んだ文字が、このアプリの控えとして使えるか */
+/* IDとして安全な形か。細工したIDが画面の作りに紛れ込むのを防ぐ
+   （2026-08-20 の監査 Critical） */
+function safeId(v){
+  return typeof v === 'string' && v.length > 0 && v.length <= 64
+    && /^[A-Za-z0-9_:.-]+$/.test(v);
+}
 function cloudCheck(text){
   let o;
   try{ o = JSON.parse(text); }catch(e){ return {ok:false, why:'中身を読めませんでした'}; }
-  if(!o || o.app !== 'fish_survey' || !o.data){
+  if(!o || o.app !== 'fish_survey' || !o.data || typeof o.data !== 'object'){
     return {ok:false, why:'このアプリの控えではありません'};
   }
   const 数 = {};
   for(const k of CLOUD_KEYS){
-    if(o.data[k] !== undefined && !Array.isArray(o.data[k])){
-      return {ok:false, why:'中身の形がちがいます'};
+    // 欠けている入れ物を「空」とみなすと、足りない控えで全部消える
+    if(!Array.isArray(o.data[k])) return {ok:false, why:'中身の形がちがいます（' + k + '）'};
+    const seen = new Set();
+    for(const x of o.data[k]){
+      if(!x || typeof x !== 'object' || Array.isArray(x)){
+        return {ok:false, why:'中身の形がちがいます（' + k + 'の並び）'};
+      }
+      if(!safeId(x.uuid)) return {ok:false, why:'IDの形がちがいます（' + k + '）'};
+      if(seen.has(x.uuid)) return {ok:false, why:'同じIDが2つあります（' + k + '）'};
+      seen.add(x.uuid);
+      const ph = x.photos;
+      if(ph !== undefined){
+        if(!Array.isArray(ph)) return {ok:false, why:'写真の形がちがいます（' + k + '）'};
+        for(const q of ph){
+          if(!q || typeof q !== 'object' || !safeId(q.id)){
+            return {ok:false, why:'写真のIDの形がちがいます（' + k + '）'};
+          }
+        }
+      }
     }
-    数[k] = (o.data[k]||[]).length;
+    数[k] = o.data[k].length;
   }
   return {ok:true, saved_at:o.saved_at||'', version:o.version||'', 数, data:o.data};
 }
@@ -6540,6 +6559,13 @@ async function cloudRestore(){
   render();
 }
 function cloudSignOut(){
+  // Google 側でも使えなくする（端末から消すだけでは、鍵は生きたまま）
+  try{
+    if(GD_TOKEN && GD_TOKEN.access_token && window.google
+       && google.accounts && google.accounts.oauth2){
+      google.accounts.oauth2.revoke(GD_TOKEN.access_token, ()=>{});
+    }
+  }catch(e){}
   gdTokenClear();
   toast('サインアウトしました');
   render();
@@ -6637,8 +6663,9 @@ SCREENS.fishMap = (svUuid)=>{
   fishUseSurvey(svUuid);
   const list = DB.stationsOf(svUuid).filter(x=>unitKindOf(x));
   const 描き中 = fishDrawing();
-  if(FISH_SEL && !DB.liveStation(FISH_SEL)) FISH_SEL = null;
-  const cur = FISH_SEL ? DB.liveStation(FISH_SEL) : null;
+  // いま開いている調査のものだけを選べる（ほかの調査の記録に書き込ませない）
+  if(FISH_SEL && !list.some(x=>x.uuid===FISH_SEL)) FISH_SEL = null;
+  const cur = FISH_SEL ? (list.find(x=>x.uuid===FISH_SEL) || null) : null;
   const 子 = cur ? unitChildren(cur.uuid, list) : [];
   const chip = (st)=>{
     const k = unitKindOf(st);
