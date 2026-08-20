@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v44';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v45';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2756,6 +2756,7 @@ function destroyMaps(){
   MESHLAYER = [];
   ENVLAYER = [];
   FISHLAYER = [];
+  SPOTLAYER = [];
   MEMARK = [];
   Object.keys(MAPS).forEach(k=>{
     const s = MAPS[k];
@@ -4871,6 +4872,8 @@ SCREENS.surveyHub = (svUuid)=>{
       ${running
         ? `<button class="btn pri" onclick="nav('station','${running.uuid}')">記録中の ${esc(running.name)} を開く</button>`
         : `<button class="btn pri" onclick="newStation('${svUuid}')">${W}を追加する</button>`}
+      ${envOnly ? '' : `<button class="btn"
+        onclick="nav('spots','${svUuid}')">地図で地点を置く</button>`}
       ${envOnly ? '' : `<button class="btn ${単位あり?'ok':''}"
         onclick="if(fishUseMap('${svUuid}', true)) navReplace('fishMap','${svUuid}')"
         >地図で記録する${単位あり ? '（つづきから）' : '（調査範囲・瀬淵・ポイント）'}</button>`}
@@ -6743,6 +6746,125 @@ SCREENS.cloud = ()=>{
    置いた地点ごとに、魚類調査と物理環境調査のどちらへも入れる。
    いまの画面をそのまま下にぶら下げる（作り直さない）
    ============================================================ */
+/* 地点を置く地図（魚類調査イメージ.pptx の1枚目）。
+   新しい調査 →（ここで地点を置く）→ 地点 → 魚類 or 物理環境 */
+let SPOTS_VIEW = {}, SPOTLAYER = [], SPOTS_SV = '';
+function spotsAdd(svUuid, lat, lon, acc){
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return null;
+  if(!writeAllowed()){
+    toast('このタブでは置けません。記録を入れているタブでお試しください', 6000);
+    return null;
+  }
+  const la = +(+lat).toFixed(6), lo = +(+lon).toFixed(6);
+  if(!validPt([la, lo])){ toast('位置がおかしいので置けません'); return null; }
+  const no = nextStationNo(svUuid);
+  if(no===null){ toast('番号が大きすぎて、これ以上置けません', 7000); return null; }
+  const rec = {uuid:uuid(), survey_uuid:svUuid, station_no:no,
+    name: 'P' + no, started_at: nowISO(), survey_time_start: timeValue(),
+    survey_type: sv.survey_type_default || '目視', env_points: [],
+    latitude: la, longitude: lo,
+    gps_accuracy: (acc===undefined||acc===null) ? '' : Math.round(acc),
+    position_source: (acc===undefined||acc===null) ? '地図' : 'GPS'};
+  if(!DB.upsert(DB.key.st, rec)){
+    toast('置けませんでした（端末の空き容量をご確認ください）', 8000);
+    return null;
+  }
+  toast(`${rec.name} を置きました`);
+  return rec.uuid;
+}
+function spotsDrawAll(svUuid){
+  const map = MAPS.main.map; if(!map) return;
+  try{ SPOTLAYER.forEach(x=>map.removeLayer(x)); }catch(e){}
+  SPOTLAYER = [];
+  DB.stationsOf(svUuid).filter(x=>!isMesh(x) && !unitKindOf(x)).forEach(st=>{
+    const pt = stationPt(st); if(!pt) return;
+    const 済み = DB.catchesOf(st.uuid).length > 0;
+    SPOTLAYER.push(L.marker(pt, {icon:envBadge(st.name||'', 済み?'#3fb950':'#4aa3ff', 30, true)})
+      .on('click', e=>{ L.DomEvent.stop(e); nav('spot', st.uuid); }).addTo(map));
+  });
+}
+SCREENS.spots = (svUuid)=>{
+  const sv = DB.getAlive(DB.key.sv, svUuid);
+  if(!sv) return null;
+  const list = DB.stationsOf(svUuid).filter(x=>!isMesh(x) && !unitKindOf(x));
+  return {
+    title:'地点を置く',
+    sub:[{text: sv.river_name||''}, {text:`${list.length}地点`}],
+    html:`
+      ${baseMapButtonsHtml()}
+      <div id="spotsmap" class="map"
+        style="height:${envMapBig()?'80vh':'50vh'};min-height:260px"></div>
+      <div class="dim small">地図をタップすると、その場所に調査地点を置きます。
+        置いた印を押すと、その地点の画面（魚類調査／物理環境調査）へ入ります。</div>
+      <div class="dim small" id="spotsGps"></div>
+
+      <div class="card">
+        <h3 style="margin-top:0">地点</h3>
+        ${list.length
+          ? `<div class="seg">${list.map(st=>`<button type="button"
+              onclick="nav('spot','${st.uuid}')">${esc(st.name||'')}
+              <span class="fsub">${DB.catchesOf(st.uuid).length}種</span></button>`).join('')}</div>`
+          : '<div class="dim small">まだありません。地図をタップして置いてください。</div>'}
+      </div>
+    `,
+    onMount(){
+      startGps();
+      const box = $('#spotsGps');
+      if(box) ENV_GPS_TIMER = setInterval(()=>{
+        if(!document.body.contains(box)){ clearInterval(ENV_GPS_TIMER); ENV_GPS_TIMER=null; return; }
+        box.textContent = gpsHint();
+        drawMe('main');
+      }, 2000);
+      const v = SPOTS_VIEW[svUuid];
+      const c = v ? [v.lat, v.lon] : envMapCenter(sv, null);
+      MAPS.main.map = makeMap('spotsmap', c, v ? v.zoom : 15, v ? v.bearing : 0);
+      const map = MAPS.main.map;
+      if(!map) return;
+      applyBaseMap('main', baseMapName());
+      addLocateControl(map);
+      addMapIconBar(map, [
+        {icon: envMapBig()?'shrink':'expand',
+         title: envMapBig()?'地図を小さく':'地図を大きく', tap:()=>envToggleBig()},
+        {icon:'fitAll', title:'置いたものが全部入るように', tap:()=>{
+          const pts = DB.stationsOf(svUuid).filter(x=>!isMesh(x) && !unitKindOf(x))
+            .map(stationPt).filter(Boolean);
+          if(!pts.length){ toast('まだ何も置かれていません'); return; }
+          try{ map.fitBounds(L.latLngBounds(pts).pad(0.3), {animate:false}); }catch(e){}
+        }},
+      ], 'topright');
+      addMapIconBar(map, [
+        {icon:'addHere', title:'いまいる場所に地点を置く', tap:()=>{
+          toast('現在地を取っています…');
+          getFixOnce(f=>{
+            if(!f){ toast('現在地を取れませんでした。地図をタップしても置けます', 6000); return; }
+            if(f.acc > GPS_MAX_ACC){
+              toast(`いまの位置は ±${Math.round(f.acc)}m と粗いので置いていません`, 8000);
+              return;
+            }
+            spotsAdd(svUuid, f.lat, f.lon, f.acc); render();
+          });
+        }},
+      ], 'bottomright');
+      spotsDrawAll(svUuid);
+      drawMe('main');
+      SPOTS_SV = svUuid;
+      map.on('click', e=>{ spotsAdd(svUuid, e.latlng.lat, e.latlng.lng, null); render(); });
+      map.on('moveend zoomend', ()=>{
+        try{
+          const cc = map.getCenter();
+          SPOTS_VIEW[svUuid] = {lat:cc.lat, lon:cc.lng, zoom:map.getZoom(), bearing:mapBearing(map)};
+        }catch(e){}
+      });
+      if(!v){
+        const pts = DB.stationsOf(svUuid).filter(x=>!isMesh(x) && !unitKindOf(x))
+          .map(stationPt).filter(Boolean);
+        if(pts.length>1){
+          try{ map.fitBounds(L.latLngBounds(pts).pad(0.3), {animate:false}); }catch(e){}
+        }
+      }
+    }
+  };
+};
 SCREENS.spot = (stUuid)=>{
   const st = DB.liveStation(stUuid);
   if(!st) return null;
