@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v45';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v47';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1376,6 +1376,141 @@ function effortSeconds(st){
 }
 function effortRunning(st){ return !!(st && st.effort_started_at); }
 
+/* ============================================================
+   採捕記録（漁具など）— 魚類調査イメージ.pptx の3枚目「▼ 採捕記録」
+   漁具ごとに1行。記録する単位（いちばん小さい単位）にぶら下がる。
+   通電・川幅・区間の長さ・面積も、この折りたたみの中にまとめた
+   ============================================================ */
+/* この単位で使った漁具の並び */
+function gearsOf(st){ return (st && Array.isArray(st.gears)) ? st.gears : []; }
+/* 漁具の名前だけを、重複なく並べる。
+   書き出しの「調査方法」はここから作る。漁具を入れていない古い記録は、
+   これまでの survey_method（選ぶボタン）をそのまま使う */
+function stationMethods(st){
+  const g = gearsOf(st).map(x=>String((x && x.gear) || '').trim()).filter(Boolean);
+  if(g.length) return g.filter((v,i)=>g.indexOf(v)===i);
+  return (st && Array.isArray(st.survey_method)) ? st.survey_method : [];
+}
+/* 名前の入っている漁具の数。足したばかりの空の行は数えない */
+function gearCount(st){ return gearsOf(st).filter(g=>g && g.gear).length; }
+function gearsShort(st){
+  const l = stationMethods(st);
+  if(!l.length) return '';
+  return l.length<=2 ? l.join('・') : l.slice(0,2).join('・')+`ほか${l.length-2}`;
+}
+/* 1つぶんの入力欄。「その他」を選んだときだけ、名前の欄を使う */
+function gearRowHtml(g, i, stUuid){
+  g = g || {};
+  const 既知 = OPT.method.indexOf(g.gear||'') >= 0;
+  const 選び = (g.gear && !既知) ? 'その他' : (g.gear||'');
+  return `<div class="card" style="padding:8px 10px;margin-bottom:8px">
+    <div class="row">
+      <div class="grow" style="font-weight:700">漁具 ${i+1}</div>
+      <button class="btn ng" style="width:auto;margin:0;padding:6px 12px;font-size:13px"
+        onclick="gearRemove('${stUuid}',${i})">消す</button>
+    </div>
+    <div onclick="setTimeout(function(){gearOtherSync(${i});},0)">
+      ${segHtml('gear'+i, OPT.method.concat(['その他']), 選び)}</div>
+    <input id="g_other_${i}" value="${esc(既知 ? '' : (g.gear||''))}"
+      placeholder="漁具の名前" style="margin-top:6px${選び==='その他'?'':';display:none'}">
+    <div class="row">
+      <div class="grow"><label>数（台・枚）</label>
+        <input id="g_cnt_${i}" inputmode="numeric" value="${esc(g.count!==undefined?g.count:'')}"></div>
+      <div class="grow"><label>規格（目合いなど）</label>
+        <input id="g_spec_${i}" value="${esc(g.spec||'')}"></div>
+    </div>
+    <div class="row">
+      <div class="grow"><label>使った時間（分）</label>
+        <input id="g_min_${i}" inputmode="decimal" value="${esc(g.minutes!==undefined?g.minutes:'')}"></div>
+      <div class="grow"><label>回数</label>
+        <input id="g_pass_${i}" inputmode="numeric" value="${esc(g.passes!==undefined?g.passes:'')}"></div>
+    </div>
+    <label>備考</label>
+    <input id="g_note_${i}" value="${esc(g.note||'')}">
+  </div>`;
+}
+/* 「その他」を選んだときだけ、名前の欄を出す */
+function gearOtherSync(i){
+  const el = $('#g_other_'+i); if(!el) return;
+  el.style.display = (segVal('gear'+i)==='その他') ? '' : 'none';
+}
+function gearsHtml(st, stUuid){
+  const l = gearsOf(st);
+  return (l.length ? l.map((g,i)=>gearRowHtml(g, i, stUuid)).join('')
+    : '<div class="dim small">まだありません。下の「＋ 漁具を足す」から入れてください。</div>')
+    + `<button class="btn" onclick="gearAdd('${stUuid}')">＋ 漁具を足す</button>`;
+}
+/* 画面に出ている漁具の欄を、そのまま読み取る */
+function collectGears(){
+  const out = [];
+  for(let i=0; ; i++){
+    if(!$('#g_cnt_'+i)) break;
+    const 選び = segVal('gear'+i);
+    const 他 = strVal('#g_other_'+i);
+    out.push({
+      gear: (選び==='その他' || (!選び && 他)) ? 他 : 選び,
+      count: strVal('#g_cnt_'+i), spec: strVal('#g_spec_'+i),
+      minutes: strVal('#g_min_'+i), passes: strVal('#g_pass_'+i),
+      note: strVal('#g_note_'+i),
+    });
+  }
+  return out;
+}
+/* 数の欄を確かめて、しまえる形にする。おかしければ理由を返す */
+function gearsNormalize(rows){
+  const out = [];
+  for(let i=0; i<rows.length; i++){
+    const r = rows[i], n = i+1;
+    const 空 = !r.gear && r.count==='' && r.spec==='' && r.minutes==='' && r.passes==='' && !r.note;
+    // 何も入れていない行は、そのまま残す。足したばかりの行を勝手に消さないため。
+    // 書き出しと集計は、名前の無い行を飛ばす
+    if(空){ out.push({gear:''}); continue; }
+    if(!r.gear) return {err:`漁具 ${n} の名前が入っていません`};
+    if(r.count!=='' && countOf(r.count)===null) return {err:`漁具 ${n} の数は0以上の整数で入れてください`};
+    if(r.passes!=='' && countOf(r.passes)===null) return {err:`漁具 ${n} の回数は0以上の整数で入れてください`};
+    const e = rangeCheck([[`漁具 ${n} の数`, r.count, 0, 9999],
+      [`漁具 ${n} の使った時間`, r.minutes, 0, 100000],
+      [`漁具 ${n} の回数`, r.passes, 0, 9999]]);
+    if(e) return {err:e};
+    const o = {gear: r.gear};
+    if(r.count!=='')   o.count   = countOf(r.count);
+    if(r.spec)         o.spec    = r.spec;
+    if(r.minutes!=='') o.minutes = numOf(r.minutes);
+    if(r.passes!=='')  o.passes  = countOf(r.passes);
+    if(r.note)         o.note    = r.note;
+    out.push(o);
+  }
+  return {gears: out};
+}
+/* 漁具を1つ足す。いま打っている分を先にしまってから、行を増やす */
+function gearAdd(stUuid){
+  if(!saveEffort(stUuid, {quiet:true})) return;
+  const st = DB.liveStation(stUuid); if(!st) return;
+  st.gears = gearsOf(st).concat([{gear:''}]);
+  if(!DB.upsert(DB.key.st, st)){
+    toast('足せませんでした（端末の空き容量をご確認ください）', 8000); return;
+  }
+  render();
+}
+function gearRemove(stUuid, i){
+  const st = DB.liveStation(stUuid); if(!st) return;
+  const l = gearsOf(st);
+  if(i<0 || i>=l.length) return;
+  if(!confirm(`漁具 ${i+1}（${l[i].gear||'名前なし'}）を消します。よろしいですか？`)) return;
+  // 消す行より前の入力は残したいので、先に打っている分をしまう。
+  // しまえなかったら消さない（打った分が黙って消えるのを防ぐ）
+  if(!saveEffort(stUuid, {quiet:true})) return;
+  const now = DB.liveStation(stUuid); if(!now) return;
+  const l2 = gearsOf(now).slice();
+  l2.splice(i, 1);
+  now.gears = l2;
+  if(!DB.upsert(DB.key.st, now)){
+    toast('消せませんでした（端末の空き容量をご確認ください）', 8000); return;
+  }
+  toast('消しました');
+  render();
+}
+
 /* 区間の長さ。
    電気ショッカーは行きつ戻りつするので、軌跡の総延長をそのまま使うと
    同じ50mを3往復して150mになる。面積が3倍、単位努力量あたりの尾数が
@@ -2434,8 +2569,29 @@ function applySels(o){
   });
 }
 /* 労力（箇所ハブ）の入力欄 */
-function effortSels(){ return ['#e_passes','#e_width','#e_len','#e_area']; }
-function collectEffort(){ return collectSels(effortSels()); }
+function effortSels(){
+  const sels = ['#e_passes','#e_width','#e_len','#e_area'];
+  // 漁具の欄は数が変わるので、画面に出ているものを数えて足す
+  for(let i=0; $('#g_cnt_'+i); i++){
+    ['g_other_','g_cnt_','g_spec_','g_min_','g_pass_','g_note_'].forEach(k=>sels.push('#'+k+i));
+  }
+  return sels;
+}
+function collectEffort(){
+  const o = collectSels(effortSels());
+  // 選ぶボタンは値を持たないので、別に控える
+  for(let i=0; $('#g_cnt_'+i); i++) o['__gear'+i] = segVal('gear'+i);
+  return o;
+}
+/* 労力の書きかけを戻す。漁具の選ぶボタンは applySels が触れないので、ここで当てる */
+function applyEffort(o){
+  if(!o) return;
+  applySels(o);
+  Object.keys(o).forEach(k=>{
+    const m = /^__gear(\d+)$/.exec(k);
+    if(m) applySegRaw('gear'+m[1], o[k]);
+  });
+}
 /* 川の環境の入力欄 */
 function envSels(){
   const sels = ['#e_drep','#e_vrep','#p_d','#p_v','#p_note'];
@@ -2579,6 +2735,8 @@ function screenKey(cur){
 function render(){
   // 物理環境の画面で打ちかけの分があれば、先に書いてしまう
   try{ if(typeof envFlush==='function') envFlush(); }catch(e){}
+  // 「新しい調査」の▼地点情報も同じ。画面を作り直す前に、打った分を書く
+  try{ if(typeof spotInfoSave==='function') spotInfoSave(); }catch(e){}
   // 同じ画面を作り直すときのために、見ていた位置を控える。
   // 押すたびに先頭へ戻ると、下のほうの入力が打てない（2026-08-20 の実機の声）
   const 前の画面 = SCREEN_AT;
@@ -4046,9 +4204,20 @@ function buildDbRows(sv){
 
   return {rows, excluded, blocked, warnings};
 }
+/* 地点情報（区間名・地点名・河川形態A）は、地点に入っていればそれを使い、
+   空なら調査ぜんぶの値を使う。地点ごとに入れられるようにしたのは 2026-08-20 */
+function spotInfoOf(sv, st){
+  const s = st || {};
+  return {
+    section: s.section_name       || sv.section_name       || '',
+    site:    s.site_name          || sv.site_name          || '',
+    formA:   s.river_morphology_a || sv.river_morphology_a || '',
+  };
+}
 /* CSVの1行を組み立てる。c が null なら魚の欄は空のまま（箇所の鍵を調べるときに使う） */
 function dbRowOf(sv, st, c, inds){
   const ls = c ? catchLengths(c, inds) : [];
+  const si = spotInfoOf(sv, st);
   return {
     '緯度': fixCoord(sv.latitude), '経度': fixCoord(sv.longitude),
     // 何日かにわたる調査では、その箇所の日付を使う。
@@ -4058,11 +4227,11 @@ function dbRowOf(sv, st, c, inds){
     // 代表値は「手入力があればそれ、無ければ測点の平均」
     '水深': cmToM(stationDepth(st, inds).rep),
     '流速': cmToM(stationVelocity(st, inds).rep),
-    '河川名':sv.river_name||'', '地点名':sv.site_name||'', '区間名':sv.section_name||'',
-    '河川形態A':sv.river_morphology_a||'', '河川形態B':st.river_morphology_b||'',
+    '河川名':sv.river_name||'', '地点名':si.site, '区間名':si.section,
+    '河川形態A':si.formA, '河川形態B':st.river_morphology_b||'',
     '河床材料':st.substrate1||'', '礫の状況':st.gravel_condition||'',
     '環境区分':st.habitat_type||'',
-    '調査区分':st.survey_type||'', '調査方法':(st.survey_method||[]).join(','),
+    '調査区分':st.survey_type||'', '調査方法':stationMethods(st).join(','),
     '種ID': c ? (c.species_id||'') : '', '個体数': c ? catchTotal(c, inds) : '',
     '最大体長': ls.length ? Math.max.apply(null,ls) : '',
     '最小体長': ls.length ? Math.min.apply(null,ls) : '',
@@ -4085,7 +4254,8 @@ function buildIndRows(sv, snap){
         .slice().sort((a,b)=>(a.individual_number||0)-(b.individual_number||0))
         .forEach(i=>{
           rows.push({
-            '調査日': stationDate(st, sv), '河川名':sv.river_name||'', '地点名':sv.site_name||'',
+            '調査日': stationDate(st, sv), '河川名':sv.river_name||'',
+            '地点名':spotInfoOf(sv, st).site,
             '箇所':st.name||'', '種ID':c.species_id||'', '種名':c.species_name||'',
             '個体番号': numOf(i.individual_number),
             '全長cm': numOf(i.total_length_cm),
@@ -4110,7 +4280,8 @@ function buildPointRows(sv, snap){
     .forEach(st=>{
       envPoints(st).forEach((pt,i)=>{
         rows.push({
-          '調査日': stationDate(st, sv), '河川名':sv.river_name||'', '地点名':sv.site_name||'',
+          '調査日': stationDate(st, sv), '河川名':sv.river_name||'',
+          '地点名':spotInfoOf(sv, st).site,
           '箇所':st.name||'', '測点番号': i+1,
           '水深cm': numOf(pt.depth_cm), '流速cms': numOf(pt.velocity_cms),
           '河床材料': pt.substrate||'', '備考': pt.note||'',
@@ -4140,8 +4311,11 @@ function buildStationRows(sv, snap){
       per100s: effortSeconds(st)>0 ? n/effortSeconds(st)*100 : '',
       per100m2: (area.used!=='' && area.used>0) ? n/area.used*100 : '',
     };
+    const si = spotInfoOf(sv, st);
     return {
-      '調査日': stationDate(st, sv), '河川名':sv.river_name||'', '地点名':sv.site_name||'',
+      '調査日': stationDate(st, sv), '河川名':sv.river_name||'', '地点名':si.site,
+      '区間名':si.section, '河川形態A':si.formA,
+      '調査者':sv.investigator||'', '何回目調査':sv.survey_round||'',
       '箇所':st.name||'', '記録のしかた':sv.detail_level||'一般',
       '調べたもの': surveyKind(sv), '環境の取り方': envMethod(st),
       '向き': isLine(st) ? (st.line_direction||'') : '',
@@ -4171,7 +4345,8 @@ function buildStationRows(sv, snap){
       'GPS精度m': numOf(st.gps_accuracy), '位置の決め方': st.position_source||'',
       '環境区分':st.habitat_type||'',
       '河川形態B':st.river_morphology_b||'',
-      '調査区分':st.survey_type||'', '調査方法':(st.survey_method||[]).join(','),
+      '調査区分':st.survey_type||'', '調査方法':stationMethods(st).join(','),
+      '漁具の件数': gearCount(st),
       '開始時刻':st.survey_time_start||'', '終了時刻':st.survey_time_end||'',
       '水温': numOf(st.water_temp),
       '測点数': envPoints(st).length,
@@ -4245,7 +4420,7 @@ function surveyRowOfDay(sv, snap, day, all){
     '環境の取り方': isEnvSurvey(sv) ? (sv.env_method_default||'点') : '',
     '緯度': fixCoord(sv.latitude), '経度': fixCoord(sv.longitude),
     'GPS精度m': numOf(sv.gps_accuracy), '位置の決め方':sv.position_source||'',
-    '調査者':sv.investigator||'',
+    '調査者':sv.investigator||'', '何回目調査':sv.survey_round||'',
     '業務番号':sv.project_number||'', '業務名':sv.project_name||'',
     '箇所数': stations.length,
     '種数': speciesCount(cs, snap),
@@ -4298,7 +4473,9 @@ function exportFileBase(sv){
 const FS_IND_COLS = ['調査日','河川名','地点名','箇所','種ID','種名',
   '個体番号','全長cm','尾叉長cm','記録した時刻','調査ID','箇所ID','記録ID'];
 
-const FS_STATION_COLS = ['調査日','河川名','地点名','箇所','記録のしかた',
+const FS_STATION_COLS = ['調査日','河川名','地点名','区間名','河川形態A',
+  '調査者','何回目調査',
+  '箇所','記録のしかた',
   '調べたもの','環境の取り方','向き',
   '始点緯度','始点経度','始点GPS精度m','終点緯度','終点経度','終点GPS精度m',
   '記録の単位','単位の呼び名','親の単位','囲いの角数','囲い座標',
@@ -4307,7 +4484,7 @@ const FS_STATION_COLS = ['調査日','河川名','地点名','箇所','記録の
   'メッシュ縦間隔m','メッシュ横分割数','メッシュ行数','メッシュ列数','メッシュ入力済み数',
   'メッシュ前の格子のマス数','メッシュ格子ID','メッシュ縦m','メッシュ横m',
   '緯度','経度','GPS精度m','位置の決め方',
-  '環境区分','河川形態B','調査区分','調査方法','開始時刻','終了時刻','水温',
+  '環境区分','河川形態B','調査区分','調査方法','漁具の件数','開始時刻','終了時刻','水温',
   '測点数','位置つき測点数',
   '水深_最小cm','水深_最大cm','水深_平均cm','水深_代表cm',
   '流速_最小cms','流速_最大cms','流速_平均cms','流速_代表cms',
@@ -4323,6 +4500,32 @@ const FS_STATION_COLS = ['調査日','河川名','地点名','箇所','記録の
   '面積_計算m2','面積_手入力m2','面積_使う値m2',
   '種数','尾数','100秒あたり尾数','100m2あたり尾数',
   'メモ','調査ID','箇所ID'];
+
+/* 採捕記録。1行＝1漁具。
+   データベースには漁具を入れる表がまだ無い（Phase 5 で決める）。
+   列名は、あとで表を作るときそのまま使えるようにしてある */
+const FS_GEAR_COLS = ['調査日','河川名','地点名','箇所','漁具の番号','漁具',
+  '数','規格','使った分','回数','備考','調査ID','箇所ID'];
+
+function buildGearRows(sv, snap){
+  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid)
+    .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
+  const rows = [];
+  stations.forEach(st=>{
+    gearsOf(st).forEach((g,i)=>{
+      if(!g || !g.gear) return;
+      rows.push({
+        '調査日': stationDate(st, sv), '河川名':sv.river_name||'',
+        '地点名': spotInfoOf(sv, st).site, '箇所':st.name||'',
+        '漁具の番号': i+1, '漁具': g.gear,
+        '数': numOf(g.count), '規格': g.spec||'',
+        '使った分': numOf(g.minutes), '回数': numOf(g.passes),
+        '備考': g.note||'', '調査ID':sv.uuid, '箇所ID':st.uuid,
+      });
+    });
+  });
+  return rows;
+}
 
 /* メッシュのマス。1行＝1マス。
    データベースには、いまマスを入れる表が無い（Phase 5 で作る）。
@@ -4344,7 +4547,7 @@ function buildMeshRows(sv, snap){
     const pct = (c.substrate_pct && typeof c.substrate_pct==='object') ? c.substrate_pct : {};
     const row = {
       '調査日': stationDate(st, sv), '河川名':sv.river_name||'',
-      '地点名':sv.site_name||'', '範囲':st.name||'',
+      '地点名':spotInfoOf(sv, st).site, '範囲':st.name||'',
       '行': countOf(c.row)===null ? '' : c.row+1,
       '列': countOf(c.col)===null ? '' : c.col+1,
       // 前の格子で入れたマスも残す。ただし、いまの格子の分と混ぜて集計されないよう印を付ける
@@ -4366,14 +4569,14 @@ function buildMeshRows(sv, snap){
 
 const FS_SURVEY_COLS = ['調査日','終了日','日数','季節','天気','河川名','地点名','区間名','河川形態A',
   '調べたもの','記録のしかた','環境の取り方',
-  '緯度','経度','GPS精度m','位置の決め方','調査者','業務番号','業務名',
+  '緯度','経度','GPS精度m','位置の決め方','調査者','何回目調査','業務番号','業務名',
   '箇所数','種数','尾数','測った尾数',
   '通電秒数_合計','距離_合計m','距離_手入力m','距離_使う値m',
   '面積_合計m2','面積_手入力m2','面積_使う値m2',
   '開始','終了','メモ','調査ID'];
 
 /* 書き出しでデータベースの31列CSVに乗らない項目。書き出し画面に必ず出す */
-const NOT_IN_DB_CSV = ['通電秒数','調査面積','調査距離','左右岸のカバー',
+const NOT_IN_DB_CSV = ['通電秒数','漁具ごとの数・規格・時間','調査面積','調査距離','左右岸のカバー',
   '河床材料の割合','測点ごとの水深・流速','1尾ずつの体長','写真','GPSの精度','調査者'];
 
 /* ============================================================
@@ -4442,6 +4645,131 @@ SCREENS.home = ()=>{
 };
 
 /* ---------- 調査の作成・編集 ---------- */
+/* ============================================================
+   新しい調査（魚類調査イメージ.pptx の1枚目）
+   ▼業務情報 → 調査日 → 季節 → 河川名 → 地図（調査地点を置く）
+   → 地点のチップ → ▼地点情報。ほかの設定は「▼くわしい設定」にたたむ
+   ============================================================ */
+/* この調査に置いた調査地点。囲い（E・P/F）とメッシュは、地点として数えない */
+function spotList(svUuid){
+  return DB.stationsOf(svUuid).filter(x=>!isMesh(x) && !unitKindOf(x));
+}
+/* いま選んでいる地点。消えていたら先頭に戻す */
+function spotCur(svUuid, list){
+  const l = list || spotList(svUuid);
+  const u = SPOTS_SEL[svUuid];
+  const hit = u ? l.filter(x=>x.uuid===u)[0] : null;
+  return hit || l[0] || null;
+}
+/* 地点の一覧（枚数の見出しも中に入れる。置くたびにここだけ描き直す） */
+function spotCardHtml(list, sel){
+  return `<h3 style="margin-top:0">地点　<span class="dim small">${list.length}件</span></h3>`
+    + spotChipsHtml(list, sel);
+}
+function spotChipsHtml(list, sel){
+  if(!list.length) return '<div class="dim small">まだありません。'
+    + '地図をタップすると、その場所に調査地点を置きます。</div>';
+  return `<div class="seg">` + list.map(st=>`<button type="button"
+    class="${sel && st.uuid===sel.uuid ? 'on' : ''}"
+    onclick="spotSelect('${st.uuid}')">${esc(st.name||'')}
+    <span class="fsub">${DB.catchesOf(st.uuid).length}種</span></button>`).join('') + `</div>`;
+}
+/* ▼地点情報。選んでいる地点の 区間名・地点名・河川形態A を入れる。
+   空のままなら、調査ぜんぶの値（▼くわしい設定）を使う */
+function spotInfoHtml(sel, sv){
+  if(!sel) return foldHtml('svspot', '地点情報', '', `
+    <div class="dim small">まだ地点がありません。地図をタップして置いてください。<br>
+      置いた地点ごとに、区間名・地点名・河川形態Aを入れられます。</div>`, true);
+  const A = sv.river_morphology_a || '';
+  return foldHtml('svspot', '地点情報', `<span class="fsub">${esc(sel.name||'')}</span>`, `
+    <label>区間名</label>
+    <input id="sp_section" value="${esc(sel.section_name||'')}"
+      placeholder="${esc(sv.section_name || '例）1・2・施工区域')}" onchange="spotInfoSave()">
+    <label>地点名</label>
+    <input id="sp_site" value="${esc(sel.site_name||'')}"
+      placeholder="${esc(sv.site_name || '例）○○橋下流')}" onchange="spotInfoSave()">
+    <label>河川形態A（セグメント）</label>
+    <div onclick="setTimeout(spotInfoSave,0)">
+      ${segHtml('spotFormA', OPT.formA, sel.river_morphology_a||'', true)}</div>
+    <div class="dim small">空のままなら、調査ぜんぶの値を使います${
+      A ? `（いまは「${esc(A)}」）` : ''}。調査ぜんぶの値は「くわしい設定」で変えられます。</div>
+    <button class="btn pri" onclick="spotOpen('${sel.uuid}')">${
+      esc(sel.name||'この地点')} を開く（魚類調査・物理環境調査）</button>
+    <button class="btn ng" onclick="spotRemove('${sel.uuid}')">この地点を削除する</button>
+  `, true);
+}
+/* 地点情報を、選んでいる地点へ書く。打つたびに保存する（保存ボタンを押さなくても残る） */
+function spotInfoSave(){
+  if(!SPOT_SV || !$('#sp_section')) return;      // 画面に出ていないときは触らない
+  const sel = spotCur(SPOT_SV); if(!sel) return;
+  const st = DB.liveStation(sel.uuid); if(!st) return;
+  const sec = strVal('#sp_section'), site = strVal('#sp_site'), a = segVal('spotFormA');
+  if((st.section_name||'')===sec && (st.site_name||'')===site
+     && (st.river_morphology_a||'')===a) return;
+  st.section_name       = sec;
+  st.site_name          = site;
+  st.river_morphology_a = a;
+  if(!DB.upsert(DB.key.st, st)){
+    toast('地点情報を保存できませんでした（端末の空き容量をご確認ください）', 8000);
+  }
+}
+function spotSelect(uu){
+  spotInfoSave();                 // 選び替える前に、打った分を先に書く
+  if(SPOT_SV) SPOTS_SEL[SPOT_SV] = uu;
+  spotRefresh();
+}
+/* 地点の並びと地点情報だけ描き直す。
+   画面ごと作り直すと、合わせた地図と書きかけが巻き添えになる */
+function spotRefresh(){
+  const svUuid = SPOT_SV; if(!svUuid) return;
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
+  const list = spotList(svUuid);
+  const sel  = spotCur(svUuid, list);
+  const a = $('#f_spotList'); if(a) a.innerHTML = spotCardHtml(list, sel);
+  const b = $('#f_spotInfo'); if(b) b.innerHTML = spotInfoHtml(sel, sv);
+  spotsDrawAll(svUuid, sel ? sel.uuid : '');
+}
+function spotOpen(uu){ spotInfoSave(); nav('spot', uu); }
+function spotRemove(uu){
+  const st = DB.liveStation(uu); if(!st) return;
+  const n = DB.catchesOf(uu).length;
+  if(!confirm(`${st.name||'この地点'}を削除します。`
+    + `${n>0?`記録${n}件も一緒に見えなくなります。`:''}よろしいですか？（ごみ箱に入ります）`)) return;
+  if(!DB.softDelete(DB.key.st, uu)) return;
+  draftClearFor('箇所', uu);
+  if(SPOT_SV) delete SPOTS_SEL[SPOT_SV];
+  toast('削除しました');
+  spotRefresh();
+}
+/* 地図で調査地点を置く。置いたら、それを選んだ状態にする */
+function svSpotAdd(svUuid, lat, lon, acc){
+  const u = spotsAdd(svUuid, lat, lon, acc);
+  if(!u) return null;
+  SPOTS_SEL[svUuid] = u;
+  // この調査の代表点がまだ空なら、はじめに置いた地点の位置を入れる。
+  // 空のままだと、書き出しも取り込みも位置なしになる
+  const sv = DB.getAlive(DB.key.sv, svUuid);
+  if(sv && numOf(sv.latitude)===''){
+    sv.latitude  = +(+lat).toFixed(6);
+    sv.longitude = +(+lon).toFixed(6);
+    sv.position_source = sv.position_source || '地点';
+    if(DB.upsert(DB.key.sv, sv)){
+      applyVals({'#f_lat': fixCoord(sv.latitude), '#f_lon': fixCoord(sv.longitude)});
+      const el=$('#posInfo'); if(el) el.textContent = '決め方：地点';
+      surveyDrawPos(sv.latitude, sv.longitude);
+    }
+  }
+  spotRefresh();
+  return u;
+}
+function svFitAll(svUuid){
+  const map = MAPS.main.map; if(!map) return;
+  const pts = spotList(svUuid).map(stationPt).filter(Boolean);
+  const la = numVal('#f_lat'), lo = numVal('#f_lon');
+  if(la!=='' && lo!=='') pts.push([la, lo]);
+  if(!pts.length){ toast('まだ何も置かれていません'); return; }
+  try{ map.fitBounds(L.latLngBounds(pts).pad(0.3), {animate:false}); }catch(e){}
+}
 SCREENS.surveyEdit = (svUuid)=>{
   const isNew = !svUuid;
   const sv = isNew ? {} : DB.getAlive(DB.key.sv, svUuid);
@@ -4449,9 +4777,28 @@ SCREENS.surveyEdit = (svUuid)=>{
   const p = prefs();
   const today = dateValue();
   const g = k => (sv[k]!==undefined ? sv[k] : '');
+  const pno = g('project_number') || (isNew ? (p.project_number||'') : '');
+  const pnm = g('project_name')   || (isNew ? (p.project_name||'')   : '');
+  const inv = g('investigator')   || (isNew ? (p.investigator||'')   : '');
+  const rnd = g('survey_round')   || (isNew ? (p.survey_round||'')   : '');
+  const spots = isNew ? [] : spotList(svUuid);
+  const sel   = isNew ? null : spotCur(svUuid, spots);
   return {
     title: isNew ? '新しい調査' : '調査の設定',
+    sub: isNew ? [] : [{text: sv.river_name||''}],
     html:`
+      ${foldHtml('svbiz', '業務情報',
+        `<span class="fsub">${esc([pnm, rnd].filter(Boolean).join('　'))}</span>`, `
+        <label>業務番号</label>
+        <input id="f_pno" value="${esc(pno)}">
+        <label>業務名</label>
+        <input id="f_pname" value="${esc(pnm)}">
+        <label>調査者</label>
+        <input id="f_inv" value="${esc(inv)}">
+        <label>何回目調査　<span class="dim small">例）夏季・秋季・1回目</span></label>
+        <input id="f_round" value="${esc(rnd)}" placeholder="例）夏季">
+      `, isNew)}
+
       <div class="card">
         <label>調査日（はじめの日）</label>
         <input id="f_date" type="date" value="${esc(g('survey_date')||today)}" onchange="onSurveyDate()">
@@ -4460,65 +4807,75 @@ SCREENS.surveyEdit = (svUuid)=>{
         <div class="dim small" id="f_daysInfo"></div>
         <label>季節（調査日から自動で入ります）</label>
         <div id="f_season_wrap">${segHtml('season', OPT.season, g('season')||seasonOf(g('survey_date')||today), true)}</div>
-        <label>天気</label>
-        ${segHtml('weather', OPT.weather, g('weather'), true)}
         <label>河川名</label>
         <input id="f_river" value="${esc(g('river_name'))}" placeholder="例）尻別川"
           onchange="surveyRiverChanged()">
-        <label>地点</label>
+        <label>登録した地点から選ぶ</label>
         <div id="f_siteList">${sitePickHtml(g('river_name'), g('site_uuid'))}</div>
-        <input id="f_site" value="${esc(g('site_name'))}" placeholder="例）○○橋下流"
-          style="margin-top:8px">
-        <div class="dim small" id="f_siteMsg">選ぶと、名前と位置がまとめて入ります。手で書いても構いません。</div>
+        <div class="dim small" id="f_siteMsg">選ぶと、名前と位置がまとめて入ります。</div>
         <button class="btn sm" onclick="nav('siteEdit',{river:strVal('#f_river')})">地点を登録する</button>
-        <label>区間名（調査全体で1つ。1・2・施工区域 など）</label>
-        <input id="f_section" value="${esc(g('section_name'))}">
-        <div class="dim small">瀬淵（早瀬・平瀬）は、箇所の「環境区分」で入れます。</div>
-        <label>河川形態A（セグメント）</label>
-        ${segHtml('formA', OPT.formA, g('river_morphology_a'), true)}
       </div>
-      <div class="card">
-        <h3 style="margin-top:0">何を調べますか</h3>
+
+      ${baseMapButtonsHtml()}
+      <div id="svmap" class="map"
+        style="height:${envMapBig()?'80vh':'50vh'};min-height:260px"></div>
+      <div class="dim small" id="f_mapMsg">${isNew
+        ? '先に下の「この調査をつくる」を押すと、地図をタップして調査地点を置けます。'
+        : '地図をタップすると、その場所に調査地点（P1・P2…）を置きます。'
+          + '置いた印を押すと、その地点を選びます。'}<br>
+        <span style="color:#3fb950">●</span> 登録した地点
+        <span style="color:#4aa3ff">●</span> 過去の調査地点</div>
+      <div class="dim small" id="f_gps"></div>
+
+      <div class="card" id="f_spotList">${spotCardHtml(spots, sel)}</div>
+
+      <div id="f_spotInfo">${spotInfoHtml(sel, sv)}</div>
+
+      ${foldHtml('svmore', 'くわしい設定', '', `
+        <label>天気</label>
+        ${segHtml('weather', OPT.weather, g('weather'), true)}
+
+        <h3>何を調べますか</h3>
         <div onclick="setTimeout(onSurveyKind,0)">
           ${segHtml('kind', OPT.surveyKind, g('survey_kind')||'魚')}</div>
         <div class="dim small" style="margin-top:8px">
           <b>魚</b>：獲れた魚を記録します。川の環境もあわせて記録できます。<br>
           <b>物理環境</b>：川の環境だけを記録します。魚を獲らない日はこちら。
         </div>
-      </div>
 
-      <div class="card" id="f_detailCard">
-        <h3 style="margin-top:0">記録のしかた</h3>
-        ${segHtml('detail', OPT.detail, g('detail_level')||'一般')}
-        <div class="dim small" style="margin-top:8px">
-          <b>一般</b>：瀬淵ごとに「箇所」を切り、そこで獲れた種と尾数をまとめて記録します。<br>
-          <b>詳細</b>：魚が獲れた場所ごとに「地点」を打ち、その点に種・尾数・体長を付けます。
-          点ごとに 位置・瀬淵区分・採捕方法・水深・流速 を持ちます。
+        <div id="f_detailCard">
+          <h3>記録のしかた</h3>
+          ${segHtml('detail', OPT.detail, g('detail_level')||'一般')}
+          <div class="dim small" style="margin-top:8px">
+            <b>一般</b>：瀬淵ごとに「箇所」を切り、そこで獲れた種と尾数をまとめて記録します。<br>
+            <b>詳細</b>：魚が獲れた場所ごとに「地点」を打ち、その点に種・尾数・体長を付けます。
+          </div>
+          <div class="warnbox">あとから変えると、入力欄の並びが変わります。
+            すでに入れた記録は消えません。</div>
         </div>
-        <div class="warnbox">あとから変えると、入力欄の並びが変わります。
-          すでに入れた記録は消えません。</div>
-      </div>
 
-      <div class="card" id="f_envCard">
-        <h3 style="margin-top:0">環境の取り方</h3>
-        ${segHtml('envm', OPT.envMethod, g('env_method_default')||'点')}
-        <div class="dim small" style="margin-top:8px">
-          <b>点</b>：測点をどんどん打って、水深・流速を拾います。<br>
-          <b>ライン</b>：早瀬・平瀬・淵…を縦断的に区間で区切り、始点と終点を押さえて記録します。<br>
-          <b>メッシュ</b>：範囲に格子を切って、マスごとに詳しく記録します。
+        <div id="f_envCard">
+          <h3>環境の取り方</h3>
+          ${segHtml('envm', OPT.envMethod, g('env_method_default')||'点')}
+          <div class="dim small" style="margin-top:8px">
+            <b>点</b>：測点をどんどん打って、水深・流速を拾います。<br>
+            <b>ライン</b>：早瀬・平瀬・淵…を縦断的に区間で区切り、始点と終点を押さえて記録します。<br>
+            <b>メッシュ</b>：範囲に格子を切って、マスごとに詳しく記録します。
+          </div>
+          <div class="dim small">ここで決めるのは<b>新しく作るときの初期値</b>です。</div>
         </div>
-        <div class="dim small">ここで決めるのは<b>新しく作るときの初期値</b>です。
-          取り方は1つずつ変えられます。</div>
-      </div>
-      <h3>位置（この調査の代表点）</h3>
-      ${baseMapButtonsHtml()}
-      <div id="svmap" class="map"></div>
-      <div class="dim small" style="margin-top:8px" id="f_mapMsg">
-        河川名を入れると、その川へ飛びます。地図をタップして位置を決められます。<br>
-        <span style="color:#3fb950">●</span> 登録した地点
-        <span style="color:#4aa3ff">●</span> 過去の調査地点
-      </div>
-      <div class="card">
+
+        <h3>地点情報の既定（この調査ぜんぶ）</h3>
+        <div class="dim small">地点ごとに入れなかったときに使う値です。</div>
+        <label>区間名</label>
+        <input id="f_section" value="${esc(g('section_name'))}">
+        <label>地点名</label>
+        <input id="f_site" value="${esc(g('site_name'))}" placeholder="例）○○橋下流">
+        <label>河川形態A（セグメント）</label>
+        ${segHtml('formA', OPT.formA, g('river_morphology_a'), true)}
+
+        <h3>位置（この調査の代表点）</h3>
+        <div class="dim small">はじめに置いた調査地点の位置が入ります。あとから直せます。</div>
         <div class="row">
           <div class="grow"><label>緯度</label>
             <input id="f_lat" inputmode="decimal" value="${esc(g('latitude'))}"></div>
@@ -4528,25 +4885,20 @@ SCREENS.surveyEdit = (svUuid)=>{
         <div class="dim small" id="posInfo">${esc(sv.position_source ? '決め方：'+sv.position_source : '')}</div>
         <button class="btn sm" onclick="grabPos()">現在地を入れる</button>
         <div class="dim small">取り込み側は緯度経度で調査をひとまとめにします。桁がばらつくと別々の調査になるため、書き出すときに小数6桁へそろえます。</div>
-      </div>
-      <div class="card">
-        <h3>業務・調査者</h3>
-        <label>業務番号</label>
-        <input id="f_pno" value="${esc(g('project_number')||(isNew?(p.project_number||''):''))}">
-        <label>業務名</label>
-        <input id="f_pname" value="${esc(g('project_name')||(isNew?(p.project_name||''):''))}">
-        <label>調査者</label>
-        <input id="f_inv" value="${esc(g('investigator')||(isNew?(p.investigator||''):''))}">
+
         <label>既定の調査区分</label>
         ${segHtml('svtype', OPT.surveyType, g('survey_type_default')||'採取')}
         <label>メモ</label>
         <textarea id="f_memo">${esc(g('memo'))}</textarea>
-      </div>
+      `)}
+
       <button class="btn pri" onclick="saveSurvey('${svUuid||''}')">${isNew?'この調査をつくる':'保存する'}</button>
+      ${isNew?'':`<button class="btn" onclick="goTo('survey','${svUuid}')">この調査を開く</button>`}
       ${isNew?'':`<button class="btn ng" onclick="deleteSurvey('${svUuid}')">この調査を削除する</button>`}
     `,
     onMount(){
       startGps();
+      SPOT_SV = svUuid || '';
       window._siteUuid = g('site_uuid') || '';
       onSurveyDate();
       onSurveyKind();
@@ -4558,7 +4910,7 @@ SCREENS.surveyEdit = (svUuid)=>{
           '#f_river':d.river_name, '#f_site':d.site_name,
           '#f_section':d.section_name, '#f_lat':d.latitude, '#f_lon':d.longitude,
           '#f_pno':d.project_number, '#f_pname':d.project_name, '#f_inv':d.investigator,
-          '#f_memo':d.memo});
+          '#f_round':d.survey_round, '#f_memo':d.memo});
         applySeg('season', d.season); applySeg('weather', d.weather);
         applySeg('formA', d.river_morphology_a); applySeg('svtype', d.survey_type_default);
         applySeg('detail', d.detail_level);
@@ -4573,24 +4925,64 @@ SCREENS.surveyEdit = (svUuid)=>{
       // 先に作ると、戻した河川名や位置が地図に反映されない
       const river = strVal('#f_river');
       const la = numVal('#f_lat'), lo = numVal('#f_lon');
-      const c = (la!=='' && lo!=='') ? [la, lo] : [43.06, 141.35];
-      MAPS.main.map = makeMap('svmap', c, (la!=='') ? 14 : 8);
+      const v = SPOTS_VIEW[svUuid||''];
+      const c = v ? [v.lat, v.lon] : ((la!=='' && lo!=='') ? [la, lo] : [43.06, 141.35]);
+      MAPS.main.map = makeMap('svmap', c, v ? v.zoom : ((la!=='') ? 15 : 8),
+        v ? v.bearing : 0);
       const map = MAPS.main.map;
-      if(map){
-        applyBaseMap('main', baseMapName());
-        addLocateControl(map);
-        const box = $('#f_siteList');
-        if(box) box.innerHTML = sitePickHtml(river, window._siteUuid || '');
-        surveyDrawSites();
-        if(la!=='') surveyDrawPos(c[0], c[1]);
-        else if(river) fitRiver(map, river, '#f_mapMsg');
-        map.on('click', e=>{
-          applyVals({'#f_lat': e.latlng.lat.toFixed(6), '#f_lon': e.latlng.lng.toFixed(6)});
-          surveyDrawPos(e.latlng.lat, e.latlng.lng);
-          window._posSource = '地図'; window._posAcc = '';
-          const el=$('#posInfo'); if(el) el.textContent = '決め方：地図';
-          draftTouch();
+      if(!map) return;
+      applyBaseMap('main', baseMapName());
+      addLocateControl(map);
+      // 方位（▲N）は makeMap がすでに付けている
+      addMapIconBar(map, [
+        {icon: envMapBig()?'shrink':'expand',
+         title: envMapBig()?'地図を小さく':'地図を大きく', tap:()=>envToggleBig()},
+        {icon:'fitAll', title:'置いたものが全部入るように', tap:()=>svFitAll(svUuid)},
+      ], 'topright');
+      if(!isNew){
+        addMapIconBar(map, [
+          {icon:'point', key:'P', on:true, title:'置くのは調査地点（P）です',
+           tap:()=>toast('地図をタップすると、その場所に調査地点を置きます', 5000)},
+        ], 'bottomleft');
+        addMapIconBar(map, [
+          {icon:'addHere', title:'いまいる場所に調査地点を置く', tap:()=>{
+            toast('現在地を取っています…');
+            getFixOnce(f=>{
+              if(!f){ toast('現在地を取れませんでした。地図をタップしても置けます', 6000); return; }
+              if(f.acc > GPS_MAX_ACC){
+                toast(`いまの位置は ±${Math.round(f.acc)}m と粗いので置いていません`, 8000);
+                return;
+              }
+              svSpotAdd(svUuid, f.lat, f.lon, f.acc);
+            });
+          }},
+        ], 'bottomright');
+      }
+      const box = $('#f_gps');
+      if(box) ENV_GPS_TIMER = setInterval(()=>{
+        if(!document.body.contains(box)){ clearInterval(ENV_GPS_TIMER); ENV_GPS_TIMER=null; return; }
+        box.textContent = gpsHint();
+        drawMe('main');
+      }, 2000);
+      const siteBox = $('#f_siteList');
+      if(siteBox) siteBox.innerHTML = sitePickHtml(river, window._siteUuid || '');
+      surveyDrawSites();
+      if(la!=='') surveyDrawPos(c[0], c[1]);
+      else if(river && !v) fitRiver(map, river, '#f_mapMsg');
+      if(!isNew){
+        spotsDrawAll(svUuid, sel ? sel.uuid : '');
+        drawMe('main');
+        map.on('click', e=>{ svSpotAdd(svUuid, e.latlng.lat, e.latlng.lng, null); });
+        map.on('moveend zoomend', ()=>{
+          try{
+            const cc = map.getCenter();
+            SPOTS_VIEW[svUuid] = {lat:cc.lat, lon:cc.lng,
+              zoom:map.getZoom(), bearing:mapBearing(map)};
+          }catch(e){}
         });
+        if(!v && spots.length>1) svFitAll(svUuid);
+      }else{
+        map.on('click', ()=>toast('先に下の「この調査をつくる」を押すと、地点を置けます', 6000));
       }
     }
   };
@@ -4604,7 +4996,8 @@ function collectSurvey(){
     section_name: strVal('#f_section'), river_morphology_a: segVal('formA'),
     latitude: strVal('#f_lat'), longitude: strVal('#f_lon'),
     project_number: strVal('#f_pno'), project_name: strVal('#f_pname'),
-    investigator: strVal('#f_inv'), survey_type_default: segVal('svtype'),
+    investigator: strVal('#f_inv'), survey_round: strVal('#f_round'),
+    survey_type_default: segVal('svtype'),
     detail_level: segVal('detail'),
     survey_kind: segVal('kind'), env_method_default: segVal('envm'),
     // 選ぶボタンは文字しか返さないので、選んだ地点のIDは別に覚えておく
@@ -4723,6 +5116,7 @@ function grabPos(){
   });
 }
 function saveSurvey(svUuid){
+  spotInfoSave();     // ▼地点情報に打ちかけがあれば、先に書く
   const rec = svUuid ? (DB.get(DB.key.sv, svUuid)||{uuid:svUuid}) : {uuid:uuid(), status:'未開始'};
   const f = collectSurvey();
   // 一般と詳細では、箇所（地点）の意味も見せ方もCSVも変わる。
@@ -4778,6 +5172,7 @@ function saveSurvey(svUuid){
   rec.project_number     = f.project_number;
   rec.project_name       = f.project_name;
   rec.investigator       = f.investigator;
+  rec.survey_round       = f.survey_round;
   rec.survey_type_default= f.survey_type_default || '採取';
   rec.detail_level       = f.detail_level || '一般';
   rec.survey_kind        = f.survey_kind === '物理環境' ? '物理環境' : '魚';
@@ -4793,10 +5188,15 @@ function saveSurvey(svUuid){
   prefSet('project_number', rec.project_number);
   prefSet('project_name', rec.project_name);
   prefSet('investigator', rec.investigator);
+  prefSet('survey_round', rec.survey_round);
   draftClear('survey:'+(svUuid||'new'));
   draftUnbind();
-  toast('保存しました');
-  if(svUuid) goBack(); else goTo('survey', rec.uuid);
+  if(svUuid){ toast('保存しました'); goBack(); return; }
+  // つくったあとも、この画面にとどまる。地図で調査地点を置くのはここ（PPT1枚目）。
+  // 戻るで調査ハブへ行けるように、道すじを組んでから置き換える
+  toast('調査をつくりました。地図をタップして、調査地点を置いてください', 7000);
+  STACK = buildChain('survey', rec.uuid).concat([{name:'surveyEdit', arg:rec.uuid}]);
+  render();
 }
 function deleteSurvey(u){
   if(!confirm('この調査を削除します。よろしいですか？（ごみ箱に入ります）')) return;
@@ -4873,7 +5273,7 @@ SCREENS.surveyHub = (svUuid)=>{
         ? `<button class="btn pri" onclick="nav('station','${running.uuid}')">記録中の ${esc(running.name)} を開く</button>`
         : `<button class="btn pri" onclick="newStation('${svUuid}')">${W}を追加する</button>`}
       ${envOnly ? '' : `<button class="btn"
-        onclick="nav('spots','${svUuid}')">地図で地点を置く</button>`}
+        onclick="nav('surveyEdit','${svUuid}')">地図で地点を置く（調査の設定へ）</button>`}
       ${envOnly ? '' : `<button class="btn ${単位あり?'ok':''}"
         onclick="if(fishUseMap('${svUuid}', true)) navReplace('fishMap','${svUuid}')"
         >地図で記録する${単位あり ? '（つづきから）' : '（調査範囲・瀬淵・ポイント）'}</button>`}
@@ -4984,6 +5384,11 @@ SCREENS.stationEdit = (arg)=>{
         ${segHtml('svtype2', OPT.surveyType, g('survey_type') || sv.survey_type_default || '採取')}
         <label>調査方法（いくつでも選べます）</label>
         ${segMultiHtml('method', OPT.method, st.survey_method||[])}
+        <div class="dim small">${gearCount(st)
+          ? `いまは<b>採捕記録の漁具（${esc(stationMethods(st).join('・'))}）</b>を使っています。`
+            + 'ここで選んだものは書き出しに出ません。'
+          : '漁具ごとの数や時間まで残すなら、'
+            + `<b>${esc(stWordOf(st))}の「採捕記録」</b>から入れてください。`}</div>
         <label>水温（℃）</label>
         <input id="s_wt" inputmode="decimal" value="${esc(g('water_temp'))}">
       </div>
@@ -5438,8 +5843,8 @@ SCREENS.station = (stUuid)=>{
             <div>${surveyIsMultiDay(sv) ? esc(stationDate(st, sv))+'　' : ''}${st.survey_time_start
               ? esc(st.survey_time_start)+' 〜 '+esc(st.survey_time_end||'（未入力）')
               : '<span class="pill ng">未入力</span>'}</div></div>
-          <div class="grow"><div class="dim small">調査方法</div>
-            <div>${(st.survey_method||[]).map(m=>`<span class="chip">${esc(m)}</span>`).join('')||'<span class="dim">—</span>'}</div></div>
+          <div class="grow"><div class="dim small">調査方法（漁具）</div>
+            <div>${stationMethods(st).map(m=>`<span class="chip">${esc(m)}</span>`).join('')||'<span class="dim">—</span>'}</div></div>
         </div>
         ${!detail ? '' : `<div class="hr"></div>
         <div class="row">
@@ -5461,12 +5866,16 @@ SCREENS.station = (stUuid)=>{
         <button class="btn sm" onclick="nav('stationEdit',{uuid:'${stUuid}'})">${W}の設定を開く</button>`,
         !detail)}
 
-      ${detail ? '' : foldHtml('effort', 'とった労力', `
-        <span class="fsub">通電 <b id="effClock">${esc(fmtDur(effortSeconds(st)))}</b></span>
-        <button class="btn ${effortRunning(st)?'ng':'ok'}"
+      ${foldHtml('catchrec', '採捕記録', `
+        <span class="fsub">${esc(gearsShort(st)||'漁具なし')}${
+          detail ? '' : '　通電 <b id="effClock">'+esc(fmtDur(effortSeconds(st)))+'</b>'}</span>
+        ${detail ? '' : `<button class="btn ${effortRunning(st)?'ng':'ok'}"
           style="width:auto;margin:0;padding:8px 14px;font-size:14px"
           onclick="event.preventDefault();event.stopPropagation();toggleEffort('${stUuid}')"
-          >${effortRunning(st)?'ストップ':'スタート'}</button>`, `
+          >${effortRunning(st)?'ストップ':'スタート'}</button>`}`, `
+        <h3 style="margin-top:0">漁具</h3>
+        <div id="gearBox">${gearsHtml(st, stUuid)}</div>
+        ${detail ? '' : `<div class="hr"></div>
         <div class="dim small">画面を移してもアプリを閉じても、時計で数えるので狂いません。</div>
 
         <label>流した回数</label>
@@ -5501,7 +5910,8 @@ SCREENS.station = (stUuid)=>{
           <div class="grow"><div class="dim small">100m²あたり</div>
             <div>${cp.per100m2===''?'—':esc(fmtNum(cp.per100m2,1))+' 尾'}</div></div>
         </div>
-        <button class="btn" onclick="saveEffort('${stUuid}')">労力を保存する</button>`)}
+        `}
+        <button class="btn" onclick="saveEffort('${stUuid}')">採捕記録を保存する</button>`)}
 
       <div class="card tap" onclick="nav('${isMesh(st)?'mesh':'env'}','${stUuid}')"
         ${detail ? 'style="opacity:.85"' : ''}>
@@ -5537,7 +5947,7 @@ SCREENS.station = (stUuid)=>{
       const dkey = 'effort:'+stUuid;
       const dbase = collectEffort();
       const dd = draftGet(dkey);
-      if(dd){ applySels(dd); toast('労力の書きかけを戻しました'); }
+      if(dd){ applyEffort(dd); toast('採捕記録の書きかけを戻しました'); }
       draftBind(dkey, collectEffort, dbase);
       if(effortRunning(st)){
         const el = $('#effClock');
@@ -5563,24 +5973,38 @@ function toggleEffort(stUuid){
     if(DB.upsert(DB.key.st, st)){ toast('通電をはじめました'); render(); }
   }
 }
-function saveEffort(stUuid){
-  const st = DB.liveStation(stUuid); if(!st) return;
+/* 採捕記録（漁具と労力）を保存する。
+   opt.quiet を立てると、保存できても画面を作り直さない（漁具の足し引きで使う）。
+   保存できたかどうかを返す */
+function saveEffort(stUuid, opt){
+  opt = opt || {};
+  const st = DB.liveStation(stUuid); if(!st) return false;
   const passes = strVal('#e_passes');
-  if(countOf(passes)===null){ toast('流した回数は0以上の整数で入れてください'); return; }
+  if($('#e_passes') && countOf(passes)===null){
+    toast('流した回数は0以上の整数で入れてください'); return false;
+  }
   const err = rangeCheck([
     ['流した回数', passes, 0, 999],
     ['平均の川幅', strVal('#e_width'), 0, 2000],
     ['区間の長さ', strVal('#e_len'), 0, 100000],
     ['面積', strVal('#e_area'), 0, 10000000]]);
-  if(err){ toast(err, 6000); return; }
-  st.effort_passes    = countOf(passes);
-  st.width_m          = numVal('#e_width');
-  st.length_m_manual  = numVal('#e_len');
-  st.area_m2_manual   = numVal('#e_area');
-  if(DB.upsert(DB.key.st, st)){
-    draftClear('effort:'+stUuid);
-    toast('保存しました'); render();
+  if(err){ toast(err, 6000); return false; }
+  const g = gearsNormalize(collectGears());
+  if(g.err){ toast(g.err, 6000); return false; }
+  // 画面に出ていない欄は触らない。地図の画面には長さ・面積の欄が無いので、
+  // まとめて書き戻すと、箇所ハブで入れた値を空で上書きしてしまう
+  if($('#e_passes')) st.effort_passes   = countOf(passes);
+  if($('#e_width'))  st.width_m         = numVal('#e_width');
+  if($('#e_len'))    st.length_m_manual = numVal('#e_len');
+  if($('#e_area'))   st.area_m2_manual  = numVal('#e_area');
+  if($('#gearBox'))  st.gears           = g.gears;
+  if(!DB.upsert(DB.key.st, st)){
+    toast('保存できませんでした（端末の空き容量をご確認ください）', 8000);
+    return false;
   }
+  draftClear('effort:'+stUuid);
+  if(!opt.quiet){ toast('保存しました'); render(); }
+  return true;
 }
 function endStation(u){
   const st = DB.get(DB.key.st, u); if(!st) return;
@@ -6746,9 +7170,10 @@ SCREENS.cloud = ()=>{
    置いた地点ごとに、魚類調査と物理環境調査のどちらへも入れる。
    いまの画面をそのまま下にぶら下げる（作り直さない）
    ============================================================ */
-/* 地点を置く地図（魚類調査イメージ.pptx の1枚目）。
-   新しい調査 →（ここで地点を置く）→ 地点 → 魚類 or 物理環境 */
-let SPOTS_VIEW = {}, SPOTLAYER = [], SPOTS_SV = '';
+/* 調査地点を置くしくみ（魚類調査イメージ.pptx の1枚目）。
+   新しい調査の画面で置く → 地点 → 魚類 or 物理環境。
+   別画面「地図で地点を置く」は、新しい調査の画面に入れたので畳んだ（2026-08-20） */
+let SPOTS_VIEW = {}, SPOTLAYER = [], SPOT_SV = '', SPOTS_SEL = {};
 function spotsAdd(svUuid, lat, lon, acc){
   const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return null;
   if(!writeAllowed()){
@@ -6772,99 +7197,20 @@ function spotsAdd(svUuid, lat, lon, acc){
   toast(`${rec.name} を置きました`);
   return rec.uuid;
 }
-function spotsDrawAll(svUuid){
+/* 置いた調査地点を地図に描く。選んでいるものは大きく出す（PPT「ちょっと大きめ」） */
+function spotsDrawAll(svUuid, sel){
   const map = MAPS.main.map; if(!map) return;
   try{ SPOTLAYER.forEach(x=>map.removeLayer(x)); }catch(e){}
   SPOTLAYER = [];
-  DB.stationsOf(svUuid).filter(x=>!isMesh(x) && !unitKindOf(x)).forEach(st=>{
+  spotList(svUuid).forEach(st=>{
     const pt = stationPt(st); if(!pt) return;
     const 済み = DB.catchesOf(st.uuid).length > 0;
-    SPOTLAYER.push(L.marker(pt, {icon:envBadge(st.name||'', 済み?'#3fb950':'#4aa3ff', 30, true)})
-      .on('click', e=>{ L.DomEvent.stop(e); nav('spot', st.uuid); }).addTo(map));
+    const 選び = !!sel && st.uuid===sel;
+    SPOTLAYER.push(L.marker(pt,
+      {icon:envBadge(st.name||'', 済み?'#3fb950':'#4aa3ff', 選び?42:34, true)})
+      .on('click', e=>{ L.DomEvent.stop(e); spotSelect(st.uuid); }).addTo(map));
   });
 }
-SCREENS.spots = (svUuid)=>{
-  const sv = DB.getAlive(DB.key.sv, svUuid);
-  if(!sv) return null;
-  const list = DB.stationsOf(svUuid).filter(x=>!isMesh(x) && !unitKindOf(x));
-  return {
-    title:'地点を置く',
-    sub:[{text: sv.river_name||''}, {text:`${list.length}地点`}],
-    html:`
-      ${baseMapButtonsHtml()}
-      <div id="spotsmap" class="map"
-        style="height:${envMapBig()?'80vh':'50vh'};min-height:260px"></div>
-      <div class="dim small">地図をタップすると、その場所に調査地点を置きます。
-        置いた印を押すと、その地点の画面（魚類調査／物理環境調査）へ入ります。</div>
-      <div class="dim small" id="spotsGps"></div>
-
-      <div class="card">
-        <h3 style="margin-top:0">地点</h3>
-        ${list.length
-          ? `<div class="seg">${list.map(st=>`<button type="button"
-              onclick="nav('spot','${st.uuid}')">${esc(st.name||'')}
-              <span class="fsub">${DB.catchesOf(st.uuid).length}種</span></button>`).join('')}</div>`
-          : '<div class="dim small">まだありません。地図をタップして置いてください。</div>'}
-      </div>
-    `,
-    onMount(){
-      startGps();
-      const box = $('#spotsGps');
-      if(box) ENV_GPS_TIMER = setInterval(()=>{
-        if(!document.body.contains(box)){ clearInterval(ENV_GPS_TIMER); ENV_GPS_TIMER=null; return; }
-        box.textContent = gpsHint();
-        drawMe('main');
-      }, 2000);
-      const v = SPOTS_VIEW[svUuid];
-      const c = v ? [v.lat, v.lon] : envMapCenter(sv, null);
-      MAPS.main.map = makeMap('spotsmap', c, v ? v.zoom : 15, v ? v.bearing : 0);
-      const map = MAPS.main.map;
-      if(!map) return;
-      applyBaseMap('main', baseMapName());
-      addLocateControl(map);
-      addMapIconBar(map, [
-        {icon: envMapBig()?'shrink':'expand',
-         title: envMapBig()?'地図を小さく':'地図を大きく', tap:()=>envToggleBig()},
-        {icon:'fitAll', title:'置いたものが全部入るように', tap:()=>{
-          const pts = DB.stationsOf(svUuid).filter(x=>!isMesh(x) && !unitKindOf(x))
-            .map(stationPt).filter(Boolean);
-          if(!pts.length){ toast('まだ何も置かれていません'); return; }
-          try{ map.fitBounds(L.latLngBounds(pts).pad(0.3), {animate:false}); }catch(e){}
-        }},
-      ], 'topright');
-      addMapIconBar(map, [
-        {icon:'addHere', title:'いまいる場所に地点を置く', tap:()=>{
-          toast('現在地を取っています…');
-          getFixOnce(f=>{
-            if(!f){ toast('現在地を取れませんでした。地図をタップしても置けます', 6000); return; }
-            if(f.acc > GPS_MAX_ACC){
-              toast(`いまの位置は ±${Math.round(f.acc)}m と粗いので置いていません`, 8000);
-              return;
-            }
-            spotsAdd(svUuid, f.lat, f.lon, f.acc); render();
-          });
-        }},
-      ], 'bottomright');
-      spotsDrawAll(svUuid);
-      drawMe('main');
-      SPOTS_SV = svUuid;
-      map.on('click', e=>{ spotsAdd(svUuid, e.latlng.lat, e.latlng.lng, null); render(); });
-      map.on('moveend zoomend', ()=>{
-        try{
-          const cc = map.getCenter();
-          SPOTS_VIEW[svUuid] = {lat:cc.lat, lon:cc.lng, zoom:map.getZoom(), bearing:mapBearing(map)};
-        }catch(e){}
-      });
-      if(!v){
-        const pts = DB.stationsOf(svUuid).filter(x=>!isMesh(x) && !unitKindOf(x))
-          .map(stationPt).filter(Boolean);
-        if(pts.length>1){
-          try{ map.fitBounds(L.latLngBounds(pts).pad(0.3), {animate:false}); }catch(e){}
-        }
-      }
-    }
-  };
-};
 SCREENS.spot = (stUuid)=>{
   const st = DB.liveStation(stUuid);
   if(!st) return null;
@@ -7105,17 +7451,21 @@ SCREENS.fishMap = (svUuid)=>{
             : '<div class="dim small">まだありません。「魚を足す」から入れてください。</div>'}`;
         })(), true)}
 
-      ${isDetail(sv) ? '' : foldHtml('fisheffort', 'とった労力',
-        `<span class="fsub">通電 <b id="effClock">${esc(fmtDur(effortSeconds(cur)))}</b></span>`,
-        `<button class="btn ${effortRunning(cur)?'ng':'ok'}"
+      ${foldHtml('fishcatchrec', '採捕記録',
+        `<span class="fsub">${esc(gearsShort(cur)||'漁具なし')}${
+          isDetail(sv) ? '' : '　通電 <b id="effClock">'+esc(fmtDur(effortSeconds(cur)))+'</b>'}</span>`,
+        `<h3 style="margin-top:0">漁具</h3>
+        <div id="gearBox">${gearsHtml(cur, cur.uuid)}</div>
+        ${isDetail(sv) ? '' : `<div class="hr"></div>
+        <button class="btn ${effortRunning(cur)?'ng':'ok'}"
           onclick="toggleEffort('${cur.uuid}')">${effortRunning(cur)?'ストップ':'スタート'}</button>
         <label>流した回数</label>
         <input id="e_passes" inputmode="numeric"
           value="${esc(cur.effort_passes!==undefined?cur.effort_passes:'')}">
         <label>平均の川幅（m）</label>
         <input id="e_width" inputmode="decimal"
-          value="${esc(cur.width_m!==undefined?cur.width_m:'')}">
-        <button class="btn" onclick="saveEffort('${cur.uuid}')">労力を保存する</button>`)}
+          value="${esc(cur.width_m!==undefined?cur.width_m:'')}">`}
+        <button class="btn" onclick="saveEffort('${cur.uuid}')">採捕記録を保存する</button>`)}
 
       ${foldHtml('fishenv', '川の環境',
         `<span class="fsub">${esc(habitatShort(cur.habitat_type||'')||'—')}</span>`,
@@ -9743,11 +10093,12 @@ SCREENS.exportHub = (svUuid)=>{
   if(!sv) return null;
   const envOnly = isEnvSurvey(sv);
   const r = buildDbRows(sv);
-  let extra = {ind:0, st:0, pt:0, mesh:0};
+  let extra = {ind:0, st:0, pt:0, mesh:0, gear:0};
   try{
     const snap = exportSnapshot();
     extra = {ind: buildIndRows(sv, snap).length, st: buildStationRows(sv, snap).length,
-             pt: buildPointRows(sv, snap).length, mesh: buildMeshRows(sv, snap).length};
+             pt: buildPointRows(sv, snap).length, mesh: buildMeshRows(sv, snap).length,
+             gear: buildGearRows(sv, snap).length};
   }catch(e){}
   const ph = photoStats(sv);
   return {
@@ -9796,6 +10147,8 @@ SCREENS.exportHub = (svUuid)=>{
             <div class="big">${extra.pt} 点</div></div>
           <div class="grow"><div class="dim small">箇所</div>
             <div class="big">${extra.st} 件</div></div>
+          ${extra.gear ? `<div class="grow"><div class="dim small">漁具</div>
+            <div class="big">${extra.gear} 件</div></div>` : ''}
           ${extra.mesh ? `<div class="grow"><div class="dim small">メッシュ</div>
             <div class="big">${extra.mesh} マス</div></div>` : ''}
         </div>
@@ -9805,6 +10158,8 @@ SCREENS.exportHub = (svUuid)=>{
           onclick="exportExtraCsv('${svUuid}','個体')">1尾ずつの体長を書き出す</button>
         <button class="btn" ${extra.pt?'':'disabled'}
           onclick="exportExtraCsv('${svUuid}','測点')">測点ごとの水深・流速を書き出す</button>
+        <button class="btn" ${extra.gear?'':'disabled'}
+          onclick="exportExtraCsv('${svUuid}','採捕')">採捕記録（漁具ごと）を書き出す</button>
         <button class="btn" onclick="exportExtraCsv('${svUuid}','箇所')">箇所ごとの記録を書き出す</button>
         <button class="btn" onclick="exportExtraCsv('${svUuid}','調査')">調査のまとめを書き出す</button>
         ${extra.mesh ? `<button class="btn"
@@ -10124,6 +10479,7 @@ function exportExtraCsv(svUuid, kind){
     '箇所': [FS_STATION_COLS, buildStationRows(sv, snap)],
     '調査': [FS_SURVEY_COLS,  buildSurveyRow(sv, snap)],
     '測点': [FS_POINT_COLS,   buildPointRows(sv, snap)],
+    '採捕': [FS_GEAR_COLS,   buildGearRows(sv, snap)],
     'メッシュ': [FS_MESH_COLS, buildMeshRows(sv, snap)],
   }[kind];
   if(!table){ toast('書き出せません'); return; }
