@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v50';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v51';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -7332,13 +7332,16 @@ SCREENS.spot = (stUuid)=>{
       <div class="dim small">この地点のあたりで地図が開きます。
         記録は地図の上で、範囲・瀬淵・ポイント（魚）／ライン・測点（物理環境）として入れます。</div>
 
-      ${foldHtml('spotform', 'この地点に直接入れる（前のやり方）', '', `
-        <div class="dim small">地図を使わず、入力欄に直接書き込む形です。
-          前に作った記録を直すときに使ってください。</div>
-        <button class="btn" onclick="nav('station','${stUuid}')">
-          魚類の入力欄${種 ? `（${種}種 ${尾}尾）` : ''}</button>
-        <button class="btn ${環境あり?'ok':''}" onclick="nav('env','${stUuid}')">
-          川の環境の入力欄${環境あり ? '（入力済み）' : ''}</button>`)}
+      <!-- 「この地点に直接入れる（前のやり方）」は普段は出さない（2026-08-21）。
+           ただし、前のやり方でこの地点に直接入れた記録があるときだけ出す。
+           消してしまうと、その記録に手が届かなくなる -->
+      ${(種 || 環境あり) ? foldHtml('spotform', '前のやり方で入れた記録を直す', '', `
+        <div class="dim small">この地点には、地図を使わずに直接入れた記録があります。
+          直すときはこちらから。新しく入れるときは、上の「魚類調査」「物理環境調査」を使ってください。</div>
+        ${種 ? `<button class="btn" onclick="nav('station','${stUuid}')">
+          魚類の入力欄（${種}種 ${尾}尾）</button>` : ''}
+        ${環境あり ? `<button class="btn ok" onclick="nav('env','${stUuid}')">
+          川の環境の入力欄（入力済み）</button>` : ''}`) : ''}
 
       ${foldHtml('spotsum', '集計', `<span class="fsub">${種}種 ${尾}尾</span>`, `
         <div class="row">
