@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v47';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v49';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1302,6 +1302,93 @@ function stationTotal(st){ return DB.catchesOf(st.uuid).reduce((a,c)=>a+catchTot
 function surveyTotal(sv){ return DB.catchesOfSurvey(sv.uuid).reduce((a,c)=>a+catchTotal(c), 0); }
 
 /* ============================================================
+   集計（調査ぜんぶ）— 魚類調査イメージ.pptx の3枚目「▼ 集計（全体の）」
+   出すのは2つだけ。ほかの集計（体長分布・努力量あたり）はデータベース側でやる
+     1. 種ごとの尾数（多い順）と、その地点別の内訳
+     2. 地点ごとの種数・尾数の一覧
+   ============================================================ */
+/* 記録はいちばん小さい単位にだけ入るので、単位ごとの記録をそのまま足せば
+   二重に数えない。大きい単位の集計（unitTotals）はここでは使わない */
+function surveyTally(svUuid){
+  const all = DB.stationsOf(svUuid);
+  // 中に小さい単位があるもの（E1・P/F1 など）は、集計を出すだけの入れ物。
+  // 一覧に並べると 0種0尾 の行になって、記録の抜けと見分けがつかない
+  const 親 = {};
+  all.forEach(st=>{ if(st.parent_uuid) 親[st.parent_uuid] = true; });
+  const sts = all.filter(st=>!親[st.uuid])
+    .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
+
+  const sp = {};        // 種 → {name, 尾, 場所}
+  const 場所 = [];
+  let 尾合計 = 0, 記録あり = 0;
+  sts.forEach(st=>{
+    const cs = DB.catchesOf(st.uuid);
+    const 名 = st.name || '（名前なし）';
+    const 種 = {};
+    let n = 0;
+    cs.forEach(c=>{
+      const t = catchTotal(c);
+      const key = c.species_id || c.species_name;
+      if(!key || t <= 0) return;      // 0尾は種数に数えない（speciesCount と同じ決まり）
+      種[key] = true;
+      n += t; 尾合計 += t;
+      const e = sp[key] || (sp[key] = {name: c.species_name || c.species_id || key, 尾:0, 場所:{}});
+      e.尾 += t;
+      e.場所[名] = (e.場所[名] || 0) + t;
+    });
+    const 種数 = Object.keys(種).length;
+    if(種数) 記録あり++;
+    場所.push({name:名, 種:種数, 尾:n, 印: UNIT_MARK[unitKindOf(st)] || ''});
+  });
+  const 種一覧 = Object.keys(sp).map(k=>({id:k, name:sp[k].name, 尾:sp[k].尾, 場所:sp[k].場所}))
+    // 多い順。同じ尾数なら名前順（並びが日によって変わらないように）
+    .sort((a,b)=> b.尾 - a.尾 || String(a.name).localeCompare(String(b.name), 'ja'));
+  return {種: 種一覧, 場所: 場所, 尾: 尾合計, 記録あり: 記録あり};
+}
+function surveyTallyShort(svUuid){
+  const t = surveyTally(svUuid);
+  return `${t.種.length}種 ${t.尾}尾 ／ ${t.場所.length}か所`;
+}
+/* 集計の中身。地図の画面と箇所ハブの両方で使う */
+function surveyTallyHtml(svUuid){
+  const t = surveyTally(svUuid);
+  if(!t.種.length && !t.場所.length){
+    return '<div class="dim small">まだ記録がありません。</div>';
+  }
+  const 種表 = t.種.length ? `
+    <table><thead><tr><th>魚種</th><th class="num">尾数</th></tr></thead><tbody>
+    ${t.種.map(s=>{
+      const 内訳 = Object.keys(s.場所).map(k=>`${esc(k)} ${s.場所[k]}`).join('　');
+      return `<tr><td>${esc(s.name)}<div class="dim small">${内訳}</div></td>
+        <td class="num" style="vertical-align:top">${s.尾}</td></tr>`;
+    }).join('')}
+    <tr><td style="font-weight:700">合計</td>
+        <td class="num" style="font-weight:700">${t.尾}</td></tr>
+    </tbody></table>`
+    : '<div class="dim small">まだ魚の記録がありません。</div>';
+
+  const 場所表 = `
+    <table><thead><tr><th>場所</th><th class="num">種数</th><th class="num">尾数</th></tr></thead><tbody>
+    ${t.場所.map(p=>`<tr>
+      <td>${p.印 ? `<span class="chip">${esc(p.印)}</span> ` : ''}${esc(p.name)}</td>
+      <td class="num">${p.種 || '—'}</td>
+      <td class="num">${p.尾 || '—'}</td></tr>`).join('')}
+    </tbody></table>
+    ${t.記録あり < t.場所.length
+      ? `<div class="dim small">${t.場所.length - t.記録あり}か所は、まだ魚の記録がありません。</div>`
+      : ''}`;
+
+  return `<h3 style="margin-top:0">種ごとの尾数（多い順）</h3>
+    <div class="dim small">名前の下は、どの場所で何尾とれたかです。</div>
+    ${種表}
+    <div class="hr"></div>
+    <h3>場所ごとの種数・尾数</h3>
+    ${場所表}
+    <div class="dim small">体長の分布や努力量あたりの尾数は、
+      書き出したCSVからデータベース側で出します。</div>`;
+}
+
+/* ============================================================
    川の環境（測点・河床材の割合・岸のカバー）
    ============================================================ */
 function envPoints(st){ return (st && Array.isArray(st.env_points)) ? st.env_points : []; }
@@ -1813,7 +1900,7 @@ function envRememberView(svUuid){
   const map = MAPS.main.map; if(!map) return;
   try{
     const c = map.getCenter();
-    ENV_VIEW[svUuid] = {lat:c.lat, lon:c.lng, zoom:map.getZoom(),
+    ENV_VIEW[mapViewKey(svUuid)] = {lat:c.lat, lon:c.lng, zoom:map.getZoom(),
                         bearing: mapBearing(map)};
   }catch(e){}
 }
@@ -2690,8 +2777,14 @@ function buildChain(name, arg){
     return st ? [home, {name:'survey', arg:st.survey_uuid}, {name:'station', arg:arg}]
               : [home];
   }
-  // メッシュの画面は箇所にぶら下がる。戻る道を箇所まで組み直す
-  if(name==='envMap') return [home, {name:'survey', arg:arg}];
+  // 地図の画面。地点から開いたときは、ホーム > 調査 > 地点 > 地図 と組む
+  if(name==='envMap' || name==='fishMap'){
+    const m = mapArg(arg);
+    if(m.spot && DB.liveStation(m.spot)){
+      return [home, {name:'survey', arg:m.sv}, {name:'spot', arg:m.spot}, {name, arg:arg}];
+    }
+    return [home, {name:'survey', arg:m.sv}];
+  }
   if(name==='mesh' || name==='meshSetup'){
     const st = DB.liveStation(arg);
     return st ? [home, {name:'survey', arg:st.survey_uuid},
@@ -2737,6 +2830,7 @@ function render(){
   try{ if(typeof envFlush==='function') envFlush(); }catch(e){}
   // 「新しい調査」の▼地点情報も同じ。画面を作り直す前に、打った分を書く
   try{ if(typeof spotInfoSave==='function') spotInfoSave(); }catch(e){}
+  MAP_SPOT = '';      // 地図を開いている地点は、画面ごとに立て直す
   // 同じ画面を作り直すときのために、見ていた位置を控える。
   // 押すたびに先頭へ戻ると、下のほうの入力が打てない（2026-08-20 の実機の声）
   const 前の画面 = SCREEN_AT;
@@ -4652,7 +4746,10 @@ SCREENS.home = ()=>{
    ============================================================ */
 /* この調査に置いた調査地点。囲い（E・P/F）とメッシュは、地点として数えない */
 function spotList(svUuid){
-  return DB.stationsOf(svUuid).filter(x=>!isMesh(x) && !unitKindOf(x));
+  // 物理環境の記録（測点・ライン）は、置いたときに env_method が必ず入る。
+  // それを地点の並びに混ぜると、測点を1つ置くたびに地点が増えてしまう（2026-08-21）
+  return DB.stationsOf(svUuid)
+    .filter(x=>!isMesh(x) && !unitKindOf(x) && !x.env_method);
 }
 /* いま選んでいる地点。消えていたら先頭に戻す */
 function spotCur(svUuid, list){
@@ -5308,6 +5405,10 @@ SCREENS.surveyHub = (svUuid)=>{
 
       <h3>${isDetail(sv) ? '地点（打った点）' : '箇所（瀬淵ごと）'}</h3>
       ${stations.length ? stCards : `<div class="card dim">まだ${W}がありません。</div>`}
+
+      ${envOnly ? '' : foldHtml('hubtally', '集計（全体の）',
+        `<span class="fsub">${esc(surveyTallyShort(svUuid))}</span>`,
+        surveyTallyHtml(svUuid))}
 
       <div class="hr"></div>
       <button class="btn" onclick="nav('notes','${svUuid}')">メモ（${DB.notesOf(svUuid).length}件）</button>
@@ -6159,11 +6260,40 @@ function fishSelect(u){
   FISH_SEL = u;
   render();
 }
+/* 地図の画面は「調査」で開くほか、「地点」からも開ける。
+   地点は大まかな目印なので、**地図をその場所で開くためだけ**に使う。
+   記録の持ち方（E・P/F・P、ライン・測点）は今までどおり調査にぶら下がる（2026-08-21） */
+function mapArg(arg){
+  if(arg && typeof arg === 'object') return {sv: arg.survey || '', spot: arg.spot || ''};
+  return {sv: arg || '', spot: ''};
+}
+/* いま地図を開いている地点。調査から開いたときは空。
+   覚えた場所を取り違えないよう、1か所だけで持つ */
+let MAP_SPOT = '';
+/* 見ていた場所は、地点ごとに別に覚える（P1で寄ってからP2を開いても、P1の位置に飛ばない） */
+function mapViewKey(svUuid, spot){
+  const sp = (spot === undefined) ? MAP_SPOT : spot;
+  return sp ? svUuid + '|' + sp : svUuid;
+}
+/* 地点から開いたときの、地図のはじめの場所 */
+function spotCenter(spot){
+  const st = spot ? DB.liveStation(spot) : null;
+  return st ? stationPt(st) : null;
+}
+/* 地点から開いたときに出す、戻り道の帯 */
+function fromSpotHtml(spot){
+  const st = spot ? DB.liveStation(spot) : null;
+  if(!st) return '';
+  return `<div class="card tap" style="padding:8px 12px" onclick="goBack()">
+    <span class="chip">${esc(st.name||'地点')}</span>
+    <span class="dim small">から開いています。押すと地点へ戻ります</span></div>`;
+}
 function fishRememberView(svUuid){
   const map = MAPS.main.map; if(!map) return;
   try{
     const c = map.getCenter();
-    FISH_VIEW[svUuid] = {lat:c.lat, lon:c.lng, zoom:map.getZoom(), bearing:mapBearing(map)};
+    FISH_VIEW[mapViewKey(svUuid)] =
+      {lat:c.lat, lon:c.lng, zoom:map.getZoom(), bearing:mapBearing(map)};
   }catch(e){}
 }
 /* 地図に、囲いと点を描く */
@@ -7185,6 +7315,7 @@ function spotsAdd(svUuid, lat, lon, acc){
   const no = nextStationNo(svUuid);
   if(no===null){ toast('番号が大きすぎて、これ以上置けません', 7000); return null; }
   const rec = {uuid:uuid(), survey_uuid:svUuid, station_no:no,
+    is_spot: true,          // 「新しい調査」の地図で置いた調査地点。物理環境の測点と混ぜない
     name: 'P' + no, started_at: nowISO(), survey_time_start: timeValue(),
     survey_type: sv.survey_type_default || '目視', env_points: [],
     latitude: la, longitude: lo,
@@ -7241,10 +7372,22 @@ SCREENS.spot = (stUuid)=>{
         </div>
       </div>
 
-      <button class="btn pri" onclick="nav('station','${stUuid}')">
-        魚類調査${種 ? `（${種}種 ${尾}尾）` : ''}</button>
-      <button class="btn ${環境あり?'ok':''}" onclick="nav('env','${stUuid}')">
-        物理環境調査${環境あり ? '（入力済み）' : ''}</button>
+      <button class="btn pri"
+        onclick="nav('fishMap',{survey:'${st.survey_uuid}',spot:'${stUuid}'})">
+        魚類調査（地図で記録する）</button>
+      <button class="btn"
+        onclick="nav('envMap',{survey:'${st.survey_uuid}',spot:'${stUuid}'})">
+        物理環境調査（地図で記録する）</button>
+      <div class="dim small">この地点のあたりで地図が開きます。
+        記録は地図の上で、範囲・瀬淵・ポイント（魚）／ライン・測点（物理環境）として入れます。</div>
+
+      ${foldHtml('spotform', 'この地点に直接入れる（前のやり方）', '', `
+        <div class="dim small">地図を使わず、入力欄に直接書き込む形です。
+          前に作った記録を直すときに使ってください。</div>
+        <button class="btn" onclick="nav('station','${stUuid}')">
+          魚類の入力欄${種 ? `（${種}種 ${尾}尾）` : ''}</button>
+        <button class="btn ${環境あり?'ok':''}" onclick="nav('env','${stUuid}')">
+          川の環境の入力欄${環境あり ? '（入力済み）' : ''}</button>`)}
 
       ${foldHtml('spotsum', '集計', `<span class="fsub">${種}種 ${尾}尾</span>`, `
         <div class="row">
@@ -7324,7 +7467,8 @@ SCREENS.trash = ()=>{
       : '<div class="card dim">ごみ箱は空です。</div>',
   };
 };
-SCREENS.fishMap = (svUuid)=>{
+SCREENS.fishMap = (arg)=>{
+  const {sv: svUuid, spot} = mapArg(arg);
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
   fishUseSurvey(svUuid);
@@ -7344,12 +7488,14 @@ SCREENS.fishMap = (svUuid)=>{
       onclick="fishSelect('${st.uuid}')">${esc(st.name||'')}${未完?'…':''}${
         中 ? `<span class="fsub">中に${中}</span>` : ''}</button>`;
   };
+  const 地点札 = fromSpotHtml(spot);
   return {
     title: `${sv.river_name||''} ${sv.site_name||''}`.trim() || '魚の調査',
     sub:[{text:surveyPeriodText(sv)},
          {text:sv.status||'未開始', cls: sv.status==='調査中'?'ok':''},
          {text:`${list.length}件`}],
     html:`
+      ${地点札}
       ${baseMapButtonsHtml()}
       <div id="fishmap" class="map"
         style="height:${envMapBig()?'80vh':'46vh'};min-height:260px"></div>
@@ -7471,6 +7617,10 @@ SCREENS.fishMap = (svUuid)=>{
         `<span class="fsub">${esc(habitatShort(cur.habitat_type||'')||'—')}</span>`,
         envItemFormHtml(cur, sv, {head:false}), false)}
       `}`}
+
+      ${foldHtml('fishtally', '集計（全体の）',
+        `<span class="fsub">${esc(surveyTallyShort(svUuid))}</span>`,
+        surveyTallyHtml(svUuid))}
     `,
     onMount(){
       startGps();
@@ -7481,9 +7631,11 @@ SCREENS.fishMap = (svUuid)=>{
         drawMe('main');
       }, 2000);
 
-      const v = FISH_VIEW[svUuid];
-      const c = v ? [v.lat, v.lon] : envMapCenter(sv, cur);
-      MAPS.main.map = makeMap('fishmap', c, v ? v.zoom : 16, v ? v.bearing : 0);
+      MAP_SPOT = spot;
+      const v = FISH_VIEW[mapViewKey(svUuid, spot)];
+      const c = v ? [v.lat, v.lon] : (spotCenter(spot) || envMapCenter(sv, cur));
+      MAPS.main.map = makeMap('fishmap', c, v ? v.zoom : (spot && !v ? 17 : 16),
+        v ? v.bearing : 0);
       const map = MAPS.main.map;
       if(!map) return;
       applyBaseMap('main', baseMapName());
@@ -7576,7 +7728,8 @@ function fishDelete(u){
   toast('消しました');
   render();
 }
-SCREENS.envMap = (svUuid)=>{
+SCREENS.envMap = (arg)=>{
+  const {sv: svUuid, spot} = mapArg(arg);
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
   envUseSurvey(svUuid);        // 別の調査から持ち越さない
@@ -7584,7 +7737,9 @@ SCREENS.envMap = (svUuid)=>{
   // メッシュの範囲は位置の持ち方が違うので、点・線の並びに混ぜない。
   // 混ぜると、位置の無い点として並んでしまう
   const meshes = all.filter(isMesh);
-  const list = all.filter(x=>!isMesh(x));
+  // 地点（新しい調査の地図で置いたもの）は、ここでは記録として扱わない。
+  // 地点は「大まかにこの辺」の目印で、詳しい記録はこの画面で作る
+  const list = all.filter(x=>!isMesh(x) && !x.is_spot);
   // 選んでいるものが消えていたら、いちばん新しいものにする
   if(ENV_SEL && !list.some(x=>x.uuid===ENV_SEL)) ENV_SEL = null;
   if(!ENV_SEL && list.length) ENV_SEL = list[list.length-1].uuid;
@@ -7609,6 +7764,7 @@ SCREENS.envMap = (svUuid)=>{
          {text:sv.status||'未開始', cls: sv.status==='調査中'?'ok':''},
          {text:`${list.length}件`}],
     html:`
+      ${fromSpotHtml(spot)}
       ${baseMapButtonsHtml()}
       <div id="envmap" class="map"
         style="height:${envMapBig()?'80vh':'46vh'};min-height:260px"></div>
@@ -7676,8 +7832,9 @@ SCREENS.envMap = (svUuid)=>{
       envItemFormWire(cur, sv);
 
       // 地図。前に見ていた場所があればそこへ戻す（勝手に動かさない）
-      const v = ENV_VIEW[svUuid];
-      const c = v ? [v.lat, v.lon] : envMapCenter(sv, cur);
+      MAP_SPOT = spot;
+      const v = ENV_VIEW[mapViewKey(svUuid, spot)];
+      const c = v ? [v.lat, v.lon] : (spotCenter(spot) || envMapCenter(sv, cur));
       MAPS.main.map = makeMap('envmap', c, v ? v.zoom : 17, v ? v.bearing : 0);
       const map = MAPS.main.map;
       if(!map) return;
@@ -7722,14 +7879,15 @@ SCREENS.envMap = (svUuid)=>{
         if(envAddAt(svUuid, la, lo, null)) envSnapTell(sn);
         render();
       });
-      // はじめて開いたときだけ、置いてあるものが入るようにする
-      if(!v){
+      // はじめて開いたときだけ、置いてあるものが入るようにする。
+      // ただし地点から開いたときは、その地点のあたりを出したいので動かさない
+      if(!v && !spot){
         const pts = envAllPoints(svUuid);
         if(pts.length>1){
           try{ map.fitBounds(L.latLngBounds(pts).pad(0.3), {animate:false}); }catch(e){}
         }
-        envRememberView(svUuid);
       }
+      if(!v) envRememberView(svUuid);
     }
   };
 };
