@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v49';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v50';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -4306,6 +4306,7 @@ function spotInfoOf(sv, st){
     section: s.section_name       || sv.section_name       || '',
     site:    s.site_name          || sv.site_name          || '',
     formA:   s.river_morphology_a || sv.river_morphology_a || '',
+    weather: s.weather             || sv.weather             || '',
   };
 }
 /* CSVの1行を組み立てる。c が null なら魚の欄は空のまま（箇所の鍵を調べるときに使う） */
@@ -4316,7 +4317,7 @@ function dbRowOf(sv, st, c, inds){
     '緯度': fixCoord(sv.latitude), '経度': fixCoord(sv.longitude),
     // 何日かにわたる調査では、その箇所の日付を使う。
     // 取り込み側は調査日で調査を分けるので、日ごとに別の調査として入る
-    '調査日': stationDate(st, sv), '季節':sv.season||'', '天気':sv.weather||'',
+    '調査日': stationDate(st, sv), '季節':sv.season||'', '天気':si.weather,
     '水温': numOf(st.water_temp),
     // 代表値は「手入力があればそれ、無ければ測点の平均」
     '水深': cmToM(stationDepth(st, inds).rep),
@@ -4409,6 +4410,7 @@ function buildStationRows(sv, snap){
     return {
       '調査日': stationDate(st, sv), '河川名':sv.river_name||'', '地点名':si.site,
       '区間名':si.section, '河川形態A':si.formA,
+      '天気': si.weather,
       '調査者':sv.investigator||'', '何回目調査':sv.survey_round||'',
       '箇所':st.name||'', '記録のしかた':sv.detail_level||'一般',
       '調べたもの': surveyKind(sv), '環境の取り方': envMethod(st),
@@ -4567,7 +4569,7 @@ function exportFileBase(sv){
 const FS_IND_COLS = ['調査日','河川名','地点名','箇所','種ID','種名',
   '個体番号','全長cm','尾叉長cm','記録した時刻','調査ID','箇所ID','記録ID'];
 
-const FS_STATION_COLS = ['調査日','河川名','地点名','区間名','河川形態A',
+const FS_STATION_COLS = ['調査日','河川名','地点名','区間名','河川形態A','天気',
   '調査者','何回目調査',
   '箇所','記録のしかた',
   '調べたもの','環境の取り方','向き',
@@ -4788,8 +4790,14 @@ function spotInfoHtml(sel, sv){
     <label>河川形態A（セグメント）</label>
     <div onclick="setTimeout(spotInfoSave,0)">
       ${segHtml('spotFormA', OPT.formA, sel.river_morphology_a||'', true)}</div>
-    <div class="dim small">空のままなら、調査ぜんぶの値を使います${
-      A ? `（いまは「${esc(A)}」）` : ''}。調査ぜんぶの値は「くわしい設定」で変えられます。</div>
+    <label>天気</label>
+    <div onclick="setTimeout(spotInfoSave,0)">
+      ${segHtml('spotWeather', OPT.weather, sel.weather||'', true)}</div>
+    <label>メモ</label>
+    <textarea id="sp_memo" onchange="spotInfoSave()">${esc(sel.memo||'')}</textarea>
+    <div class="dim small">この地点の位置は、置いたときに自動で記録されています
+      （${esc(fixCoord(sel.latitude)||'—')}, ${esc(fixCoord(sel.longitude)||'—')}）。
+      空のままの欄は、調査ぜんぶの値を使います${A ? `（河川形態A：${esc(A)}）` : ''}。</div>
     <button class="btn pri" onclick="spotOpen('${sel.uuid}')">${
       esc(sel.name||'この地点')} を開く（魚類調査・物理環境調査）</button>
     <button class="btn ng" onclick="spotRemove('${sel.uuid}')">この地点を削除する</button>
@@ -4801,11 +4809,15 @@ function spotInfoSave(){
   const sel = spotCur(SPOT_SV); if(!sel) return;
   const st = DB.liveStation(sel.uuid); if(!st) return;
   const sec = strVal('#sp_section'), site = strVal('#sp_site'), a = segVal('spotFormA');
+  const w = segVal('spotWeather'), memo = strVal('#sp_memo');
   if((st.section_name||'')===sec && (st.site_name||'')===site
-     && (st.river_morphology_a||'')===a) return;
+     && (st.river_morphology_a||'')===a && (st.weather||'')===w
+     && (st.memo||'')===memo) return;
   st.section_name       = sec;
   st.site_name          = site;
   st.river_morphology_a = a;
+  st.weather            = w;
+  st.memo               = memo;
   if(!DB.upsert(DB.key.st, st)){
     toast('地点情報を保存できませんでした（端末の空き容量をご確認ください）', 8000);
   }
@@ -4929,65 +4941,28 @@ SCREENS.surveyEdit = (svUuid)=>{
       <div id="f_spotInfo">${spotInfoHtml(sel, sv)}</div>
 
       ${foldHtml('svmore', 'くわしい設定', '', `
-        <label>天気</label>
-        ${segHtml('weather', OPT.weather, g('weather'), true)}
-
-        <h3>何を調べますか</h3>
-        <div onclick="setTimeout(onSurveyKind,0)">
-          ${segHtml('kind', OPT.surveyKind, g('survey_kind')||'魚')}</div>
+        <h3 style="margin-top:0">環境の取り方</h3>
+        ${segHtml('envm', OPT.envMethod, g('env_method_default')||'点')}
         <div class="dim small" style="margin-top:8px">
-          <b>魚</b>：獲れた魚を記録します。川の環境もあわせて記録できます。<br>
-          <b>物理環境</b>：川の環境だけを記録します。魚を獲らない日はこちら。
+          <b>点</b>：測点をどんどん打って、水深・流速を拾います。<br>
+          <b>ライン</b>：早瀬・平瀬・淵…を縦断的に区間で区切り、始点と終点を押さえて記録します。<br>
+          <b>メッシュ</b>：範囲に格子を切って、マスごとに詳しく記録します。
         </div>
-
-        <div id="f_detailCard">
-          <h3>記録のしかた</h3>
-          ${segHtml('detail', OPT.detail, g('detail_level')||'一般')}
-          <div class="dim small" style="margin-top:8px">
-            <b>一般</b>：瀬淵ごとに「箇所」を切り、そこで獲れた種と尾数をまとめて記録します。<br>
-            <b>詳細</b>：魚が獲れた場所ごとに「地点」を打ち、その点に種・尾数・体長を付けます。
-          </div>
-          <div class="warnbox">あとから変えると、入力欄の並びが変わります。
-            すでに入れた記録は消えません。</div>
-        </div>
-
-        <div id="f_envCard">
-          <h3>環境の取り方</h3>
-          ${segHtml('envm', OPT.envMethod, g('env_method_default')||'点')}
-          <div class="dim small" style="margin-top:8px">
-            <b>点</b>：測点をどんどん打って、水深・流速を拾います。<br>
-            <b>ライン</b>：早瀬・平瀬・淵…を縦断的に区間で区切り、始点と終点を押さえて記録します。<br>
-            <b>メッシュ</b>：範囲に格子を切って、マスごとに詳しく記録します。
-          </div>
-          <div class="dim small">ここで決めるのは<b>新しく作るときの初期値</b>です。</div>
-        </div>
-
-        <h3>地点情報の既定（この調査ぜんぶ）</h3>
-        <div class="dim small">地点ごとに入れなかったときに使う値です。</div>
-        <label>区間名</label>
-        <input id="f_section" value="${esc(g('section_name'))}">
-        <label>地点名</label>
-        <input id="f_site" value="${esc(g('site_name'))}" placeholder="例）○○橋下流">
-        <label>河川形態A（セグメント）</label>
-        ${segHtml('formA', OPT.formA, g('river_morphology_a'), true)}
-
-        <h3>位置（この調査の代表点）</h3>
-        <div class="dim small">はじめに置いた調査地点の位置が入ります。あとから直せます。</div>
-        <div class="row">
-          <div class="grow"><label>緯度</label>
-            <input id="f_lat" inputmode="decimal" value="${esc(g('latitude'))}"></div>
-          <div class="grow"><label>経度</label>
-            <input id="f_lon" inputmode="decimal" value="${esc(g('longitude'))}"></div>
-        </div>
-        <div class="dim small" id="posInfo">${esc(sv.position_source ? '決め方：'+sv.position_source : '')}</div>
-        <button class="btn sm" onclick="grabPos()">現在地を入れる</button>
-        <div class="dim small">取り込み側は緯度経度で調査をひとまとめにします。桁がばらつくと別々の調査になるため、書き出すときに小数6桁へそろえます。</div>
-
-        <label>既定の調査区分</label>
-        ${segHtml('svtype', OPT.surveyType, g('survey_type_default')||'採取')}
-        <label>メモ</label>
-        <textarea id="f_memo">${esc(g('memo'))}</textarea>
+        <div class="dim small">ここで決めるのは<b>新しく作るときの初期値</b>です。
+          取り方は1つずつ変えられます。</div>
+        <div class="dim small">天気・区間名・地点名・河川形態A・メモは、
+          <b>地点ごと</b>に入れます（上の「▼ 地点情報」）。</div>
       `)}
+
+      <!-- この調査の代表点。地点を置いたときに自動で入る。
+           取り込み側が緯度経度で調査をひとまとめにするので、値は持ち続ける。
+           人が打つものではないので画面には出さない（2026-08-21） -->
+      <div style="display:none">
+        <input id="f_lat" value="${esc(g('latitude'))}">
+        <input id="f_lon" value="${esc(g('longitude'))}">
+        <input id="f_site" value="${esc(g('site_name'))}">
+        <span id="posInfo"></span>
+      </div>
 
       <button class="btn pri" onclick="saveSurvey('${svUuid||''}')">${isNew?'この調査をつくる':'保存する'}</button>
       ${isNew?'':`<button class="btn" onclick="goTo('survey','${svUuid}')">この調査を開く</button>`}
@@ -4998,21 +4973,17 @@ SCREENS.surveyEdit = (svUuid)=>{
       SPOT_SV = svUuid || '';
       window._siteUuid = g('site_uuid') || '';
       onSurveyDate();
-      onSurveyKind();
       const key = 'survey:'+(svUuid||'new');
       const base = collectSurvey();     // 書きかけを戻す前の姿を控える
       const d = draftGet(key);
       if(d){
         applyVals({'#f_date':d.survey_date, '#f_date2':d.survey_date_end,
           '#f_river':d.river_name, '#f_site':d.site_name,
-          '#f_section':d.section_name, '#f_lat':d.latitude, '#f_lon':d.longitude,
+          '#f_lat':d.latitude, '#f_lon':d.longitude,
           '#f_pno':d.project_number, '#f_pname':d.project_name, '#f_inv':d.investigator,
-          '#f_round':d.survey_round, '#f_memo':d.memo});
-        applySeg('season', d.season); applySeg('weather', d.weather);
-        applySeg('formA', d.river_morphology_a); applySeg('svtype', d.survey_type_default);
-        applySeg('detail', d.detail_level);
-        applySeg('kind', d.survey_kind); applySeg('envm', d.env_method_default);
-        onSurveyKind();
+          '#f_round':d.survey_round});
+        applySeg('season', d.season);
+        applySeg('envm', d.env_method_default);
         if(d.site_uuid) window._siteUuid = d.site_uuid;
         toast('書きかけを戻しました');
       }
@@ -5088,18 +5059,14 @@ SCREENS.surveyEdit = (svUuid)=>{
 function collectSurvey(){
   return {
     survey_date: strVal('#f_date'), survey_date_end: strVal('#f_date2'),
-    season: segVal('season'), weather: segVal('weather'),
+    season: segVal('season'),
     river_name: strVal('#f_river'), site_name: strVal('#f_site'),
-    section_name: strVal('#f_section'), river_morphology_a: segVal('formA'),
     latitude: strVal('#f_lat'), longitude: strVal('#f_lon'),
     project_number: strVal('#f_pno'), project_name: strVal('#f_pname'),
     investigator: strVal('#f_inv'), survey_round: strVal('#f_round'),
-    survey_type_default: segVal('svtype'),
-    detail_level: segVal('detail'),
-    survey_kind: segVal('kind'), env_method_default: segVal('envm'),
+    env_method_default: segVal('envm'),
     // 選ぶボタンは文字しか返さないので、選んだ地点のIDは別に覚えておく
     site_uuid: (window._siteUuid || ''),
-    memo: strVal('#f_memo'),
   };
 }
 let SVMARK = null, SVSITES = [];
@@ -5112,12 +5079,9 @@ function sitePickHtml(river, chosen){
     `<button type="button" class="${x.uuid===chosen?'on':''}"
       onclick="pickSurveySite(this,'${x.uuid}')">${esc(x.name)}</button>`).join('') + `</div>`;
 }
-/* 調査の位置を地図に描く */
-function surveyDrawPos(lat, lon){
-  const map = MAPS.main.map; if(!map) return;
-  if(SVMARK){ try{ map.removeLayer(SVMARK); }catch(e){} }
-  SVMARK = L.marker([lat,lon], {icon:dotIcon('#f0883e',16)}).addTo(map);
-}
+/* この調査の代表点は、はじめに置いた地点の位置をそのまま使う。
+   地点の印と重なって紛らわしいので、地図には別の印を描かない（2026-08-21） */
+function surveyDrawPos(){}
 /* 登録した地点（緑の丸）と、過去の調査地点（薄い青）を出す */
 function surveyDrawSites(){
   const map = MAPS.main.map; if(!map) return;
@@ -5175,15 +5139,6 @@ function pickSurveySite(btn, uu){
   useSite(uu);
 }
 
-/* 「何を調べますか」で出す欄を入れ替える。
-   画面ごと作り直すと、書きかけや地図が巻き添えになるので、見せ方だけ変える */
-function onSurveyKind(){
-  const env = segVal('kind')==='物理環境';
-  const d = $('#f_detailCard'), e = $('#f_envCard');
-  if(d) d.style.display = env ? 'none' : '';
-  if(e) e.style.display = env ? '' : 'none';
-  draftTouch();
-}
 function onSurveyDate(){
   const s = seasonOf(strVal('#f_date'));
   const wrap = $('#f_season_wrap');
@@ -5197,20 +5152,6 @@ function onSurveyDate(){
       : '';
   }
   draftTouch();      // 入れ直した季節も控える
-}
-function grabPos(){
-  toast('現在地を取っています…');
-  getFixOnce(f=>{
-    if(!f){ toast('現在地を取れませんでした'); return; }
-    const la=$('#f_lat'), lo=$('#f_lon');
-    if(la) la.value = f.lat.toFixed(6);
-    if(lo) lo.value = f.lon.toFixed(6);
-    const el=$('#posInfo');
-    if(el) el.textContent = `決め方：GPS（精度およそ${Math.round(f.acc)}m）`;
-    window._posSource = 'GPS'; window._posAcc = f.acc;
-    draftTouch();      // 差し込んだ緯度経度は input が起きないので、自分で控える
-    toast('現在地を入れました');
-  });
 }
 function saveSurvey(svUuid){
   spotInfoSave();     // ▼地点情報に打ちかけがあれば、先に書く
@@ -5258,11 +5199,14 @@ function saveSurvey(svUuid){
     ['調査面積（手入力）', f.survey_area_m2_manual, 0, 100000000]]);
   if(rerr){ toast(rerr, 6000); return; }
   rec.season             = f.season;
-  rec.weather            = f.weather;
   rec.river_name         = f.river_name;
   rec.site_name          = f.site_name;
-  rec.section_name       = f.section_name;
-  rec.river_morphology_a = f.river_morphology_a;
+  // 天気・区間名・河川形態A・調査区分・メモは、地点ごとに入れる形にしたので
+  // 調査の設定から欄を外した。取れないときは、いまの値をそのまま残す（2026-08-21）
+  if(f.weather !== undefined)            rec.weather            = f.weather;
+  if(f.section_name !== undefined)       rec.section_name       = f.section_name;
+  if(f.river_morphology_a !== undefined) rec.river_morphology_a = f.river_morphology_a;
+  if(f.memo !== undefined)               rec.memo               = f.memo;
   rec.latitude           = numOf(f.latitude);
   rec.longitude          = numOf(f.longitude);
   if(window._posSource){ rec.position_source = window._posSource; rec.gps_accuracy = window._posAcc; }
@@ -5270,14 +5214,19 @@ function saveSurvey(svUuid){
   rec.project_name       = f.project_name;
   rec.investigator       = f.investigator;
   rec.survey_round       = f.survey_round;
-  rec.survey_type_default= f.survey_type_default || '採取';
-  rec.detail_level       = f.detail_level || '一般';
-  rec.survey_kind        = f.survey_kind === '物理環境' ? '物理環境' : '魚';
+  rec.survey_type_default= f.survey_type_default || rec.survey_type_default || '採取';
+  // 「何を調べますか」と「記録のしかた」は、調査の設定から欄を外した（2026-08-21）。
+  // 地点ごとに魚類調査と物理環境調査のどちらへも入れるようになったため。
+  // 画面から取れないときは、いまの値をそのまま残す。
+  // ここで既定へ倒すと、前に作った「物理環境の調査」や「詳細」が黙って作り替わる
+  rec.detail_level       = f.detail_level || rec.detail_level || '一般';
+  rec.survey_kind        = f.survey_kind
+    ? (f.survey_kind === '物理環境' ? '物理環境' : '魚')
+    : (rec.survey_kind || '魚');
   rec.env_method_default = f.env_method_default || '点';
   // 物理環境の調査に「詳細」は無い。詳細は魚を点ごとに記録するための形
   if(rec.survey_kind === '物理環境') rec.detail_level = '一般';
   if(f.site_uuid) rec.site_uuid = f.site_uuid;
-  rec.memo               = f.memo;
   if(!rec.river_name && !rec.site_name){ toast('河川名か地点名のどちらかは入れてください'); return; }
   const ok = DB.upsert(DB.key.sv, rec);
   if(!ok) return;                       // 保存できていないので画面も動かさない
@@ -5330,7 +5279,9 @@ SCREENS.surveyHub = (svUuid)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
   const 単位あり = DB.stationsOf(svUuid).some(x=>unitKindOf(x));
-  const stations = DB.stationsOf(svUuid);
+  // 一覧に並べるのは地点だけ。物理環境の測点や、地図の単位（E・P/F・P）は
+  // それぞれの地図の画面で見る（混ぜると、測点を置くたびに箇所が増えて見える）
+  const stations = isEnvSurvey(sv) ? DB.stationsOf(svUuid) : spotList(svUuid);
   // 「記録中」は、いま現場にいるときだけの言い方。
   // あとから書き起こしているときに「記録中」と出ると、何かが動いている誤解になる。
   // 詳細（点を打つ形）では、点に「途中」という状態が無いので使わない
