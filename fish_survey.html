@@ -1168,7 +1168,10 @@ const SPECIES_STAMP = {n:101, sha:"d7be0336f474"};
   直す('FW050', 'サクラマス');
   後に足す('FW050', {id:'FW050J', ja:'ヤマメ', fam:'サケ科'});
   後に足す('FW044', {id:'FW044J', ja:'サケ稚魚', fam:'サケ科'});
-  SPECIES_ALIAS['ヤマメ'] = 'FW050J';           // これまでは FW050（親と同じ）だった
+  // 「ヤマメ」「サクラマス」は正式な和名になったので、別名からは外す
+  //（名前そのもので見つかる。別名に残すと、正式な和名を横取りしてしまう）
+  delete SPECIES_ALIAS['ヤマメ'];
+  delete SPECIES_ALIAS['サクラマス'];
   SPECIES_ALIAS['サクラマス稚魚'] = 'FW050J';
   SPECIES_ALIAS['サクラマス（ヤマメ）'] = 'FW050';
   SPECIES_ALIAS['サケの稚魚'] = 'FW044J';
