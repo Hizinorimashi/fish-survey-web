@@ -12,6 +12,14 @@
   --bg:#0a0e14; --panel:#141b25; --panel2:#1b2430; --line:#2b3644;
   --fg:#e6edf5; --dim:#93a2b5; --accent:#4aa3ff; --ok:#3fb950; --warn:#d29922; --ng:#f85149;
 }
+/* 屋外モード（明るい表示）。晴天の川原で、暗い画面が反射して読めない対策
+   （2026-08-23 の実機の声・鳥アプリから） */
+html.light{
+  --bg:#f2f5f9; --panel:#ffffff; --panel2:#e9eef4; --line:#c9d3de;
+  --fg:#101826; --dim:#54637a; --accent:#0b6bcb; --ok:#1a7f37; --warn:#8a5a00; --ng:#c62828;
+}
+html.light .map, html.light .leaflet-container{background:#dde5ee}
+html.light .mediathumb{background:#dde5ee}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
   font-family:system-ui,-apple-system,"Segoe UI","Hiragino Sans","Noto Sans JP",sans-serif;
@@ -89,6 +97,8 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .ngbox{background:#2a1414;border:1px solid #5c2626;color:#ffb4ad;border-radius:8px;padding:10px;font-size:13px;margin:10px 0}
 .mediagrid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px}
 .photogrid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.mediajump{position:absolute;left:4px;bottom:4px;border:0;border-radius:6px;
+  background:rgba(0,0,0,.55);color:#fff;font-size:11px;padding:3px 7px}
 .mediathumb{position:relative;aspect-ratio:1/1;border-radius:8px;overflow:hidden;background:#1a1d22}
 .mediathumb img{width:100%;height:100%;object-fit:cover;display:block}
 .mediadel{position:absolute;top:2px;right:2px;width:26px;height:26px;border:0;border-radius:13px;
@@ -132,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v98';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v99';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -457,6 +467,15 @@ function tombstoneAdd(u){
   try{ localStorage.setItem('fs_tombstones', JSON.stringify(a)); return true; }catch(e){ return false; }
 }
 
+/* 表示のモード（屋外＝明るい）。端末ごとの好み */
+function themeMode(){ try{ return localStorage.getItem('fs_theme')||''; }catch(e){ return ''; } }
+function themeApply(){
+  document.documentElement.classList.toggle('light', themeMode()==='light');
+}
+function toggleTheme(){
+  try{ localStorage.setItem('fs_theme', themeMode()==='light' ? '' : 'light'); }catch(e){}
+  themeApply(); render();
+}
 /* ---------- 端末ごとの好み（記録ではないので門を通さない） ---------- */
 function prefs(){ try{ return JSON.parse(localStorage.getItem('fs_prefs')||'{}')||{}; }catch(e){ return {}; } }
 function prefSet(k,v){ const p=prefs(); p[k]=v; try{ localStorage.setItem('fs_prefs', JSON.stringify(p)); }catch(e){} }
@@ -5527,6 +5546,8 @@ SCREENS.home = ()=>{
         </div>
         <button class="btn" onclick="nav('check',null)">データ点検</button>
       `)}
+      <button class="btn" onclick="toggleTheme()">${themeMode()==='light'
+        ? '通常（暗い表示）に戻す' : '屋外モード（明るい表示）にする'}</button>
       <div class="hr"></div>
       <div class="card">
         <div class="row">
@@ -9093,17 +9114,32 @@ function galleryOwners(){
       DB.loadRaw(DB.key[kk]).forEach(x=>{
         if(!x || x.deleted_at) return;
         const sv = x.survey_uuid || (kk==='sv' ? x.uuid : '');
-        photoIdsOf(x).forEach(id=>{ if(!own[id]) own[id] = sv || ''; });
+        photoIdsOf(x).forEach(id=>{
+          if(!own[id]) own[id] = {sv: sv||'', kind: kk, uuid: x.uuid};
+        });
       });
     });
   }catch(e){}
   return own;
 }
+/* 写真から、その写真が付いている記録を開く（2026-08-23 の実機の声・鳥アプリから） */
+function galJump(id){
+  const o = galleryOwners()[id];
+  if(!o){ toast('この写真が付いている記録が見つかりません', 6000); return; }
+  if(o.kind === 'ca'){ nav('catchEdit', {uuid: o.uuid}); return; }
+  if(o.kind === 'st'){ mapOpenRecord(o.uuid); return; }
+  if(o.kind === 'ind'){
+    const r = DB.get(DB.key.ind, o.uuid);
+    if(r && r.catch_uuid){ nav('catchEdit', {uuid: r.catch_uuid}); return; }
+  }
+  if(o.sv){ goTo('survey', o.sv); return; }
+  toast('この記録は開けませんでした', 6000);
+}
 function galSetSv(v){ GAL_SV = v; GAL_PAGE = 0; render(); }
 function galSetPage(p){ GAL_PAGE = p; render(); }
 SCREENS.gallery = ()=>{
   const own = galleryOwners();
-  const ids = Object.keys(own).filter(id=>!GAL_SV || own[id]===GAL_SV);
+  const ids = Object.keys(own).filter(id=>!GAL_SV || own[id].sv===GAL_SV);
   const svs = DB.surveys().slice()
     .sort((a,b)=>String(b.survey_date||'').localeCompare(String(a.survey_date||'')));
   const pages = Math.max(1, Math.ceil(ids.length / GAL_PER));
@@ -9139,7 +9175,8 @@ SCREENS.gallery = ()=>{
         const url = URL.createObjectURL(r.blob);
         mine.push(url);
         parts.push(`<div class="mediathumb"><img src="${url}" alt="写真"
-          onclick="viewPhoto('${id}')"></div>`);
+            onclick="viewPhoto('${id}')">
+          <button class="mediajump" onclick="galJump('${id}')">記録へ</button></div>`);
       }
       if(screenStale(gen)){
         mine.forEach(u=>{ try{ URL.revokeObjectURL(u); }catch(e){} });
@@ -13051,6 +13088,7 @@ function doForceUpdate(){
    起動
    ============================================================ */
 function boot(){
+  themeApply();        // 表示のモード（屋外＝明るい）を、描く前に当てる
   render();            // 先に画面を出す。保存領域の準備を待つと白いままになる
   claimLock();
   startGps();
