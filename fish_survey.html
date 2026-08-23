@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v107';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v108';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -7553,9 +7553,14 @@ const 移す欄 = ['gears','effort_seconds','effort_started_at','effort_passes',
 function unitMoveOwn(親uuid, 子uuid){
   // 1つの入れ物につき1回の保存にまとめる。別々に保存すると、
   // 途中で失敗したとき親と子の両方に値が残る（監査71回目 Minor）
-  let sts, cas;
-  try{ sts = DB.loadRaw(DB.key.st); cas = DB.loadRaw(DB.key.ca); }
-  catch(e){ return false; }
+  let sts, cas, 元st, 元ca;
+  try{
+    sts = DB.loadRaw(DB.key.st); cas = DB.loadRaw(DB.key.ca);
+    // 戻すための写しは、書き換える前に取る。書き換えたあとに読み直しても、
+    // それは移動後の姿でしかない（監査72回目 Major）
+    元st = JSON.parse(JSON.stringify(sts));
+    元ca = JSON.parse(JSON.stringify(cas));
+  }catch(e){ return false; }
   const 親 = sts.find(x=>x && x.uuid===親uuid);
   const 子 = sts.find(x=>x && x.uuid===子uuid);
   if(!親 || !子) return false;
@@ -7573,9 +7578,10 @@ function unitMoveOwn(親uuid, 子uuid){
   });
   if(!DB.save(DB.key.st, sts)) return false;
   if(!DB.save(DB.key.ca, cas)){
-    // 魚を書けなかったら、箇所も元へ（読み直して戻す）
-    try{ DB.save(DB.key.st, DB.loadRaw(DB.key.st)); }catch(e){}
-    return false;
+    // 魚を書けなかったら、箇所を「変更前の写し」で戻す
+    let 戻せた = false;
+    try{ 戻せた = DB.save(DB.key.st, 元st); }catch(e){}
+    return 戻せた ? false : 'broken';
   }
   return true;
 }
@@ -7602,9 +7608,13 @@ function fishClosePoly(svUuid){
       toast(断り, 10000);
       return false;
     }
-    if(!unitMoveOwn(親.uuid, st.uuid)){
-      toast('移せませんでした（端末の空き容量をご確認ください）。'
-        + 'そのままにしてあります', 9000);
+    const 移し = unitMoveOwn(親.uuid, st.uuid);
+    if(移し !== true){
+      toast(移し === 'broken'
+        ? '移す途中で書けなくなり、半端な状態になっています。'
+          + '「データ点検」を開いてご確認ください'
+        : '移せませんでした（端末の空き容量をご確認ください）。'
+          + 'そのままにしてあります', 10000);
       return false;
     }
     toast(`${親.name} の${何}を ${st.name} へ移しました`, 6000);
@@ -8271,6 +8281,26 @@ function trashPurgeMany(list){
       return false;
     }
   }
+  // 消す前に、墓標をまとめて書く（監査72回目 Minor）。
+  // あとから書くと、書けなかったとき「消えたのに墓標が無い」＝合成で復活する。
+  // 消すのに失敗したら、墓標も元へ戻す
+  const 元の墓標 = localStorage.getItem('fs_tombstones') || '[]';
+  {
+    const a = tombstones();
+    const ある = new Set(a.map(t=>t.uuid));
+    const t = nowISO();
+    Object.keys(消す).forEach(kk=>{
+      消す[kk].forEach(u=>{ if(!ある.has(u)){ a.push({uuid:u, at:t}); ある.add(u); } });
+    });
+    let 書けた = false;
+    try{ localStorage.setItem('fs_tombstones', JSON.stringify(a)); 書けた = true; }
+    catch(e){}
+    if(!書けた){
+      toast('完全に消せませんでした（消した印を書けません）。'
+        + '端末の空き容量をご確認ください。記録はそのままです', 10000);
+      return false;
+    }
+  }
   const 書いた = [];
   for(const kk of Object.keys(元)){
     if(!消す[kk] || !消す[kk].size) continue;
@@ -8283,6 +8313,7 @@ function trashPurgeMany(list){
         try{ if(!DB.save(DB.key[PURGE_BOX[k2]], 元[k2])) 戻せた = false; }
         catch(e){ 戻せた = false; }
       });
+      try{ localStorage.setItem('fs_tombstones', 元の墓標); }catch(e){ 戻せた = false; }
       toast(戻せた
         ? '完全に消せませんでした（端末の空き容量をご確認ください）。記録はそのままです'
         : '完全に消せませんでした。しかも元に戻せず、一部だけ消えたままです。'
@@ -8291,9 +8322,6 @@ function trashPurgeMany(list){
     }
     書いた.push(kk);
   }
-  // 消したことを墓標に残す。残さないと、ほかの端末との合成で戻ってくる
-  //（2026-08-23・合成同期のため）
-  Object.keys(消す).forEach(kk=>{ 消す[kk].forEach(u=>tombstoneAdd(u)); });
   toast('完全に消しました');
   return true;
 }
@@ -8664,8 +8692,14 @@ function cloudCheck(text){
         return {ok:false, why:'墓標の形がちがいます'};
       }
       if(!safeId(t.uuid)) return {ok:false, why:'墓標のIDの形がちがいます'};
-      if(t.at !== undefined && (typeof t.at !== 'string' || t.at.length > 40)){
-        return {ok:false, why:'墓標の日時の形がちがいます'};
+      if(t.at !== undefined && t.at !== ''){
+        // 「zzzz」のような文字は、どのISO日時よりも新しい扱いになり、
+        // 生きている記録を消させられる（監査72回目 Major）。本物の日時だけ通す
+        if(typeof t.at !== 'string'
+           || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/.test(t.at)
+           || isNaN(Date.parse(t.at))){
+          return {ok:false, why:'墓標の日時の形がちがいます'};
+        }
       }
     }
   }
@@ -8719,10 +8753,23 @@ function cloudApply(data, 新しい墓標){
     }
   }
   // 墓標も控えのものへ置き換える。古い墓標が残っていると、
-  // いま戻した記録が、次の合成でまた消える（監査71回目 Major）
+  // いま戻した記録が、次の合成でまた消える（監査71回目 Major）。
+  // 書けなければ、記録も元へ戻して失敗にする（監査72回目 Major）
   if(新しい墓標 !== undefined){
+    let 書けた = false;
     try{ localStorage.setItem('fs_tombstones',
-      JSON.stringify(Array.isArray(新しい墓標) ? 新しい墓標 : [])); }catch(e){}
+      JSON.stringify(Array.isArray(新しい墓標) ? 新しい墓標 : [])); 書けた = true; }
+    catch(e){}
+    if(!書けた){
+      let 戻せた = true;
+      CLOUD_KEYS.forEach(kk=>{
+        try{ if(!DB.save(DB.key[kk], 元[kk])) 戻せた = false; }catch(e){ 戻せた = false; }
+      });
+      toast(戻せた
+        ? '戻せませんでした（消した印を書けません）。いまの記録はそのままです'
+        : '戻せませんでした。しかも元にも戻せず、一部が書き換わったままです', 12000);
+      return false;
+    }
   }
   打ちかけを捨てる();     // ぜんぶ置き換えられたときだけ
   // 写真の「付ける先」の印も片付ける。残すと、置き換えたあとの画面で
@@ -9013,24 +9060,38 @@ async function cloudSave(opt){
     const q = encodeURIComponent("name='"+GD_FILE+"' and '"+folder+"' in parents and trashed=false");
     const list = await gdFetch('drive/v3/files?spaces=drive&fields=files(id,modifiedTime)&q='+q, {}, token);
     let id = (list.files && list.files.length) ? list.files[0].id : '';
-    // 別の端末が保存した控えを、知らずに上書きしない（監査71回目 Critical）。
-    // 「この端末が最後に書いたときの、ドライブ側の時刻」を控えておき、
-    // いまのドライブの時刻と食い違っていたら、丸ごと置き換えをやめて合成を促す
+    // 別の端末が保存した控えを、知らずに上書きしない（監査71・72回目 Critical）。
+    // 「この端末が最後に見た、ドライブ側の時刻」（合成の直後は opt.expectMtime）と
+    // 照合し、食い違っていたら丸ごと置き換えをやめて合成を促す。
+    // 基準が無い（この端末で初めて）のに控えがあるのも、知らない控えなので同じ扱い
+    const 基準 = (opt && opt.expectMtime !== undefined)
+      ? String(opt.expectMtime||'')
+      : (localStorage.getItem('fs_gdrive_mtime') || '');
     const いまの時刻 = id ? String((list.files[0].modifiedTime)||'') : '';
-    const 控えた時刻 = localStorage.getItem('fs_gdrive_mtime') || '';
-    if(id && 控えた時刻 && いまの時刻 && 控えた時刻 !== いまの時刻 && !(opt && opt.force)){
-      言う('別の端末がドライブへ保存しています。上書きすると、その端末の記録が消えます。'
+    if(id && (!基準 || 基準 !== いまの時刻) && !(opt && opt.force)){
+      言う('ドライブに、この端末が知らない控えがあります。上書きすると消えます。'
         + '先に「ドライブと合成する」を押してください', 12000);
-      if(自動) return;                 // 自動は静かに見送る（次の合成で合わさる）
-      if(!confirm('別の端末が保存した控えがドライブにあります。\n'
+      if(自動) return 'conflict';       // 自動は静かに見送る（次の合成で合わさる）
+      if(!confirm('ドライブに、この端末がまだ取り込んでいない控えがあります。\n'
         + '「OK」＝それを消して、この端末の記録で上書きする\n'
-        + '「キャンセル」＝やめる（先に「ドライブと合成する」がおすすめ）')) return;
+        + '「キャンセル」＝やめる（先に「ドライブと合成する」がおすすめ）')) return 'conflict';
     }
     if(!id){
       const made = await gdFetch('drive/v3/files?fields=id', {method:'POST',
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify({name:GD_FILE, parents:[folder]})}, token);
       id = made.id;
+    }else if(!(opt && opt.force)){
+      // 書く直前に、もう一度だけ時刻を見る。確認との間に別の端末が
+      // 書き込む隙間を、できるだけ小さくする（ドライブは「書く条件」を
+      // 付けられないため、完全にはふさげない。監査72回目 Critical への手当て）
+      try{
+        const again = await gdFetch('drive/v3/files/'+id+'?fields=modifiedTime', {}, token);
+        if(String((again && again.modifiedTime)||'') !== いまの時刻){
+          言う('いままさに別の端末が保存しました。先に「ドライブと合成する」を押してください', 10000);
+          return 'conflict';
+        }
+      }catch(e){}
     }
     const 書けた = await gdFetch('upload/drive/v3/files/'+id+'?uploadType=media&fields=id,modifiedTime',
       {method:'PATCH', headers:{'Content-Type':'application/json'}, body:text}, token);
@@ -9043,11 +9104,14 @@ async function cloudSave(opt){
       + (写真.全部 > 0 ? `（写真 ${写真.全部}枚のうち、新しい ${写真.送った}枚を預けました`
           + (写真.失敗 > 0 ? `／${写真.失敗}枚は預けられませんでした` : '') + '）'
         : (写真.全部 < 0 ? '（写真は預けられませんでした）' : '')), 8000);
+    if(!自動) render();
+    return 'ok';
   }catch(e){
     言う('保存できませんでした：' + ((e && e.message) || e), 10000);
   }
   // 自動のときは画面を作り直さない。打っている最中の欄が消える（監査71回目 Major）
   if(!自動) render();
+  return 'error';
 }
 /* ---- ドライブと合成（2台で使うとき） ----
    ドライブの控えと手元の記録を、記録ごとに「新しい操作をした方」で合わせる。
@@ -9130,10 +9194,9 @@ async function cloudMerge(){
         + list.files[0].id + '?alt=media', {headers:{Authorization:'Bearer '+token}});
       if(!r.ok) throw new Error('ドライブ ' + r.status);
       remote = JSON.parse(await r.text());
-      // いま読んだ控えの時刻を控える。控えないと、このあとの送り返しが
-      // 「別の端末が保存した」と勘違いして止まる
-      try{ localStorage.setItem('fs_gdrive_mtime',
-        String(list.files[0].modifiedTime||'')); }catch(e){}
+      // いま読んだ時刻は、手元へ持つだけ。先に控えると、確認を取り消したのに
+      // 「合成済み」の顔をして、次の自動保存が上書きしてしまう（監査72回目 Critical）
+      remote.__mtime = String(list.files[0].modifiedTime||'');
     }
   }catch(e){
     toast('ドライブの控えを読めませんでした（' + (e && e.message || '') + '）', 9000);
@@ -9144,8 +9207,10 @@ async function cloudMerge(){
     if(confirm('ドライブにまだ控えがありません。いまの記録を保存しますか？')) cloudSave();
     return;
   }
+  // 墓標も一緒に検査へ渡す。落とすと、検査済みの墓標が常に空になり、
+  // 別の端末で消した記録が合成で復活してしまう（監査72回目 Critical）
   const 検査 = cloudCheck(JSON.stringify({app:remote.app, version:remote.version,
-    saved_at:remote.saved_at, data:remote.data}));
+    saved_at:remote.saved_at, data:remote.data, tombstones:remote.tombstones}));
   if(!検査.ok){
     toast('ドライブの控えが戻せない形です（' + 検査.why + '）。合成をやめました', 10000);
     return;
@@ -9185,13 +9250,29 @@ async function cloudMerge(){
       return;
     }
   }
-  try{ localStorage.setItem('fs_tombstones', JSON.stringify(m.tombs)); }catch(e){}
+  // 墓標も、記録と同じ「1つのまとまり」として書く。
+  // 書けなければ、記録も元へ戻す（監査72回目 Major）
+  const 元の墓標 = localStorage.getItem('fs_tombstones') || '[]';
+  let 墓標書けた = false;
+  try{ localStorage.setItem('fs_tombstones', JSON.stringify(m.tombs)); 墓標書けた = true; }
+  catch(e){}
+  if(!墓標書けた){
+    let 戻せた = true;
+    CLOUD_KEYS.forEach(kk=>{
+      try{ if(!DB.save(DB.key[kk], 元[kk])) 戻せた = false; }catch(e){ 戻せた = false; }
+    });
+    toast(戻せた
+      ? '合成できませんでした（消した印を書けません）。記録はそのままです'
+      : '合成できませんでした。しかも元に戻せず、一部が書き換わったままです', 12000);
+    return;
+  }
   // 親子と代表の位置を、合わせた結果から決め直す
   try{
     DB.surveys().forEach(sv=>{ unitRelink(sv.uuid); spotPosFix(sv.uuid); });
   }catch(e){}
   toast('合成しました。ドライブへも送り返します…', 6000);
-  try{ await cloudSave({auto:true}); }catch(e){}
+  let 送り = 'error';
+  try{ 送り = await cloudSave({auto:true, expectMtime: remote.__mtime || ''}); }catch(e){}
   // 手元に実体の無い写真を、ドライブから取り寄せる
   try{
     const token = await gdGetToken();
@@ -9203,7 +9284,14 @@ async function cloudMerge(){
     }
   }catch(e){}
   reset('home');
-  toast('合成が終わりました', 6000);
+  if(送り === 'ok') toast('合成が終わりました', 6000);
+  else if(送り === 'conflict'){
+    toast('手元は合成できましたが、その間に別の端末がまた保存したため、'
+      + 'ドライブへは送っていません。もう一度「ドライブと合成する」を押してください', 12000);
+  }else{
+    toast('手元は合成できましたが、ドライブへ送り返せませんでした。'
+      + 'あとで「ドライブに保存する」を押してください', 12000);
+  }
 }
 
 async function cloudRestore(){
@@ -9233,6 +9321,10 @@ async function cloudRestore(){
       + `${控え}件）で、いまの記録（${いま}件）を置き換えます。\n`
       + 'いまの記録は消えます。よろしいですか？')) return;
     if(cloudApply(中.data, 中.tombstones)){
+      // いま戻した控えを「この端末が知っている控え」として控える。
+      // 控えないと、次の保存が「知らない控えがある」と止まる（監査72回目 Critical）
+      try{ localStorage.setItem('fs_gdrive_mtime',
+        String(list.files[0].modifiedTime||'')); }catch(e){}
       let 写真 = {戻した:0, 足りない:0}, 写真の失敗 = '';
       try{ 写真 = await cloudRestorePhotos(token, folder); }
       catch(e){ 写真の失敗 = (e && e.message) || String(e); }
@@ -9817,7 +9909,7 @@ function repairScan(){
         if(seen[kk]) out.重なり++; else seen[kk] = 1;
       });
     }
-    const st = {}, ca = {};
+    const st = Object.create(null), ca = Object.create(null);
     DB.loadRaw(DB.key.st).forEach(x=>{ if(x && x.uuid) st[x.uuid] = x; });
     DB.loadRaw(DB.key.ca).forEach(x=>{ if(x && x.uuid) ca[x.uuid] = x; });
     // ごみ箱の中の分は数えない（修復でごみ箱へ移した分が、また数えられてしまう）
@@ -9912,24 +10004,31 @@ function repairRun(){
       }
     }
     // 迷子の魚の記録・1尾ずつ → ごみ箱へ（消さない。人が見て決められる）
-    const st = {}, ca2 = {};
+    const st = Object.create(null), ca2 = Object.create(null);
     DB.loadRaw(DB.key.st).forEach(x=>{ if(x && x.uuid) st[x.uuid] = x; });
     DB.loadRaw(DB.key.ca).forEach(x=>{ if(x && x.uuid) ca2[x.uuid] = x; });
+    let 書けない = false;
     DB.loadRaw(DB.key.ca).forEach(x=>{
+      if(書けない) return;
       if(x && x.uuid && !x.deleted_at && (!x.station_uuid || !st[x.station_uuid])){
-        DB.softDelete(DB.key.ca, x.uuid); 直した++;
+        if(!DB.softDelete(DB.key.ca, x.uuid)){ 書けない = true; return; }
+        直した++;
       }
     });
+    if(書けない){ 戻す(); return; }
     DB.loadRaw(DB.key.ind).forEach(x=>{
+      if(書けない) return;
       if(x && x.uuid && !x.deleted_at && (!x.catch_uuid || !ca2[x.catch_uuid])){
-        DB.softDelete(DB.key.ind, x.uuid); 直した++;
+        if(!DB.softDelete(DB.key.ind, x.uuid)){ 書けない = true; return; }
+        直した++;
       }
     });
+    if(書けない){ 戻す(); return; }
     // 切れたつながりを外す
     let a2; try{ a2 = DB.loadRaw(DB.key.st); }catch(e){ a2 = null; }
     if(a2){
       let 変えた = false;
-      const st2 = {};
+      const st2 = Object.create(null);
       a2.forEach(x=>{ if(x && x.uuid) st2[x.uuid] = x; });
       a2.forEach(x=>{
         if(!x) return;
