@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v110';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v111';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -9319,7 +9319,9 @@ async function cloudMerge(){
     + '\nよろしいですか？')) return;
   // 除く分の中身を、先に端末へ控える（黙って失わない。監査71回目 Critical）。
   // 控えられないときは、合成をやめる
-  if((m.控え||[]).length && !repairBackupPush(m.控え)){
+  // 控えは「種類＋中身」の形でそろえる。形が違うと、点検の行数に出ず、
+  // ごみ箱として戻すこともできない（監査75回目 Major・つなぎ忘れ）
+  if((m.控え||[]).length && !repairBackupPush({種類:'合成で除いた行', 中身:m.控え})){
     toast('除く分の控えを取れなかったため、合成をやめました。'
       + '端末の空き容量をご確認ください', 10000);
     return;
@@ -9395,11 +9397,17 @@ async function cloudRestore(){
     const token = await gdGetToken();
     const folder = await gdFolder(token);
     const 全部 = await cloudFetchAll(token, folder);
-    if(!全部.合わせ){
+    if(!全部.合わせ && !全部.読めない){
       toast('ドライブに控えがありませんでした', 8000); return;
     }
     if(全部.読めない){
-      toast('読めない控えが ' + 全部.読めない + 'ファイルありました（飛ばして続けます）', 8000);
+      // 「戻す」は丸ごと置き換え。1ファイルでも読めていないと、
+      // その端末だけにあった記録を消してしまう（監査75回目 Major）。
+      // 足す方向の「合成」とは違い、ここでは中止する
+      toast('控えのうち ' + 全部.読めない + 'ファイルを読めませんでした。'
+        + '欠けたまま置き換えると記録が消えるため、戻すのをやめました。'
+        + '電波の良いところでもう一度お試しください', 12000);
+      return;
     }
     const 中 = normalizeDataset(全部.合わせ);
     const いま = CLOUD_KEYS.reduce((a,k)=>a + DB.load(DB.key[k]).length, 0);
@@ -10063,7 +10071,9 @@ function repairBackupRestore(){
   });
   const t = nowISO();
   a.forEach(entry=>{
-    const 中身 = entry && entry.記録 && entry.記録.中身;
+    // v110の途中までは、合成の控えが生の配列で入っていた。その形も読む
+    let 中身 = entry && entry.記録 && entry.記録.中身;
+    if(!Array.isArray(中身) && Array.isArray(entry && entry.記録)) 中身 = entry.記録;
     if(!Array.isArray(中身)) return;    // 丸ごとの控えは「書き出し」でだけ扱う
     中身.forEach(row=>{
       if(!row || !row.k || !row.rec || !CLOUD_KEYS.includes(row.k)){ 札なし++; return; }
@@ -10240,7 +10250,8 @@ SCREENS.check = ()=>{
         const a = repairBackupList();
         if(!a.length) return '';
         const 行数 = a.reduce((n,e)=>{
-          const 中 = e && e.記録 && e.記録.中身;
+          let 中 = e && e.記録 && e.記録.中身;
+          if(!Array.isArray(中) && Array.isArray(e && e.記録)) 中 = e.記録;
           return n + (Array.isArray(中) ? 中.length : 0);
         }, 0);
         return `<div class="card">
