@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v118';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v119';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2784,9 +2784,17 @@ function unitRelink(svUuid){
   // 親が「子のいる入れ物」に見えて、箇所数が減る（監査63回目 Major）
   const 対象 = この調査.filter(unitReady);
   let 変わった = false;
+  const 直した時 = nowISO();
   この調査.forEach(st=>{
     const 親 = unitReady(st) ? unitParentOf(st, 対象) : '';
-    if((st.parent_uuid||'') !== 親){ st.parent_uuid = 親; 変わった = true; }
+    if((st.parent_uuid||'') !== 親){
+      st.parent_uuid = 親;
+      // 直した結び付きは、時刻も進めて保存する。進めないと、合成のとき
+      // 他の端末に残る古い写し（消した囲いを親に指したまま）が選ばれ直し、
+      // その囲いの完全削除に子まで巻き込まれる（監査83回目 Critical）
+      st.updated_at = 直した時;
+      変わった = true;
+    }
   });
   if(!変わった) return true;
   return DB.save(DB.key.st, all);
@@ -4871,6 +4879,12 @@ function fixGuard(svUuid){
 function spotPosFix(svUuid){
   const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return true;
   if(sv.position_source && sv.position_source !== '地点') return true;
+  // 昔の版には「位置の決め方」欄そのものが無い記録がある。
+  // 位置が入っているのに欄が空だからといって「地点由来」と決めつけると、
+  // 手入力した位置を消したり別の位置に動かしたりしてしまう（監査83回目 Critical）。
+  // 欄が空で位置も空のときだけ、地点から補ってよい
+  if(!sv.position_source
+     && numOf(sv.latitude) !== '' && numOf(sv.longitude) !== '') return true;
   const 地点 = spotList(svUuid).filter(x=>x.is_spot)
     .slice().sort((a,b)=>(a.station_no||0)-(b.station_no||0));
   const 先頭 = 地点.map(stationPt).filter(Boolean)[0];
@@ -8617,7 +8631,10 @@ function cloudPrune(box){
   (box.st||[]).forEach(x=>{
     ['spot_uuid','parent_uuid'].forEach(欄=>{
       const u = x[欄];
-      if(u && (!safeId(u) || !stm2[u] || stm2[u].survey_uuid !== x.survey_uuid)){
+      // ごみ箱に入った地点・親も結び先にしない。指したままだと、
+      // その親の完全削除に生きた子まで巻き込まれる（監査83回目 Critical）
+      if(u && (!safeId(u) || !stm2[u] || stm2[u].deleted_at
+               || stm2[u].survey_uuid !== x.survey_uuid)){
         x[欄] = '';
         外した['つながり'] = (外した['つながり']||0) + 1;
       }
@@ -9408,8 +9425,13 @@ function resurrectAncestors(box, 全勝ち, tombs, 控え, 数){
             // ごみ箱状態の写ししか無ければ、削除の方が新しい限り復活させない
             if(!(証 > String(復活.deleted_at))) return;
             delete 復活.deleted_at; delete 復活.deleted_by;
-            if(証 > String(復活.updated_at||'')) 復活.updated_at = 証;
           }
+          // 復活した祖先の時刻を、証拠の時刻まで進めて残す。進めないと、
+          // 他の端末ファイルに残ったままの古い墓標に次の合成でまた負けて、
+          // 復活と消滅を繰り返し、結果が定まらない（監査83回目 Major）。
+          // （箱の中に生きて居る祖先はそもそも墓標に負けていないので進めない。
+          //  進めると、他の端末でのその記録自体の編集を上書きしてしまう）
+          if(証 > recTime(復活)) 復活.updated_at = 証;
           box[道.先].push(復活);
           ある[道.先].set(pu, 復活);
           証拠[pu] = 証;                         // 証拠の時刻を上へ運ぶ
@@ -9661,10 +9683,22 @@ async function cloudRestore(){
       return;
     }
     if(cloudApply(中.data, 中.tombstones)){
+      // 戻した直後に、親子の結び付きと代表の位置を整える。
+      // 古い写しが「消した囲い」を親に指したままだと、その囲いの
+      // 完全削除に生きた子まで巻き込まれる（監査83回目 Critical）
+      let 整えた = true;
+      try{
+        DB.surveys().forEach(sv=>{
+          if(!unitRelink(sv.uuid)) 整えた = false;
+          if(!spotPosFix(sv.uuid)) 整えた = false;
+        });
+      }catch(e){ 整えた = false; }
       let 写真 = {戻した:0, 足りない:0}, 写真の失敗 = '';
       try{ 写真 = await cloudRestorePhotos(token, folder); }
       catch(e){ 写真の失敗 = (e && e.message) || String(e); }
       toast('ドライブの控えで置き換えました'
+        + (整えた ? '' : '（ただし親子のつながりを整えられませんでした。'
+          + '「データを点検」をお試しください）')
         + (写真の失敗 ? `（ただし写真は戻せませんでした：${写真の失敗}）`
           : (写真.戻した ? `（写真 ${写真.戻した}枚も戻しました`
               + (写真.足りない ? `／${写真.足りない}枚は見つかりませんでした` : '') + '）'
