@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v90';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v91';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2640,6 +2640,15 @@ function envHasOwn(st){
   if(envPoints(st).length) return '測点';
   return '';
 }
+/* 親に入っていると、中に小さい単位を作れなくなるもの。
+   数えるのは「足し合わせると二重になるもの」だけ（2026-08-23 の実機の声）。
+
+   48・49・62回目の監査に応じて「親の画面から入れられるものぜんぶ」に
+   広げてしまったが、それは行きすぎだった。
+   調査範囲について水温を測る・環境区分を選ぶ・写真を撮る・メモを書く、は
+   現場のふつうの手順で、しかも足し算にならない。
+   止めてしまうと、そのあと河川区分（瀬淵）に分けられなくなる。
+   しかも「中の単位へ移す」道具が無いので、詰んでしまう */
 function unitHasOwn(st){
   if(!st) return '';
   if(DB.catchesOf(st.uuid).length) return '魚の記録';
@@ -2648,10 +2657,14 @@ function unitHasOwn(st){
   //（監査49回目 Major）
   if(st.effort_started_at || +st.effort_seconds > 0) return '通電';
   if(numOf(st.length_m_manual)!=='' || numOf(st.area_m2_manual)!=='') return '距離・面積';
-  // 親の画面から入れられるものは、ぜんぶ見る。見落とすと、
-  // 親に入れたまま子を作れてしまい、親の入力欄が隠れて手が届かなくなる
-  //（監査48回目 Major）
   if(numOf(st.effort_passes)!=='' || numOf(st.width_m)!=='') return '流した回数・川幅';
+  return '';
+}
+/* 親に入っていても構わないもの（足し算にならない）。
+   ただし、子ができると親の入力欄が隠れるので、
+   入っていることは画面に出して、直せる道を残す（監査48・62回目の趣旨） */
+function unitOwnInfo(st){
+  if(!st) return '';
   const e = envHasOwn(st); if(e) return e;
   if((st.photos||[]).length) return '写真';
   if(st.memo) return 'メモ';
@@ -7339,13 +7352,60 @@ function polyProblem(pts){
   }
   return '';
 }
+/* 親に入っている「数に響く記録」を、中の単位へまるごと移す。
+   移す道具が無いまま「移してください」と言うと、詰んでしまう
+   （2026-08-23 の実機の声）。魚の記録・漁具・通電・距離・面積・回数・川幅 が対象。
+   1尾ずつの記録は魚の記録にぶら下がっているので、一緒についてくる */
+const 移す欄 = ['gears','effort_seconds','effort_started_at','effort_passes',
+                'width_m','length_m_manual','area_m2_manual'];
+function unitMoveOwn(親uuid, 子uuid){
+  const 親 = DB.liveStation(親uuid), 子 = DB.liveStation(子uuid);
+  if(!親 || !子) return false;
+  const cs = DB.catchesOf(親uuid);
+  // 先に全部を書き換えてから保存する（片方だけ動くのを防ぐ）
+  移す欄.forEach(k=>{
+    if(親[k] === undefined || 親[k] === '') return;
+    if(子[k] === undefined || 子[k] === '') 子[k] = 親[k];
+    delete 親[k];
+  });
+  if(!DB.upsert(DB.key.st, 子)) return false;
+  if(!DB.upsert(DB.key.st, 親)) return false;
+  for(const c of cs){
+    c.station_uuid = 子uuid;
+    if(!DB.upsert(DB.key.ca, c)) return false;
+  }
+  return true;
+}
 function fishClosePoly(svUuid){
   const st = fishDrawing();
   if(!st){ toast('いま描いている囲いがありません'); return false; }
   const 具合 = polyProblem(polyPts(st));
   if(具合){ toast(具合, 8000); return false; }
-  const 断り = unitParentBlocked(st, DB.stationsOf(svUuid).filter(x=>unitKindOf(x)));
-  if(断り){ toast(断り, 10000); return false; }
+  const 一覧 = DB.stationsOf(svUuid).filter(x=>unitKindOf(x));
+  const 断り = unitParentBlocked(st, 一覧);
+  if(断り){
+    // 「移してください」と言うだけでは詰む。ここで移せるようにする
+    const 親id = unitParentOf(st, 一覧);
+    const 親 = 一覧.filter(x=>x.uuid===親id)[0];
+    const 何 = 親 ? unitHasOwn(親) : '';
+    if(!親 || !何){ toast(断り, 10000); return false; }
+    if(!confirm(`${親.name} に入っている${何}を、いま閉じようとしている `
+      + `${st.name} へ移しますか？
+
+`
+      + `「はい」＝移してから閉じます（${親.name} は中の集計になります）
+`
+      + `「いいえ」＝閉じるのをやめます（${親.name} はそのまま）`)){
+      toast(断り, 10000);
+      return false;
+    }
+    if(!unitMoveOwn(親.uuid, st.uuid)){
+      toast('移せませんでした（端末の空き容量をご確認ください）。'
+        + 'そのままにしてあります', 9000);
+      return false;
+    }
+    toast(`${親.name} の${何}を ${st.name} へ移しました`, 6000);
+  }
   // 閉じたことを記録に残す。残さないと、読み込み直しに耐えられない
   const st2 = DB.liveStation(st.uuid);
   if(st2){ delete st2.poly_state; if(!DB.upsert(DB.key.st, st2)){
@@ -9099,7 +9159,20 @@ SCREENS.fishMap = (arg)=>{
 
       ${(子.length || 描きかけ) ? (描きかけ
         ? '<div class="warnbox">この囲いは、まだ閉じていません。'
-          + '角を足して、右下の「囲いを閉じる」で閉じてください。</div>' : '') : `
+          + '角を足して、右下の「囲いを閉じる」で閉じてください。</div>'
+        : (()=>{
+            // 中に小さい単位ができると、この囲い自身の入力欄は隠れる。
+            // それでも囲い自身に入っている値は、見て直せるようにしておく
+            //（2026-08-23 の実機の声）
+            const 何 = unitOwnInfo(cur);
+            if(!何) return '';
+            return `<div class="card">
+              <div class="dim small">この${esc(UNIT_WORD[unitKindOf(cur)]||'囲い')}そのものに
+                <b>${esc(何)}</b>が入っています（中の単位とは別に残ります）。</div>
+              <button class="btn" onclick="nav('env','${cur.uuid}')">
+                この囲いの環境の入力欄をひらく</button>
+            </div>`;
+          })()) : `
       ${foldHtml('fishcatch', '魚を記録する',
         `<span class="fsub">${(()=>{ const t = unitTotals(cur.uuid, list);
           return `${t.種}種 ${t.尾}尾`; })()}</span>`,
