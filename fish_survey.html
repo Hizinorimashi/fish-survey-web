@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v99';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v102';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -5530,6 +5530,7 @@ SCREENS.home = ()=>{
       ${list.length ? cards : '<div class="card dim">まだ調査がありません。上のボタンから作ってください。</div>'}
       ${list.length && !pickOn()
         ? `<button class="btn" onclick="pickStart()">いらない調査を選んで消す</button>` : ''}
+      <button class="btn" onclick="SEARCH_Q=''; nav('search',null)">記録を検索する</button>
       <button class="btn" onclick="nav('sites',null)">地点を登録・確認する（${DB.sites().length}件）</button>
       ${foldHtml('hometools', '資料・データの管理',
         `<span class="fsub">図鑑PDF・写真・書き出し・点検</span>`, `
@@ -8983,6 +8984,208 @@ function cloudSignOut(){
    クラウド保存（Googleドライブ）は既にあるものをそのまま使う
    ============================================================ */
 
+/* ---- 位置GeoJSON（QGISでそのまま開ける形・EPSG:4326） ----
+   点・線・面で1ファイルずつ。座標の並びは GeoJSON の決まりで [経度, 緯度]
+   （2026-08-23 の実機の声・鳥アプリから） */
+function geoFeature(geom, props){ return {type:'Feature', geometry:geom, properties:props}; }
+function geoProps(sv, st, 種別){
+  const si = spotInfoOf(sv, st);
+  return {
+    '種別': 種別, '名前': st.name||'', '調査日': stationDate(st, sv),
+    '河川名': sv.river_name||'', '地点': si.spot||'', '地点名': si.site||'',
+    '区間名': si.section||'', '調べたもの': exportKind(sv, st),
+    '調査ID': sv.uuid, '記録ID': st.uuid,
+  };
+}
+function buildGeoJSON(sv){
+  const 点 = [], 線 = [], 面 = [];
+  const sts = DB.stationsOf(sv.uuid).filter(unitReady);
+  for(const st of sts){
+    if(isMesh(st)) continue;                       // メッシュは31列とマスCSVで
+    const k = unitKindOf(st);
+    if(st.is_spot){
+      const pt = stationPt(st);
+      if(pt) 点.push(geoFeature({type:'Point', coordinates:[pt[1], pt[0]]},
+        geoProps(sv, st, '調査地点')));
+    }else if(k === 'P'){
+      const pt = stationPt(st);
+      if(pt) 点.push(geoFeature({type:'Point', coordinates:[pt[1], pt[0]]},
+        geoProps(sv, st, 'ポイント')));
+    }else if(k === 'E' || k === 'PF'){
+      const pts = polyPts(st);
+      if(pts.length >= 3){
+        const ring = pts.map(v=>[v[1], v[0]]);
+        ring.push(ring[0]);                        // 面は始点で閉じる
+        面.push(geoFeature({type:'Polygon', coordinates:[ring]},
+          geoProps(sv, st, k==='E' ? '調査範囲' : '河川区分（瀬淵）')));
+      }
+    }else if(isLine(st)){
+      const a = linePt(st, 'start'), b = linePt(st, 'end');
+      if(a){
+        const mids = lineVias(st).map(v=>[v[1], v[0]]);
+        const coords = [[a[1], a[0]]].concat(mids).concat(b ? [[b[1], b[0]]] : []);
+        if(coords.length >= 2){
+          const pr = geoProps(sv, st, '物理環境ライン');
+          pr['向き'] = st.line_direction||'';
+          線.push(geoFeature({type:'LineString', coordinates:coords}, pr));
+        }
+      }
+    }else{
+      // 物理環境の測点・前のやり方の箇所
+      const pt = stationPt(st);
+      if(pt){
+        const pr = geoProps(sv, st, stationKind(sv, st)==='物理環境' ? '測点' : '箇所');
+        pr['水深cm'] = numOf(st.depth_rep_cm); pr['流速cms'] = numOf(st.velocity_rep_cms);
+        pr['環境区分'] = st.habitat_type||'';
+        点.push(geoFeature({type:'Point', coordinates:[pt[1], pt[0]]}, pr));
+      }
+    }
+    // 歩いた道すじ（どの種類の記録に付いていても出す）
+    const tr = (st.track||[]).filter(validPt);
+    if(tr.length >= 2){
+      線.push(geoFeature({type:'LineString',
+        coordinates: tr.map(v=>[v[1], v[0]])},
+        geoProps(sv, st, '歩いた道すじ')));
+    }
+  }
+  return {点, 線, 面};
+}
+function exportGeoJSON(svUuid){
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
+  const g = buildGeoJSON(sv);
+  const base = `fish_${String(sv.survey_date||'').replace(/-/g,'')}_${(sv.river_name||'').slice(0,10)}`;
+  let 出した = 0;
+  const 出す = (名, feats)=>{
+    if(!feats.length) return;
+    download(`${base}_${名}.geojson`,
+      JSON.stringify({type:'FeatureCollection', features:feats}), 'application/geo+json');
+    出した++;
+  };
+  出す('点', g.点); 出す('線', g.線); 出す('面', g.面);
+  toast(出した
+    ? `GeoJSONを ${出した}ファイル書き出しました（点${g.点.length}・線${g.線.length}・面${g.面.length}）。`
+      + 'QGISへそのまま読み込めます'
+    : '位置の付いた記録がまだありません', 8000);
+}
+
+/* ---- 報告書用の書き出し（種一覧・地点×種） ----
+   報告書の表をそのまま作れる形（2026-08-23 の実機の声・鳥アプリから）。
+   数える決まりは画面の集計（surveyTally）と同じ:
+   記録はいちばん小さい単位の分だけ数え、場所は地点でまとめる */
+function buildReport(sv){
+  const t = surveyTally(sv.uuid);
+  const 場所列 = (t.場所||[]).map(x=>x.name||'');
+  // 種一覧
+  const 種一覧 = (t.種||[]).map(k=>{
+    const sp = speciesById(k.id);
+    return {
+      '種名': k.name||'', '種ID': k.id||'', '科': sp ? sp.fam||'' : '',
+      '尾数': k.尾, '出現地点数': Object.keys(k.場所||{}).length,
+    };
+  });
+  // 地点×種（行＝種、列＝地点）
+  const クロス = (t.種||[]).map(k=>{
+    const row = {'種名': k.name||''};
+    場所列.forEach(nm=>{ row[nm] = ''; });
+    Object.keys(k.場所||{}).forEach(pid=>{
+      const b = k.場所[pid];
+      if(b && b.name !== undefined) row[b.name] = b.尾;
+    });
+    row['合計'] = k.尾;
+    return row;
+  });
+  return {種一覧, クロス, 場所列};
+}
+function exportReport(svUuid){
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
+  const r = buildReport(sv);
+  if(!r.種一覧.length){ toast('魚の記録がまだありません', 6000); return; }
+  const base = `fish_${String(sv.survey_date||'').replace(/-/g,'')}_${(sv.river_name||'').slice(0,10)}`;
+  download(`${base}_報告_種一覧.csv`,
+    toCsv(['種名','種ID','科','尾数','出現地点数'], r.種一覧), 'text/csv');
+  download(`${base}_報告_地点×種.csv`,
+    toCsv(['種名'].concat(r.場所列).concat(['合計']), r.クロス), 'text/csv');
+  toast(`報告書用のCSVを2つ書き出しました（${r.種一覧.length}種 × ${r.場所列.length}地点）`, 8000);
+}
+
+/* ---- 横断検索（2026-08-23 の実機の声・鳥アプリから） ----
+   種名・場所・メモ・名前で、全部の調査の記録から探す */
+function searchAll(q){
+  q = String(q||'').trim();
+  if(!q) return [];
+  const 語 = q.split(/\s+/).filter(Boolean);
+  const 当たる = (文)=>語.every(w=>String(文||'').indexOf(w)>=0);
+  const out = [];
+  const svName = {};
+  try{
+    DB.surveys().forEach(sv=>{
+      svName[sv.uuid] = `${sv.river_name||''} ${String(sv.survey_date||'').slice(0,10)}`;
+      const 文 = [sv.river_name, sv.site_name, sv.section_name, sv.memo,
+        sv.investigator, sv.project_name, sv.project_number].join(' ');
+      if(当たる(文)) out.push({種類:'調査', 見出し:svName[sv.uuid],
+        添え: sv.memo||'', 開く:()=>goTo('survey', sv.uuid)});
+    });
+    DB.loadRaw(DB.key.st).filter(x=>x && !x.deleted_at).forEach(st=>{
+      const 文 = [st.name, st.memo, st.site_name, st.section_name,
+        st.habitat_type].join(' ');
+      if(当たる(文)) out.push({種類: st.is_spot ? '地点' : '箇所・単位',
+        見出し: `${st.name||''}（${svName[st.survey_uuid]||''}）`,
+        添え: st.memo||st.habitat_type||'', 開く:()=>mapOpenRecord(st.uuid)});
+    });
+    DB.loadRaw(DB.key.ca).filter(x=>x && !x.deleted_at).forEach(c=>{
+      const 文 = [c.species_name, c.notes].join(' ');
+      if(当たる(文)){
+        const st = DB.liveStation(c.station_uuid);
+        out.push({種類:'魚の記録',
+          見出し: `${c.species_name||''} ${catchTotal(c)}尾（${st?st.name:''}・${svName[c.survey_uuid]||''}）`,
+          添え: c.notes||'', 開く:()=>nav('catchEdit',{uuid:c.uuid})});
+      }
+    });
+    DB.loadRaw(DB.key.nt).filter(x=>x && !x.deleted_at).forEach(nt=>{
+      if(当たる(nt.content||'')) out.push({種類:'メモ',
+        見出し: `${String(nt.content||'').slice(0,24)}（${svName[nt.survey_uuid]||''}）`,
+        添え: String(nt.content||'').slice(0,60),
+        開く:()=>nav('noteEdit',{uuid:nt.uuid})});
+    });
+  }catch(e){}
+  return out.slice(0, 100);
+}
+let SEARCH_Q = '';
+let SEARCH_HITS = [];
+function searchRun(v){
+  SEARCH_Q = v;
+  SEARCH_HITS = searchAll(v);
+  const box = $('#searchOut'); if(!box) return;
+  box.innerHTML = SEARCH_HITS.length ? SEARCH_HITS.map((h,i)=>`<div class="card tap"
+      onclick="searchOpen(${i})">
+    <div class="row"><div class="grow" style="min-width:0">
+      <div class="dim small">${esc(h.種類)}</div>
+      <div style="font-weight:700;overflow:hidden;text-overflow:ellipsis;
+        white-space:nowrap">${esc(h.見出し)}</div>
+      ${h.添え ? `<div class="dim small" style="overflow:hidden;text-overflow:ellipsis;
+        white-space:nowrap">${esc(h.添え)}</div>` : ''}
+    </div><span class="dim">›</span></div>
+  </div>`).join('')
+    : (String(v||'').trim() ? '<div class="dim small">見つかりませんでした。</div>' : '');
+}
+function searchOpen(i){
+  const h = SEARCH_HITS[i];
+  if(h && h.開く) h.開く();
+}
+SCREENS.search = ()=>({
+  title:'検索',
+  html:`
+    <label>記録を横断して探す（種名・場所・メモ・名前）</label>
+    <input id="searchBox" autocomplete="off" placeholder="例）ヤマメ ／ 早瀬 ／ 橋"
+      value="${esc(SEARCH_Q)}" oninput="searchRun(this.value)">
+    <div id="searchOut" style="margin-top:10px"></div>
+  `,
+  onMount(){
+    const b = $('#searchBox');
+    if(b){ b.focus(); }
+    searchRun(SEARCH_Q);
+  }});
+
 /* ---- JSONバックアップ（書き出し） ----
    形は cloudPack と同じ {app,version,saved_at,data} に photos を足したもの。
    取り込み側は cloudCheck で同じ検査を通す */
@@ -12134,6 +12337,8 @@ SCREENS.map = (svUuid)=>{
         <span style="color:#3fb950">●</span> ${isDetail(sv)?'打った地点':'箇所'}　
         <span style="color:#d29922">●</span> 測点<br>
         地図をタップすると、この調査の位置をそこへ動かせます。</div>
+      <button class="btn" onclick="exportReport('${svUuid}')">報告書用CSV（種一覧・地点×種）</button>
+      <button class="btn" onclick="exportGeoJSON('${svUuid}')">位置GeoJSON（QGIS用・点/線/面）</button>
       <button class="btn" onclick="nav('offlineMap','${svUuid}')">圏外にそなえて地図を保存する</button>
     `,
     onMount(){
