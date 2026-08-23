@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v92';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v93';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -3486,6 +3486,43 @@ function applyBaseMap(slot, name){
   s.layer = L.tileLayer(b.url, {maxZoom:MAP_MAX_ZOOM, maxNativeZoom:b.max,
                                 attribution:b.attr, crossOrigin:true})
     .addTo(s.map);
+  // タイルが無かったら、上の段のタイルを切り出して埋める。
+  // 航空写真は場所によって17段階や16段階までしか無く、
+  // そこへ拡大すると真っ暗になっていた（2026-08-23 の実機の声）
+  s.layer.on('tileerror', ev=>{
+    try{ tileErrorFill(ev.tile, ev.coords, b.url, 1); }catch(e){}
+  });
+}
+/* 上の段のどのタイルの、どの部分を切り出すか */
+function tileParentInfo(z, x, y, up){
+  const 大きさ = 256 >> up;                 // 切り出す幅（ピクセル）
+  return { z: z - up, x: x >> up, y: y >> up,
+    sx: (x - ((x >> up) << up)) * 大きさ,
+    sy: (y - ((y >> up) << up)) * 大きさ,
+    size: 大きさ };
+}
+/* 失敗したタイルの場所に、上の段のタイルを切り出して入れる。
+   上の段も無ければ、さらに上を試す（4段まで） */
+function tileErrorFill(img, coords, url, up){
+  if(!img || !coords || up > 4) return;
+  const c = { z: coords.z, x: coords.x, y: coords.y };
+  const 上 = tileParentInfo(c.z, c.x, c.y, up);
+  if(上.z < 5) return;
+  const src = url.replace('{z}', 上.z).replace('{x}', 上.x).replace('{y}', 上.y);
+  const 親 = new Image();
+  親.crossOrigin = 'anonymous';
+  親.onload = ()=>{
+    try{
+      const cv = document.createElement('canvas');
+      cv.width = 256; cv.height = 256;
+      const ctx = cv.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(親, 上.sx, 上.sy, 上.size, 上.size, 0, 0, 256, 256);
+      img.src = cv.toDataURL('image/png');
+    }catch(e){}
+  };
+  親.onerror = ()=>tileErrorFill(img, coords, url, up + 1);
+  親.src = src;
 }
 function baseMapButtonsHtml(){
   const cur = baseMapName();
