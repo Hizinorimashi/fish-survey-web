@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v105';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v106';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -5499,28 +5499,70 @@ const NOT_IN_DB_CSV = ['通電秒数','漁具ごとの数・規格・時間','�
    ============================================================ */
 
 /* ---------- ホーム ---------- */
+/* ホームの調査カード。1枚ぶんを作る（一覧と検索の両方で使う） */
+function homeSvCard(s){
+  const nSt = DB.stationsOf(s.uuid).length;
+  const nSp = speciesCount(DB.catchesOfSurvey(s.uuid), null);
+  const cls = s.status==='調査中' ? 'ok' : (s.status==='終了' ? '' : 'warn');
+  if(pickOn()){
+    return `<button type="button" class="btn sm" data-pick="${s.uuid}"
+      style="text-align:left" onclick="pickToggle('${s.uuid}')">
+      ${esc(s.river_name||'(河川名なし)')} ${esc(s.site_name||'')}
+      <span class="fsub">${esc(surveyPeriodText(s))}　箇所${nSt}　${nSp}種 ${surveyTotal(s)}尾</span>
+    </button>`;
+  }
+  return `<div class="card tap" onclick="nav('survey','${s.uuid}')">
+    <div class="row">
+      <div class="grow">
+        <div style="font-weight:700">${esc(s.river_name||'(河川名なし)')} ${esc(s.site_name||'')}</div>
+        <div class="dim small">${esc(surveyPeriodText(s))}　箇所${nSt}　${nSp}種　${surveyTotal(s)}尾</div>
+      </div>
+      <span class="pill ${cls}">${esc(s.status||'未開始')}</span>
+    </div></div>`;
+}
+/* ホームの調査の絞り込み（2026-08-23 の実機の声）。
+   調査が増えると一覧が長くなるので、「調査中」だけ常に出し、
+   残りは折りたたみ＋検索で探せるようにする */
+let HOME_Q = '';
+function homeSvMatch(s, q){
+  const 語 = String(q||'').trim().split(/\s+/).filter(Boolean);
+  if(!語.length) return true;
+  const 文 = [s.river_name, s.site_name, s.section_name, s.investigator,
+    s.project_name, s.project_number, s.memo,
+    String(s.survey_date||''), String(s.survey_date_end||'')].join(' ');
+  return 語.every(w=>文.indexOf(w)>=0);
+}
+function homeSvListHtml(){
+  const list = DB.surveys();
+  if(String(HOME_Q||'').trim()){
+    const hits = list.filter(s=>homeSvMatch(s, HOME_Q));
+    return `<div class="dim small">検索結果 ${hits.length}件</div>`
+      + (hits.map(homeSvCard).join('')
+         || '<div class="card dim">見つかりませんでした。</div>');
+  }
+  const 進行中 = list.filter(s=>s.status==='調査中');
+  const 残り = list.filter(s=>s.status!=='調査中');
+  return 進行中.map(homeSvCard).join('')
+    + (残り.length
+      ? foldHtml('homepast', 進行中.length ? '過去の調査' : '調査の一覧',
+          `<span class="fsub">${残り.length}件</span>`,
+          残り.map(homeSvCard).join(''), true)
+      : '');
+}
+function homeQ(v){
+  HOME_Q = v;
+  // 一覧だけ入れ替える。画面ごと作り直すと、打っている途中の欄から
+  // フォーカスが外れてしまう
+  const box = $('#homeSvList');
+  if(box) box.innerHTML = homeSvListHtml();
+}
 SCREENS.home = ()=>{
   const list = DB.surveys();
-  const cards = list.map(s=>{
-    const nSt = DB.stationsOf(s.uuid).length;
-    const nSp = speciesCount(DB.catchesOfSurvey(s.uuid), null);
-    const cls = s.status==='調査中' ? 'ok' : (s.status==='終了' ? '' : 'warn');
-    if(pickOn()){
-      return `<button type="button" class="btn sm" data-pick="${s.uuid}"
-        style="text-align:left" onclick="pickToggle('${s.uuid}')">
-        ${esc(s.river_name||'(河川名なし)')} ${esc(s.site_name||'')}
-        <span class="fsub">${esc(surveyPeriodText(s))}　箇所${nSt}　${nSp}種 ${surveyTotal(s)}尾</span>
-      </button>`;
-    }
-    return `<div class="card tap" onclick="nav('survey','${s.uuid}')">
-      <div class="row">
-        <div class="grow">
-          <div style="font-weight:700">${esc(s.river_name||'(河川名なし)')} ${esc(s.site_name||'')}</div>
-          <div class="dim small">${esc(surveyPeriodText(s))}　箇所${nSt}　${nSp}種　${surveyTotal(s)}尾</div>
-        </div>
-        <span class="pill ${cls}">${esc(s.status||'未開始')}</span>
-      </div></div>`;
-  }).join('');
+  const cards = pickOn()
+    ? list.map(homeSvCard).join('')
+    : `${list.length > 3 ? `<input id="homeQ" placeholder="調査を探す（河川名・日付・調査者など）"
+        value="${esc(HOME_Q)}" oninput="homeQ(this.value)">` : ''}
+      <div id="homeSvList">${homeSvListHtml()}</div>`;
   return {
     title:'魚類調査記録',
     sub:[{text:`調査 ${list.length}件`}, {text:`魚種 ${SPECIES.length}`}],
