@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v108';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v109';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -8475,7 +8475,29 @@ function pickTrashDo(どうする){
    ============================================================ */
 const GD_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 const GD_FOLDER = '魚類調査バックアップ';
-const GD_FILE = 'fish_survey_backup.json';
+const GD_FILE = 'fish_survey_backup.json';   // 前の版までの1つの共有ファイル（読むだけ）
+/* この端末の名札。ドライブには「自分のファイル」だけを書く。
+   1つの共有ファイルを2台で取り合うと、どれだけ照合しても
+   「確認と書き込みの間」に割り込まれる隙間が残る（監査73回目 Critical）。
+   端末ごとに別のファイルなら、上書きの競合は起きようがない */
+function deviceId(){
+  let d = '';
+  try{ d = localStorage.getItem('fs_device_id') || ''; }catch(e){}
+  if(!d){
+    d = uuid();
+    try{ localStorage.setItem('fs_device_id', d); }catch(e){}
+  }
+  return d;
+}
+function gdMyFile(){ return 'fish_survey_' + deviceId() + '.json'; }
+/* クラウドの操作は、いちどに1つ（保存・合成・戻すを重ねない） */
+let CLOUD_BUSY = false;
+function cloudBusy(){
+  if(CLOUD_BUSY){ toast('クラウドの操作がもう動いています。少しお待ちください', 6000); return true; }
+  CLOUD_BUSY = true;
+  return false;
+}
+function cloudFree(){ CLOUD_BUSY = false; }
 const GD_CLIENT_ID = '39266503709-hqoe2kpd60r59dn5s1ql7ltjs7nu31h0.apps.googleusercontent.com';
 let GD_TOKEN = null;
 /* 鍵（アクセストークン）は、この画面を開いているあいだだけ持つ。
@@ -8699,6 +8721,11 @@ function cloudCheck(text){
            || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/.test(t.at)
            || isNaN(Date.parse(t.at))){
           return {ok:false, why:'墓標の日時の形がちがいます'};
+        }
+        // 遠い未来の墓標は、どの記録よりも新しい扱いになり、
+        // 生きている記録を消させられる（監査73回目 Major）。1日先まで許す
+        if(Date.parse(t.at) > Date.now() + 86400000){
+          return {ok:false, why:'墓標の日時が未来すぎます'};
         }
       }
     }
@@ -9030,6 +9057,12 @@ async function autoBackupRun(){
 async function cloudSave(opt){
   const 自動 = !!(opt && opt.auto);
   const 言う = 自動 ? (()=>{}) : toast;
+  if(!(opt && opt.nested)){
+    if(CLOUD_BUSY){ 言う('クラウドの操作がもう動いています。少しお待ちください', 6000);
+      return 'error'; }
+    CLOUD_BUSY = true;
+  }
+  try{
   if(!writeAllowed()){
     言う('このタブでは保存できません。記録を入れているタブでお試しください', 7000);
     return;
@@ -9057,45 +9090,28 @@ async function cloudSave(opt){
   try{
     const token = await gdGetToken();
     const folder = await gdFolder(token);
-    const q = encodeURIComponent("name='"+GD_FILE+"' and '"+folder+"' in parents and trashed=false");
+    // 書くのは「この端末のファイル」だけ（監査73回目 Critical への設計替え）。
+    // ほかの端末は別のファイルへ書くので、上書きの競合は起きない。
+    // ほかの端末の分は「ドライブと合成する」で読み合わせる
+    const 名 = gdMyFile();
+    const q = encodeURIComponent("name='"+名+"' and '"+folder+"' in parents and trashed=false");
     const list = await gdFetch('drive/v3/files?spaces=drive&fields=files(id,modifiedTime)&q='+q, {}, token);
-    let id = (list.files && list.files.length) ? list.files[0].id : '';
-    // 別の端末が保存した控えを、知らずに上書きしない（監査71・72回目 Critical）。
-    // 「この端末が最後に見た、ドライブ側の時刻」（合成の直後は opt.expectMtime）と
-    // 照合し、食い違っていたら丸ごと置き換えをやめて合成を促す。
-    // 基準が無い（この端末で初めて）のに控えがあるのも、知らない控えなので同じ扱い
-    const 基準 = (opt && opt.expectMtime !== undefined)
-      ? String(opt.expectMtime||'')
-      : (localStorage.getItem('fs_gdrive_mtime') || '');
-    const いまの時刻 = id ? String((list.files[0].modifiedTime)||'') : '';
-    if(id && (!基準 || 基準 !== いまの時刻) && !(opt && opt.force)){
-      言う('ドライブに、この端末が知らない控えがあります。上書きすると消えます。'
-        + '先に「ドライブと合成する」を押してください', 12000);
-      if(自動) return 'conflict';       // 自動は静かに見送る（次の合成で合わさる）
-      if(!confirm('ドライブに、この端末がまだ取り込んでいない控えがあります。\n'
-        + '「OK」＝それを消して、この端末の記録で上書きする\n'
-        + '「キャンセル」＝やめる（先に「ドライブと合成する」がおすすめ）')) return 'conflict';
+    let id = '';
+    if(list.files && list.files.length){
+      // 万一同じ名のファイルが2つあれば、新しい方を使う（名は端末ごとに違うので、
+      // 作れるのはこの端末だけ。二重になるのは初回保存が切れた場合くらい）
+      const 並び = list.files.slice().sort((a,b)=>
+        String(b.modifiedTime||'').localeCompare(String(a.modifiedTime||'')));
+      id = 並び[0].id;
     }
     if(!id){
       const made = await gdFetch('drive/v3/files?fields=id', {method:'POST',
         headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({name:GD_FILE, parents:[folder]})}, token);
+        body: JSON.stringify({name:名, parents:[folder]})}, token);
       id = made.id;
-    }else if(!(opt && opt.force)){
-      // 書く直前に、もう一度だけ時刻を見る。確認との間に別の端末が
-      // 書き込む隙間を、できるだけ小さくする（ドライブは「書く条件」を
-      // 付けられないため、完全にはふさげない。監査72回目 Critical への手当て）
-      try{
-        const again = await gdFetch('drive/v3/files/'+id+'?fields=modifiedTime', {}, token);
-        if(String((again && again.modifiedTime)||'') !== いまの時刻){
-          言う('いままさに別の端末が保存しました。先に「ドライブと合成する」を押してください', 10000);
-          return 'conflict';
-        }
-      }catch(e){}
     }
-    const 書けた = await gdFetch('upload/drive/v3/files/'+id+'?uploadType=media&fields=id,modifiedTime',
+    await gdFetch('upload/drive/v3/files/'+id+'?uploadType=media&fields=id,modifiedTime',
       {method:'PATCH', headers:{'Content-Type':'application/json'}, body:text}, token);
-    try{ localStorage.setItem('fs_gdrive_mtime', String((書けた && 書けた.modifiedTime)||'')); }catch(e){}
     let 写真 = {送った:0, 全部:0, 失敗:0};
     try{ 写真 = await cloudSavePhotos(token, folder); }
     catch(e){ 写真 = {送った:0, 全部:-1, 失敗:-1}; }
@@ -9112,7 +9128,57 @@ async function cloudSave(opt){
   // 自動のときは画面を作り直さない。打っている最中の欄が消える（監査71回目 Major）
   if(!自動) render();
   return 'error';
+  }finally{ if(!(opt && opt.nested)) CLOUD_BUSY = false; }
 }
+/* 2つの控え（data＋墓標）を、記録ごとに「新しい方」で合わせる純粋な関数 */
+function mergeDatasets(A, B){
+  const 時 = x => String((x && (x.updated_at || x.created_at)) || '');
+  const data = {};
+  for(const k of CLOUD_KEYS){
+    const m = Object.create(null);
+    ((A.data && A.data[k]) || []).forEach(x=>{ if(x && x.uuid) m[x.uuid] = x; });
+    ((B.data && B.data[k]) || []).forEach(x=>{
+      if(!x || !x.uuid) return;
+      const 既 = m[x.uuid];
+      if(!既 || 時(x) > 時(既)) m[x.uuid] = x;
+    });
+    data[k] = Object.keys(m).map(u=>m[u]);
+  }
+  const tm = Object.create(null);
+  (A.tombstones||[]).concat(B.tombstones||[]).forEach(t=>{
+    if(!t || !safeId(t.uuid)) return;
+    const at = (typeof t.at === 'string') ? t.at : '';
+    if(tm[t.uuid] === undefined || at > tm[t.uuid]) tm[t.uuid] = at;
+  });
+  return {data, tombstones: Object.keys(tm).map(u=>({uuid:u, at:tm[u]}))};
+}
+/* ドライブにある控えのファイルをぜんぶ読み、1つに合わせて返す。
+   端末ごとのファイル（fish_survey_<名札>.json）と、
+   前の版までの共有ファイル（fish_survey_backup.json）の両方を見る */
+async function cloudFetchAll(token, folder){
+  const q = encodeURIComponent("name contains 'fish_survey_' and '"+folder
+    + "' in parents and trashed=false");
+  const list = await gdFetch('drive/v3/files?spaces=drive'
+    + '&fields=files(id,name,modifiedTime)&q='+q, {}, token);
+  const files = (list.files||[]).filter(f=>f && /\.json$/.test(String(f.name||'')));
+  let 合わせ = null, 読めた = 0, 読めない = 0;
+  for(const f of files){
+    try{
+      const r = await fetch('https://www.googleapis.com/drive/v3/files/'
+        + f.id + '?alt=media', {headers:{Authorization:'Bearer '+token}});
+      if(!r.ok) throw new Error('ドライブ ' + r.status);
+      const o = JSON.parse(await r.text());
+      const 検査 = cloudCheck(JSON.stringify({app:o.app, version:o.version,
+        saved_at:o.saved_at, data:o.data, tombstones:o.tombstones}));
+      if(!検査.ok){ 読めない++; continue; }
+      const 今回 = {data: 検査.data, tombstones: 検査.tombstones};
+      合わせ = 合わせ ? mergeDatasets(合わせ, 今回) : 今回;
+      読めた++;
+    }catch(e){ 読めない++; }
+  }
+  return {合わせ, 読めた, 読めない, ファイル数: files.length};
+}
+
 /* ---- ドライブと合成（2台で使うとき） ----
    ドライブの控えと手元の記録を、記録ごとに「新しい操作をした方」で合わせる。
    ・同じ記録が両方にあれば、更新時刻の新しい方
@@ -9182,40 +9248,29 @@ async function cloudMerge(){
     toast('このタブでは合成できません。記録を入れているタブでお試しください', 7000);
     return;
   }
+  if(cloudBusy()) return;
+  try{
   toast('ドライブの控えを読んでいます…', 8000);
-  let remote = null;
+  let 全部 = null;
   try{
     const token = await gdGetToken();
     const folder = await gdFolder(token);
-    const q = encodeURIComponent("name='"+GD_FILE+"' and '"+folder+"' in parents and trashed=false");
-    const list = await gdFetch('drive/v3/files?spaces=drive&fields=files(id,modifiedTime)&q='+q, {}, token);
-    if(list.files && list.files.length){
-      const r = await fetch('https://www.googleapis.com/drive/v3/files/'
-        + list.files[0].id + '?alt=media', {headers:{Authorization:'Bearer '+token}});
-      if(!r.ok) throw new Error('ドライブ ' + r.status);
-      remote = JSON.parse(await r.text());
-      // いま読んだ時刻は、手元へ持つだけ。先に控えると、確認を取り消したのに
-      // 「合成済み」の顔をして、次の自動保存が上書きしてしまう（監査72回目 Critical）
-      remote.__mtime = String(list.files[0].modifiedTime||'');
-    }
+    全部 = await cloudFetchAll(token, folder);
   }catch(e){
     toast('ドライブの控えを読めませんでした（' + (e && e.message || '') + '）', 9000);
     return;
   }
-  if(!remote){
+  if(!全部 || !全部.合わせ){
     // ドライブがまだ空なら、いまの記録を送るだけでよい
-    if(confirm('ドライブにまだ控えがありません。いまの記録を保存しますか？')) cloudSave();
+    if(confirm('ドライブにまだ控えがありません。いまの記録を保存しますか？')){
+      await cloudSave({nested:true});
+    }
     return;
   }
-  // 墓標も一緒に検査へ渡す。落とすと、検査済みの墓標が常に空になり、
-  // 別の端末で消した記録が合成で復活してしまう（監査72回目 Critical）
-  const 検査 = cloudCheck(JSON.stringify({app:remote.app, version:remote.version,
-    saved_at:remote.saved_at, data:remote.data, tombstones:remote.tombstones}));
-  if(!検査.ok){
-    toast('ドライブの控えが戻せない形です（' + 検査.why + '）。合成をやめました', 10000);
-    return;
+  if(全部.読めない){
+    toast('読めない控えが ' + 全部.読めない + 'ファイルありました（飛ばして続けます）', 8000);
   }
-  const m = mergeBackup(検査.data, 検査.tombstones);
+  const m = mergeBackup(全部.合わせ.data, 全部.合わせ.tombstones);
   const 外し数 = Object.keys(m.外した||{}).reduce((a,k)=>a+m.外した[k], 0);
   if(!confirm('ドライブの控えと合成します。\n'
     + '・手元だけにある記録 ' + m.数.手元のみ + '件（残ります）\n'
@@ -9272,7 +9327,7 @@ async function cloudMerge(){
   }catch(e){}
   toast('合成しました。ドライブへも送り返します…', 6000);
   let 送り = 'error';
-  try{ 送り = await cloudSave({auto:true, expectMtime: remote.__mtime || ''}); }catch(e){}
+  try{ 送り = await cloudSave({auto:true, nested:true}); }catch(e){}
   // 手元に実体の無い写真を、ドライブから取り寄せる
   try{
     const token = await gdGetToken();
@@ -9285,13 +9340,11 @@ async function cloudMerge(){
   }catch(e){}
   reset('home');
   if(送り === 'ok') toast('合成が終わりました', 6000);
-  else if(送り === 'conflict'){
-    toast('手元は合成できましたが、その間に別の端末がまた保存したため、'
-      + 'ドライブへは送っていません。もう一度「ドライブと合成する」を押してください', 12000);
-  }else{
+  else{
     toast('手元は合成できましたが、ドライブへ送り返せませんでした。'
       + 'あとで「ドライブに保存する」を押してください', 12000);
   }
+  }finally{ cloudFree(); }
 }
 
 async function cloudRestore(){
@@ -9299,32 +9352,26 @@ async function cloudRestore(){
     toast('このタブでは戻せません。記録を入れているタブでお試しください', 7000);
     return;
   }
+  if(cloudBusy()) return;
+  try{
   toast('ドライブから読んでいます…', 8000);
   try{
     const token = await gdGetToken();
     const folder = await gdFolder(token);
-    const q = encodeURIComponent("name='"+GD_FILE+"' and '"+folder+"' in parents and trashed=false");
-    const list = await gdFetch('drive/v3/files?spaces=drive&fields=files(id,modifiedTime)&q='+q,
-      {}, token);
-    if(!list.files || !list.files.length){
+    const 全部 = await cloudFetchAll(token, folder);
+    if(!全部.合わせ){
       toast('ドライブに控えがありませんでした', 8000); return;
     }
-    const res = await fetch('https://www.googleapis.com/drive/v3/files/'
-      + list.files[0].id + '?alt=media', {headers:{Authorization:'Bearer '+token}});
-    if(!res.ok) throw new Error('ドライブ ' + res.status);
-    const text = await res.text();
-    const 中 = cloudCheck(text);
-    if(!中.ok){ toast('戻せませんでした：' + 中.why, 9000); return; }
+    if(全部.読めない){
+      toast('読めない控えが ' + 全部.読めない + 'ファイルありました（飛ばして続けます）', 8000);
+    }
+    const 中 = {data: 全部.合わせ.data, tombstones: 全部.合わせ.tombstones};
     const いま = CLOUD_KEYS.reduce((a,k)=>a + DB.load(DB.key[k]).length, 0);
-    const 控え = CLOUD_KEYS.reduce((a,k)=>a + 中.数[k], 0);
-    if(!confirm(`ドライブの控え（${String(中.saved_at).slice(0,16).replace('T',' ')}／`
-      + `${控え}件）で、いまの記録（${いま}件）を置き換えます。\n`
+    const 控え = CLOUD_KEYS.reduce((a,k)=>a + (中.data[k]||[]).length, 0);
+    if(!confirm(`ドライブの控え（${全部.読めた}ファイルを読み合わせ／${控え}件）で、`
+      + `いまの記録（${いま}件）を置き換えます。\n`
       + 'いまの記録は消えます。よろしいですか？')) return;
     if(cloudApply(中.data, 中.tombstones)){
-      // いま戻した控えを「この端末が知っている控え」として控える。
-      // 控えないと、次の保存が「知らない控えがある」と止まる（監査72回目 Critical）
-      try{ localStorage.setItem('fs_gdrive_mtime',
-        String(list.files[0].modifiedTime||'')); }catch(e){}
       let 写真 = {戻した:0, 足りない:0}, 写真の失敗 = '';
       try{ 写真 = await cloudRestorePhotos(token, folder); }
       catch(e){ 写真の失敗 = (e && e.message) || String(e); }
@@ -9340,6 +9387,7 @@ async function cloudRestore(){
     toast('戻せませんでした：' + ((e && e.message) || e), 10000);
   }
   render();
+  }finally{ cloudFree(); }
 }
 function cloudSignOut(){
   // Google 側でも使えなくする（端末から消すだけでは、鍵は生きたまま）
