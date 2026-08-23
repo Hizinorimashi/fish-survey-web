@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v117';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v118';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -9289,11 +9289,15 @@ function mergeBackup(remoteData, remoteTombs){
       if(tombs[u] !== undefined){
         // 墓標より新しい編集は消さない（消したあとに、別の端末で直した記録。
         // 無条件に消すと、その編集が黙って失われる。監査71回目 Critical）。
-        // 日時の分からない墓標も、消す側に倒さない
-        if(!tombs[u] || 時(勝ち) > tombs[u]){
+        // 日時の分からない墓標も、消す側に倒さない。
+        // ただし墓標を破れるのは「生きた記録」だけ。ごみ箱への削除は
+        // 消す操作なので、完全削除（墓標）を取り消す理由にならない。
+        // 墓標より新しい削除なら、墓標の時刻をそこまで進める（監査82回目 Major）
+        if((!tombs[u] || 時(勝ち) > tombs[u]) && !勝ち.deleted_at){
           数.墓標より新しい++;
           delete tombs[u];               // 記録が生きるので、墓標を下げる
         }else{
+          if(時(勝ち) > (tombs[u]||'')) tombs[u] = 時(勝ち);
           数.墓標で除外++;
           控え.push({k, rec: 勝ち});     // どの入れ物かの札を付けて控える
           return;
@@ -9341,46 +9345,74 @@ function mergeBackup(remoteData, remoteTombs){
    親（とその祖先）も同じ集まりから復活させ、祖先の墓標を下げる。
    これをしないと「新しい編集は残す」と言いながら、親を失った子が
    迷子として除かれてしまう（監査81回目 Major）。
-   親のたどり: 1尾ずつ→魚の記録→箇所→調査、メモ→調査、マス→箇所 */
+   親のたどり: 1尾ずつ→魚の記録→箇所→調査、メモ→調査、マス→箇所、
+   さらに箇所どうし（単位→親の囲い、単位→地点）もたどる（監査82回目 Major）。
+   証拠になるのは「生きた記録」だけ。ごみ箱への削除は証拠にしない。
+   復活させる祖先がごみ箱状態なら、写しを取って印を外し、
+   更新時刻を証拠の時刻まで進めてから返す（監査82回目 Major） */
 function resurrectAncestors(box, 全勝ち, tombs, 控え, 数){
   const 親道 = [
     {k:'ind', 欄:'catch_uuid',   先:'ca'},
     {k:'ca',  欄:'station_uuid', 先:'st'},
     {k:'mc',  欄:'station_uuid', 先:'st'},
+    {k:'st',  欄:'parent_uuid',  先:'st'},
+    {k:'st',  欄:'spot_uuid',    先:'st'},
     {k:'st',  欄:'survey_uuid',  先:'sv'},
     {k:'nt',  欄:'survey_uuid',  先:'sv'},
   ];
   const ある = {};
   CLOUD_KEYS.forEach(k=>{
-    ある[k] = new Set((box[k]||[]).map(x=>x.uuid));
+    ある[k] = new Map((box[k]||[]).map(x=>[x.uuid, x]));
   });
   // 「新しい編集がある」という証拠の時刻。親をたどるとき、
   // きっかけになった子の時刻を上へ運ぶ。運ばないと、
   // 箇所そのものは古いために、その上の調査が復活しない
   const 証拠 = Object.create(null);
   const 証拠時 = x => {
-    const t = recTime(x);
+    const t = x.deleted_at ? '' : recTime(x);   // ごみ箱の記録自身は証拠にならない
     const v = 証拠[x.uuid] || '';
     return t > v ? t : v;
   };
-  // 子（下の段）から親（上の段）へ、何度か回して連鎖を拾う
-  for(let 回 = 0; 回 < 4; 回++){
+  // 子（下の段）から親（上の段）へ、何度か回して連鎖を拾う。
+  // 箇所どうしのたどり（単位→囲い→地点）が挟まるため、回数は多めに取る。
+  // 「ある」と「証拠」は増える一方なので、堂々巡りにはならない
+  for(let 回 = 0; 回 < 8; 回++){
     let 増えた = false;
     親道.forEach(道=>{
       (box[道.k]||[]).forEach(x=>{
         const pu = x && x[道.欄];
-        if(!pu || ある[道.先].has(pu)) return;
+        if(!pu || pu === x.uuid) return;
+        const 証 = 証拠時(x);
+        if(!証) return;
+        const 居る = ある[道.先].get(pu);
+        if(居る){
+          // 親はいる。ごみ箱状態で、証拠の方が新しければ、ごみ箱から出す
+          if(居る.deleted_at && 証 > String(居る.deleted_at)){
+            delete 居る.deleted_at; delete 居る.deleted_by;
+            if(証 > String(居る.updated_at||'')) 居る.updated_at = 証;
+            増えた = true;
+          }
+          // 証拠の時刻だけは上へ運ぶ（祖父母の墓標を破るために要る）
+          if(証 > (証拠[pu]||'')){ 証拠[pu] = 証; 増えた = true; }
+          return;
+        }
         const 親 = (全勝ち[道.先]||Object.create(null))[pu];
         if(!親) return;                          // どこにも無い親は復活させようがない
         const 墓 = tombs[pu];
         if(墓 === undefined) return;             // 墓標が無いのに無い＝別の理由。触らない
         // 子の編集（またはその子の証拠）が墓標より新しいときだけ、
         // 親を返して墓標を下げる
-        const t = 証拠時(x);
-        if(!墓 || t > 墓){
-          box[道.先].push(親);
-          ある[道.先].add(pu);
-          証拠[pu] = t;                          // 証拠の時刻を上へ運ぶ
+        if(!墓 || 証 > 墓){
+          const 復活 = Object.assign({}, 親);
+          if(復活.deleted_at){
+            // ごみ箱状態の写ししか無ければ、削除の方が新しい限り復活させない
+            if(!(証 > String(復活.deleted_at))) return;
+            delete 復活.deleted_at; delete 復活.deleted_by;
+            if(証 > String(復活.updated_at||'')) 復活.updated_at = 証;
+          }
+          box[道.先].push(復活);
+          ある[道.先].set(pu, 復活);
+          証拠[pu] = 証;                         // 証拠の時刻を上へ運ぶ
           delete tombs[pu];
           if(数) 数.墓標より新しい++;
           // 控えに入れてしまっていたら、取り出す
@@ -9416,7 +9448,11 @@ function normalizeDataset(ds){
     data[k] = ((ds.data && ds.data[k]) || []).filter(x=>{
       if(!x || !x.uuid) return false;
       if(tombs[x.uuid] === undefined) return true;
-      if(!tombs[x.uuid] || 時(x) > tombs[x.uuid]){ delete tombs[x.uuid]; return true; }
+      // 墓標を破れるのは生きた記録だけ（合成と同じ決まり。監査82回目 Major）
+      if((!tombs[x.uuid] || 時(x) > tombs[x.uuid]) && !x.deleted_at){
+        delete tombs[x.uuid]; return true;
+      }
+      if(時(x) > (tombs[x.uuid]||'')) tombs[x.uuid] = 時(x);
       控え.push({k, rec: x});
       return false;
     });
@@ -9498,7 +9534,12 @@ async function cloudMerge(){
     return;
   } }catch(e){}
   try{
-    const 残り = draftAll();
+    const 残り = Object.assign({}, draftAll());
+    // 端末に書けず画面の中（メモリ）だけに残った入力も、同じ控えに入れる。
+    // 容量が足りないときこそ、ここにしか残っていない（監査82回目 Major）
+    Object.keys(DRAFT_HOLD).forEach(k2=>{
+      if(DRAFT_HOLD[k2]) 残り[k2] = DRAFT_HOLD[k2];
+    });
     if(Object.keys(残り).length
        && !repairBackupPush({種類:'合成前の書きかけ', 中身: 残り})){
       toast('書きかけの控えを取れなかったため、合成をやめました', 10000);
@@ -9545,10 +9586,22 @@ async function cloudMerge(){
   }
   // 残った打ちかけは捨てる（先に flushAllForms で書いた分は記録に入っている）
   cloudDraftReset();
-  // 親子と代表の位置を、合わせた結果から決め直す
+  // 親子と代表の位置を、合わせた結果から決め直す。
+  // 直しきれなかったら、その状態をドライブへ送らない（監査82回目 minor）
+  let 整えた = true;
   try{
-    DB.surveys().forEach(sv=>{ unitRelink(sv.uuid); spotPosFix(sv.uuid); });
-  }catch(e){}
+    DB.surveys().forEach(sv=>{
+      if(!unitRelink(sv.uuid)) 整えた = false;
+      if(!spotPosFix(sv.uuid)) 整えた = false;
+    });
+  }catch(e){ 整えた = false; }
+  if(!整えた){
+    toast('合成はできましたが、親子のつながり・代表の位置を整えられませんでした。'
+      + '端末の空き容量を確認して「データを点検」をお試しください。'
+      + 'ドライブへの送り返しは止めています', 12000);
+    reset('home');
+    return;
+  }
   toast('合成しました。ドライブへも送り返します…', 6000);
   let 送り = 'error';
   try{ 送り = await cloudSave({auto:true, nested:true}); }catch(e){}
