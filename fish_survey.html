@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v95';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v97';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1880,10 +1880,46 @@ function snapCells(st, snap){
 /* 環境区分の略字。横一列に並べるため（早瀬→早） */
 const HABITAT_SHORT = {'早瀬':'早','平瀬':'平','淵':'淵','瀬頭':'頭','トロ':'ト',
                        'たまり':'た','その他':'他'};
-function habitatShort(v){ return HABITAT_SHORT[v] || v || ''; }
+function habitatShort(v){
+  // 「早瀬・淵」のように複数入っていても、1つずつ略す（2026-08-23 の実機の声）
+  return String(v||'').split('・').map(x=>HABITAT_SHORT[x] || x).filter(Boolean).join('・');
+}
 function habitatLong(short){
   const hit = Object.keys(HABITAT_SHORT).find(k=>HABITAT_SHORT[k]===short);
   return hit || (short==='なし' ? '' : short);
+}
+/* 環境区分は複数選べる（「瀬と淵の境」のような場所がある。2026-08-23 の実機の声）。
+   記録には「早瀬・淵」のように「・」でつないだ1つの文字として入れる。
+   書き出しの列も、これまでの記録も、そのまま通る */
+function habitatList(v){ return String(v||'').split('・').filter(Boolean); }
+/* 環境区分のボタン。「なし」を押すと全部外れる */
+function pickHabMulti(btn){
+  const 皆 = btn.parentElement.querySelectorAll('button');
+  if(btn.textContent === 'なし'){
+    皆.forEach(b=>b.classList.remove('on'));
+    btn.classList.add('on');
+  }else{
+    btn.classList.toggle('on');
+    皆.forEach(b=>{ if(b.textContent==='なし') b.classList.remove('on'); });
+    if(!Array.from(皆).some(b=>b.classList.contains('on'))){
+      皆.forEach(b=>{ if(b.textContent==='なし') b.classList.add('on'); });
+    }
+  }
+  draftTouch();
+}
+/* いま押されている環境区分（正式な名前で）。順番は選択肢の並びにそろえる */
+function habMultiVal(){
+  const on = $$(`[data-segmulti="envhab"] button.on`)
+    .map(b=>b.textContent).filter(x=>x!=='なし').map(habitatLong);
+  return OPT.habitat.filter(h=>on.indexOf(h)>=0).join('・');
+}
+function applyHabMulti(v){
+  const wrap = document.querySelector(`[data-segmulti="envhab"]`); if(!wrap) return;
+  const 選ばれ = habitatList(habitatShort(v||''));
+  Array.from(wrap.querySelectorAll('button')).forEach(b=>{
+    b.classList.toggle('on', b.textContent==='なし' ? !選ばれ.length
+      : 選ばれ.indexOf(b.textContent)>=0);
+  });
 }
 
 /* 画面は m・m/s、中は cm・cm/s。出し入れのときだけ直す。
@@ -1928,7 +1964,7 @@ function envRampColor(v, lo, hi){
 /* いまの基準で、その記録の色を決める */
 function envColorOf(st, range){
   const by = envColorBy();
-  if(by === '環境区分')  return envCatColor(OPT.habitat, st.habitat_type);
+  if(by === '環境区分')  return envCatColor(OPT.habitat, habitatList(st.habitat_type)[0]);
   if(by === '河床材料')  return envCatColor(OPT.substrate, st.substrate1);
   if(by === '礫の状況')  return envCatColor(OPT.gravel, st.gravel_condition);
   if(by === '流速')      return envRampColor(st.velocity_rep_cms, range.vLo, range.vHi);
@@ -4869,7 +4905,14 @@ function dbRowOf(sv, st, c, inds){
     // 何日かにわたる調査では、その箇所の日付を使う。
     // 取り込み側は調査日で調査を分けるので、日ごとに別の調査として入る
     '調査日': stationDate(st, sv), '季節':sv.season||'', '天気':si.weather,
-    '水温': numOf(st.water_temp),
+    // 水温は、その箇所に無ければ地点の水温を使う（地点情報で測るため。
+    // 2026-08-23 の実機の声）
+    '水温': (()=>{
+      const own = numOf(st.water_temp);
+      if(own !== '') return own;
+      const sp = st.spot_uuid ? DB.liveStation(st.spot_uuid) : null;
+      return (sp && sp.survey_uuid === sv.uuid) ? numOf(sp.water_temp) : '';
+    })(),
     // 代表値は「手入力があればそれ、無ければ測点の平均」
     '水深': cmToM(stationDepth(st, inds).rep),
     '流速': cmToM(stationVelocity(st, inds).rep),
@@ -5573,6 +5616,10 @@ function spotInfoHtml(sel, sv){
     <label>天気</label>
     <div onclick="setTimeout(spotInfoSave,0)">
       ${segHtml('spotWeather', OPT.weather, sel.weather||'', true)}</div>
+    <label>水温（℃）</label>
+    <input id="sp_wt" inputmode="decimal" value="${esc(
+      sel.water_temp!==undefined && sel.water_temp!==null ? sel.water_temp : '')}"
+      placeholder="例）12.5" oninput="spotInfoTouch()" onchange="spotInfoSave()">
     <label>メモ</label>
     <textarea id="sp_memo" oninput="spotInfoTouch()"
       onchange="spotInfoSave()">${esc(sel.memo||'')}</textarea>
@@ -5595,6 +5642,7 @@ function spotInfoVals(){
   return {uuid: sel.uuid, v: {
     section_name: strVal('#sp_section'), site_name: strVal('#sp_site'),
     river_morphology_a: segVal('spotFormA'), weather: segVal('spotWeather'),
+    water_temp: strVal('#sp_wt'),
     memo: strVal('#sp_memo')}};
 }
 /* 打っているそばから控える。
@@ -5630,10 +5678,14 @@ function spotInfoSave(){
   const st = DB.liveStation(sel.uuid); if(!st) return true;
   const v = {section_name: strVal('#sp_section'), site_name: strVal('#sp_site'),
              river_morphology_a: segVal('spotFormA'), weather: segVal('spotWeather'),
+             water_temp: strVal('#sp_wt'),
              memo: strVal('#sp_memo')};
-  const 同じ = Object.keys(v).every(k => (st[k]||'') === v[k]);
+  // 水温はおかしな値を先に断る（-5〜45℃）
+  const 難 = rangeCheck([['水温', v.water_temp, -5, 45]]);
+  if(難){ toast(難, 6000); SPOT_HOLD[sel.uuid] = v; return false; }
+  const 同じ = Object.keys(v).every(k => String(st[k]===undefined||st[k]===null?'':st[k]) === String(v[k]));
   if(同じ){ draftClear('spotinfo:'+sel.uuid); return true; }
-  Object.keys(v).forEach(k=>{ st[k] = v[k]; });
+  Object.keys(v).forEach(k=>{ st[k] = (k==='water_temp') ? numOf(v[k]) : v[k]; });
   if(!DB.upsert(DB.key.st, st)){
     const 残せた = draftSave('spotinfo:'+sel.uuid, v);
     SPOT_HOLD[sel.uuid] = v;      // 控えも取れなくても、画面には持ち続ける
@@ -5816,19 +5868,10 @@ SCREENS.surveyEdit = (svUuid)=>{
 
       <div id="f_spotInfo">${spotInfoHtml(sel, sv)}</div>
 
-      ${foldHtml('svmore', 'くわしい設定', '', `
-        <h3 style="margin-top:0">環境の取り方</h3>
-        ${segHtml('envm', OPT.envMethod, g('env_method_default')||'点')}
-        <div class="dim small" style="margin-top:8px">
-          <b>点</b>：測点をどんどん打って、水深・流速を拾います。<br>
-          <b>ライン</b>：早瀬・平瀬・淵…を縦断的に区間で区切り、始点と終点を押さえて記録します。<br>
-          <b>メッシュ</b>：範囲に格子を切って、マスごとに詳しく記録します。
-        </div>
-        <div class="dim small">ここで決めるのは<b>新しく作るときの初期値</b>です。
-          取り方は1つずつ変えられます。</div>
-        <div class="dim small">天気・区間名・地点名・河川形態A・メモは、
-          <b>地点ごと</b>に入れます（上の「▼ 地点情報」）。</div>
-      `)}
+      <!-- 「くわしい設定」は無くした（2026-08-23 の実機の声）。
+           中身は「環境の取り方の初期値」だけで、地点→地図の流れでは
+           点・ラインを地図のボタンで選ぶため、使われていなかった。
+           保存されている env_method_default は、前の版の調査のために残る -->
 
       <!-- この調査の代表点。地点を置いたときに自動で入る。
            取り込み側が緯度経度で調査をひとまとめにするので、値は持ち続ける。
@@ -6171,7 +6214,10 @@ function saveSurvey(svUuid){
   rec.survey_kind        = f.survey_kind
     ? (f.survey_kind === '物理環境' ? '物理環境' : '魚')
     : (rec.survey_kind || '魚');
-  rec.env_method_default = f.env_method_default || '点';
+  // 「環境の取り方」の欄は無くした（2026-08-23）。
+  // 前の版の調査に入っている値は、保存しても書き替えない
+  if(f.env_method_default) rec.env_method_default = f.env_method_default;
+  else if(!svUuid) rec.env_method_default = '点';
   // 物理環境の調査に「詳細」は無い。詳細は魚を点ごとに記録するための形。
   // ただし画面から取れないときは触らない。触ると、前に作った「詳細」の調査が
   // 開いて保存しただけで一般に変わってしまう（監査34回目 Critical）
@@ -7687,7 +7733,7 @@ function envItemFormWire(cur, sv){
   const d = ownsLock() ? draftForForm(key) : null;
   if(d){
     applySels(d);
-    applySegRaw('envhab', d.__hab);
+    applyHabMulti(d.__hab);
     applySeg('envsub', d.__sub); applySeg('envgr', d.__gr);
     toast('書きかけを戻しました');
   }
@@ -7706,7 +7752,7 @@ function envItemFormWire(cur, sv){
     // pickSeg はボタン自身の onclick なので、ここへ来る時点で選び終わっている。
     // ひと呼吸置くと、その間に画面が変わって取りこぼす（2026-08-18 の監査 Major）
     box.addEventListener('click', e=>{
-      if(e.target && e.target.closest && e.target.closest('[data-seg] button')){
+      if(e.target && e.target.closest && e.target.closest('[data-seg] button, [data-segmulti] button')){
         envAutoSave(cur.uuid);
       }
     });
@@ -7772,13 +7818,14 @@ ${(opt && opt.head === false) ? '' : `      <div class="card">
               <input type="time" id="ev_t2" value="${esc(cur.survey_time_end||'')}"></div>` : ''}
           </div>`, envMoveOn(cur.uuid))}
 `}
-        <label>環境区分</label>
-        <div class="seg" data-seg="envhab">
+        <label>環境区分（いくつでも選べます）</label>
+        <div class="seg" data-segmulti="envhab">
           ${['なし'].concat(OPT.habitat).map(o=>{
             const short = o==='なし' ? 'なし' : habitatShort(o);
-            const on = (o==='なし' ? !g('habitat_type') : g('habitat_type')===o);
+            const 選ばれ = habitatList(g('habitat_type'));
+            const on = (o==='なし' ? !選ばれ.length : 選ばれ.indexOf(o)>=0);
             return `<button type="button" class="${on?'on':''}"
-              onclick="pickSeg(this)" title="${esc(o)}">${esc(short)}</button>`;
+              onclick="pickHabMulti(this)" title="${esc(o)}">${esc(short)}</button>`;
           }).join('')}
         </div>
 
@@ -8994,7 +9041,14 @@ SCREENS.spot = (stUuid)=>{
   const 尾 = 合計.尾, 種 = 合計.種;
   const 直接種 = new Set(cs.map(c=>c.species_id).filter(Boolean)).size;
   const 直接尾 = stationTotal(st);
-  const 直接環境 = !!envHasOwn(st);
+  // 水温は地点情報の欄になったので、水温だけなら「前のやり方」ではない
+  //（2026-08-23 の実機の声）
+  const 直接環境 = (()=>{
+    const e = envHasOwn(st);
+    if(!e) return false;
+    if(e === '水温・流量' && numOf(st.flow_rate)==='') return false;
+    return true;
+  })();
   // 前の版で地点へ直に入れた、写真・漁具・労力。
   // 見落とすと、値は残っているのに画面から直せない（監査50回目 Major）
   const 直接写真 = (st.photos||[]).length;
@@ -9762,7 +9816,7 @@ function envItemSels(){
 }
 function collectEnvItem(){
   const o = collectSels(envItemSels());
-  o.__hab = segRaw('envhab');       // 略字のまま控える
+  o.__hab = habMultiVal();          // 正式な名前でつないで控える
   o.__sub = segVal('envsub');
   o.__gr  = segVal('envgr');
   o.photos = (SCREENS._photos||[]).slice();
@@ -10168,7 +10222,7 @@ function saveEnvItem(stUuid, opt){
   const err = envItemError();
   if(err){ envShowError(err); if(!quiet) toast(err, 6000); return false; }
 
-  st.habitat_type     = habitatLong(segVal('envhab'));
+  st.habitat_type     = habMultiVal();
   st.substrate1       = segVal('envsub');
   st.gravel_condition = segVal('envgr');
   st.depth_rep_cm     = mToCm(strVal('#ev_d'));
