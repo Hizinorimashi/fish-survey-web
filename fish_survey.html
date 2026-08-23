@@ -88,6 +88,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .warnbox{background:#2a2110;border:1px solid #4d3f16;color:#f0d48a;border-radius:8px;padding:10px;font-size:13px;margin:10px 0}
 .ngbox{background:#2a1414;border:1px solid #5c2626;color:#ffb4ad;border-radius:8px;padding:10px;font-size:13px;margin:10px 0}
 .mediagrid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px}
+.photogrid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
 .mediathumb{position:relative;aspect-ratio:1/1;border-radius:8px;overflow:hidden;background:#1a1d22}
 .mediathumb img{width:100%;height:100%;object-fit:cover;display:block}
 .mediadel{position:absolute;top:2px;right:2px;width:26px;height:26px;border:0;border-radius:13px;
@@ -131,7 +132,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v97';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v98';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -5511,9 +5512,21 @@ SCREENS.home = ()=>{
       ${list.length && !pickOn()
         ? `<button class="btn" onclick="pickStart()">いらない調査を選んで消す</button>` : ''}
       <button class="btn" onclick="nav('sites',null)">地点を登録・確認する（${DB.sites().length}件）</button>
-      ${(()=>{ const n = trashCount(); return n
-        ? `<button class="btn" onclick="nav('trash',null)">ごみ箱（${n}件）</button>` : ''; })()}
-      <button class="btn" onclick="nav('cloud',null)">クラウド保存（Googleドライブ）</button>
+      ${foldHtml('hometools', '資料・データの管理',
+        `<span class="fsub">図鑑PDF・写真・書き出し・点検</span>`, `
+        <button class="btn" onclick="nav('refdocs',null)">資料・図鑑（PDF取り込み）</button>
+        <button class="btn" onclick="GAL_SV=''; GAL_PAGE=0; nav('gallery',null)">写真一覧</button>
+        <div class="btn2">
+          <button class="btn" onclick="nav('exportAll',null)">書き出し</button>
+          <button class="btn" onclick="nav('importHub',null)">取り込み</button>
+        </div>
+        <div class="btn2">
+          <button class="btn" onclick="nav('trash',null)">ごみ箱${(()=>{
+            const n = trashCount(); return n ? `（${n}件）` : ''; })()}</button>
+          <button class="btn" onclick="nav('cloud',null)">クラウド保存</button>
+        </div>
+        <button class="btn" onclick="nav('check',null)">データ点検</button>
+      `)}
       <div class="hr"></div>
       <div class="card">
         <div class="row">
@@ -8942,6 +8955,354 @@ function cloudSignOut(){
   toast('サインアウトしました');
   render();
 }
+/* ============================================================
+   資料・データの管理（2026-08-23 の実機の声・鳥アプリに合わせた魚版）
+   ・JSONバックアップ（全データ・写真込み）とその取り込み
+   ・写真一覧／資料PDF／データ点検
+   クラウド保存（Googleドライブ）は既にあるものをそのまま使う
+   ============================================================ */
+
+/* ---- JSONバックアップ（書き出し） ----
+   形は cloudPack と同じ {app,version,saved_at,data} に photos を足したもの。
+   取り込み側は cloudCheck で同じ検査を通す */
+async function exportBackup(){
+  toast('バックアップを作っています…', 8000);
+  let text;
+  try{ text = cloudPack(); }
+  catch(e){ toast('記録を読み取れないため、書き出せませんでした', 8000); return; }
+  const 点検 = cloudCheck(text);
+  if(!点検.ok){
+    toast('記録に戻せない形が混ざっています（' + 点検.why + '）。'
+      + '先に「データ点検」をご覧ください', 10000);
+    return;
+  }
+  const o = JSON.parse(text);
+  // 写真も入れる（記録が指しているものだけ）
+  o.photos = [];
+  const ids = cloudPhotoIds();
+  let 欠け = 0;
+  for(const id of ids){
+    let r = null; try{ r = await PhotoDB.get(id); }catch(e){}
+    if(!r || !r.blob){ 欠け++; continue; }
+    const b64 = await new Promise(res=>{
+      const fr = new FileReader();
+      fr.onload = ()=>res(String(fr.result||'').split(',')[1] || '');
+      fr.onerror = ()=>res('');
+      fr.readAsDataURL(r.blob);
+    });
+    if(b64) o.photos.push({id, ext: r.ext||'jpg', size: r.blob.size, b64});
+    else 欠け++;
+  }
+  const day = dateValue().replace(/-/g,'');
+  download('fish_survey_backup_' + day + '.json', JSON.stringify(o), 'application/json');
+  toast('バックアップを書き出しました（記録と写真 ' + o.photos.length + '枚'
+    + (欠け ? '・この端末に無い写真 ' + 欠け + '枚は入っていません' : '') + '）', 9000);
+}
+
+/* ---- JSONバックアップ（取り込み） ---- */
+async function doImport(){
+  const inp = $('#impFile');
+  const f = inp && inp.files && inp.files[0];
+  if(!f){ toast('ファイルを選んでください', 6000); return; }
+  if(!writeAllowed()){
+    toast('このタブでは取り込めません。記録を入れているタブでお試しください', 7000);
+    return;
+  }
+  let text;
+  try{ text = await f.text(); }
+  catch(e){ toast('ファイルを読めませんでした', 8000); return; }
+  // 写真を分けてから、記録の部分を cloudCheck と同じ検査に通す
+  let o;
+  try{ o = JSON.parse(text); }catch(e){ toast('中身を読めませんでした', 8000); return; }
+  const photos = Array.isArray(o.photos) ? o.photos : [];
+  delete o.photos;
+  const 点検 = cloudCheck(JSON.stringify(o));
+  if(!点検.ok){ toast('取り込めない形です（' + 点検.why + '）', 10000); return; }
+  const 名 = {sv:'調査',st:'箇所',ca:'魚の記録',ind:'1尾ずつ',nt:'メモ',mc:'メッシュのマス'};
+  const 数 = CLOUD_KEYS.map(k=>名[k] + ' ' + (点検.数[k]||0) + '件').join('・');
+  if(!confirm('このバックアップで、いまの記録を丸ごと置き換えます。\n'
+    + '（' + 数 + '・写真 ' + photos.length + '枚）\n'
+    + 'いまの記録は消えます。よろしいですか？')) return;
+  if(!cloudApply(点検.data)) return;
+  // 写真を戻す（形のおかしいものは飛ばす）
+  let 戻した = 0, 飛ばした = 0;
+  for(const pp of photos){
+    if(!pp || !safeId(pp.id) || typeof pp.b64 !== 'string' || !pp.b64){ 飛ばした++; continue; }
+    try{
+      const bin = atob(pp.b64);
+      const buf = new Uint8Array(bin.length);
+      for(let i=0;i<bin.length;i++) buf[i] = bin.charCodeAt(i);
+      const blob = new Blob([buf]);
+      if(!blob.size){ 飛ばした++; continue; }
+      await PhotoDB.put({id: pp.id, blob, ext: String(pp.ext||'jpg').slice(0,8),
+        size: blob.size, added_at: nowISO()});
+      戻した++;
+    }catch(e){ 飛ばした++; }
+  }
+  toast('取り込みました（写真 ' + 戻した + '枚'
+    + (飛ばした ? '・取り込めなかった写真 ' + 飛ばした + '枚' : '') + '）。'
+    + 'ホームへ戻ります', 9000);
+  reset('home');
+}
+
+SCREENS.importHub = ()=>({
+  title:'取り込み',
+  html:`
+    <div class="card">
+      <h3 style="margin-top:0">JSONバックアップから戻す</h3>
+      <div class="dim small">「書き出し」で作った fish_survey_backup_*.json を選ぶと、
+        調査・記録・写真を丸ごと戻します。<b>いまの記録は置き換わります。</b></div>
+      <input type="file" id="impFile" accept="application/json,.json">
+      <button class="btn pri" onclick="doImport()">このファイルを取り込む</button>
+    </div>
+    <div class="dim small">ドライブに預けた分から戻すときは、
+      「クラウド保存」の画面をお使いください。</div>
+  `});
+
+/* ---- 全体の書き出しの入口（調査ごとの書き出しへの案内も兼ねる） ---- */
+SCREENS.exportAll = ()=>{
+  const svs = DB.surveys().slice()
+    .sort((a,b)=>String(b.survey_date||'').localeCompare(String(a.survey_date||'')));
+  return {
+    title:'書き出し',
+    html:`
+      <div class="card">
+        <h3 style="margin-top:0">まるごと1つのファイルに</h3>
+        <button class="btn pri" onclick="exportBackup()">JSONバックアップ（全記録・写真込み）</button>
+        <div class="dim small">機種変え・控えの持ち出しに。戻すときは「取り込み」から。</div>
+      </div>
+      <h3>調査ごとの書き出し（CSV・写真ZIP）</h3>
+      ${svs.length ? svs.map(sv=>`<div class="card tap"
+          onclick="nav('exportHub','${sv.uuid}')">
+        <div class="row"><div class="grow">
+          <div style="font-weight:700">${esc(sv.river_name||'')} ${esc(sv.site_name||'')}</div>
+          <div class="dim small">${esc(String(sv.survey_date||'').slice(0,10))}</div>
+        </div><span class="dim">›</span></div>
+      </div>`).join('') : '<div class="dim small">まだ調査がありません。</div>'}
+    `};
+};
+
+/* ---- 写真一覧 ---- */
+let GAL_SV = '', GAL_PAGE = 0;
+const GAL_PER = 24;
+/* 写真ID → その写真が付いている調査。記録をぜんぶなめて作る */
+function galleryOwners(){
+  const own = {};
+  try{
+    Object.keys(DB.key).forEach(kk=>{
+      DB.loadRaw(DB.key[kk]).forEach(x=>{
+        if(!x || x.deleted_at) return;
+        const sv = x.survey_uuid || (kk==='sv' ? x.uuid : '');
+        photoIdsOf(x).forEach(id=>{ if(!own[id]) own[id] = sv || ''; });
+      });
+    });
+  }catch(e){}
+  return own;
+}
+function galSetSv(v){ GAL_SV = v; GAL_PAGE = 0; render(); }
+function galSetPage(p){ GAL_PAGE = p; render(); }
+SCREENS.gallery = ()=>{
+  const own = galleryOwners();
+  const ids = Object.keys(own).filter(id=>!GAL_SV || own[id]===GAL_SV);
+  const svs = DB.surveys().slice()
+    .sort((a,b)=>String(b.survey_date||'').localeCompare(String(a.survey_date||'')));
+  const pages = Math.max(1, Math.ceil(ids.length / GAL_PER));
+  const page = Math.min(Math.max(0, GAL_PAGE), pages-1);
+  const shown = ids.slice(page*GAL_PER, (page+1)*GAL_PER);
+  return {
+    title:'写真一覧',
+    sub:[{text:`${ids.length}枚`}],
+    html:`
+      <label>調査で絞り込み</label>
+      <select onchange="galSetSv(this.value)">
+        <option value="">すべての調査</option>
+        ${svs.map(sv=>`<option value="${sv.uuid}" ${GAL_SV===sv.uuid?'selected':''}>
+          ${esc(sv.river_name||'')} ${esc(String(sv.survey_date||'').slice(0,10))}</option>`).join('')}
+      </select>
+      ${ids.length ? `<div id="galGrid" class="photogrid" style="margin-top:10px"></div>`
+        : '<div class="dim small" style="margin-top:10px">記録に付いた写真が、ここに並びます。</div>'}
+      ${pages>1 ? `<div class="row" style="margin-top:8px">
+        <button class="btn sm" style="width:auto" ${page<=0?'disabled':''}
+          onclick="galSetPage(${page-1})">前へ</button>
+        <div class="grow dim small" style="text-align:center;align-self:center">${page+1} / ${pages}</div>
+        <button class="btn sm" style="width:auto" ${page>=pages-1?'disabled':''}
+          onclick="galSetPage(${page+1})">次へ</button>
+      </div>` : ''}
+    `,
+    async onMount(){
+      const gen = screenGen();
+      const box = $('#galGrid'); if(!box) return;
+      const parts = [], mine = [];
+      for(const id of shown){
+        let r = null; try{ r = await PhotoDB.get(id); }catch(e){}
+        if(!r || !r.blob) continue;
+        const url = URL.createObjectURL(r.blob);
+        mine.push(url);
+        parts.push(`<div class="mediathumb"><img src="${url}" alt="写真"
+          onclick="viewPhoto('${id}')"></div>`);
+      }
+      if(screenStale(gen)){
+        mine.forEach(u=>{ try{ URL.revokeObjectURL(u); }catch(e){} });
+        return;
+      }
+      revokePhotoUrls();
+      SCREENS._photoUrls = mine;
+      box.innerHTML = parts.join('') ||
+        '<div class="dim small">この端末に写真の実体がありません。</div>';
+    }};
+};
+
+/* ---- 資料PDF（図鑑など）----
+   クラウド保存・バックアップには入れない（大きいため）。この端末の中だけ */
+const DocDB = {
+  _open(){
+    return new Promise((res, rej)=>{
+      const rq = indexedDB.open('fs_docs', 1);
+      rq.onupgradeneeded = ()=>{ rq.result.createObjectStore('docs', {keyPath:'id'}); };
+      rq.onsuccess = ()=>res(rq.result);
+      rq.onerror = ()=>rej(rq.error);
+    });
+  },
+  async _do(mode, fn){
+    const db = await this._open();
+    try{
+      return await new Promise((res, rej)=>{
+        const tx = db.transaction('docs', mode);
+        const rq = fn(tx.objectStore('docs'));
+        tx.oncomplete = ()=>res(rq && rq.result !== undefined ? rq.result : undefined);
+        tx.onerror = ()=>rej(tx.error);
+      });
+    }finally{ try{ db.close(); }catch(e){} }
+  },
+  all(){ return this._do('readonly', st=>st.getAll()); },
+  put(rec){ return this._do('readwrite', st=>st.put(rec)); },
+  del(id){ return this._do('readwrite', st=>st.delete(id)); },
+};
+async function docAdd(){
+  const inp = $('#docFile');
+  const f = inp && inp.files && inp.files[0];
+  if(!f){ toast('PDFファイルを選んでください', 6000); return; }
+  if(f.size > 200*1024*1024){ toast('200MBまでのPDFにしてください', 8000); return; }
+  try{
+    await DocDB.put({id: uuid(), name: f.name, size: f.size, blob: f,
+      added_at: nowISO()});
+    toast('取り込みました');
+    render();
+  }catch(e){
+    toast('取り込めませんでした（端末の空き容量をご確認ください）', 9000);
+  }
+}
+async function docOpen(id){
+  try{
+    const all = await DocDB.all();
+    const r = (all||[]).find(x=>x.id===id);
+    if(!r || !r.blob){ toast('この資料が見つかりません', 6000); return; }
+    const url = URL.createObjectURL(r.blob);
+    window.open(url, '_blank');
+    setTimeout(()=>{ try{ URL.revokeObjectURL(url); }catch(e){} }, 60000);
+  }catch(e){ toast('開けませんでした', 6000); }
+}
+async function docDel(id, name){
+  if(!confirm('「' + name + '」を消します。よろしいですか？（元に戻せません）')) return;
+  try{ await DocDB.del(id); toast('消しました'); render(); }
+  catch(e){ toast('消せませんでした', 6000); }
+}
+SCREENS.refdocs = ()=>({
+  title:'資料・図鑑',
+  html:`
+    <div class="card">
+      <h3 style="margin-top:0">PDFを取り込む</h3>
+      <div class="dim small">図鑑や調査要領のPDFを入れておくと、圏外でも開けます。
+        この端末の中だけに置き、クラウド保存やバックアップには入りません。</div>
+      <input type="file" id="docFile" accept="application/pdf,.pdf">
+      <button class="btn pri" onclick="docAdd()">取り込む</button>
+    </div>
+    <div id="docList"><div class="dim small">読み込んでいます…</div></div>
+  `,
+  async onMount(){
+    const gen = screenGen();
+    let all = [];
+    try{ all = await DocDB.all() || []; }catch(e){}
+    if(screenStale(gen)) return;
+    const box = $('#docList'); if(!box) return;
+    all.sort((a,b)=>String(b.added_at||'').localeCompare(String(a.added_at||'')));
+    box.innerHTML = all.length ? all.map(r=>`<div class="card">
+      <div class="row">
+        <div class="grow" style="min-width:0">
+          <div style="font-weight:700;overflow:hidden;text-overflow:ellipsis;
+            white-space:nowrap">${esc(r.name||'')}</div>
+          <div class="dim small">${fmtBytes(r.size||0)}</div>
+        </div>
+        <button class="btn sm" style="width:auto;margin:0"
+          onclick="docOpen('${r.id}')">開く</button>
+        <button class="btn sm ng" style="width:auto;margin:0"
+          onclick="docDel('${r.id}','${esc(r.name||'')}')">消す</button>
+      </div>
+    </div>`).join('') : '<div class="dim small">まだ資料がありません。</div>';
+  }});
+
+/* ---- データ点検 ---- */
+SCREENS.check = ()=>{
+  let 件数 = {}, 点検 = null, 迷子 = null;
+  try{
+    CLOUD_KEYS.forEach(k=>{ 件数[k] = DB.loadRaw(DB.key[k]).filter(x=>x && !x.deleted_at).length; });
+    const text = cloudPack();
+    点検 = cloudCheck(text);
+    迷子 = window._cloudPruned;
+  }catch(e){ 点検 = {ok:false, why:'記録を読み取れませんでした'}; }
+  const 名 = {sv:'調査', st:'箇所・地点・単位', ca:'魚の記録', ind:'1尾ずつの記録',
+              nt:'メモ', mc:'メッシュのマス'};
+  return {
+    title:'データ点検',
+    html:`
+      <div class="card">
+        <h3 style="margin-top:0">いまの記録</h3>
+        ${CLOUD_KEYS.map(k=>`<div class="row">
+          <div class="grow">${名[k]}</div>
+          <div style="font-weight:700">${件数[k]!==undefined?件数[k]:'—'}件</div>
+        </div>`).join('')}
+      </div>
+      ${点検 && 点検.ok
+        ? `<div class="card"><div style="color:#3fb950;font-weight:700">
+            記録の形に問題はありません</div>
+           <div class="dim small">親子のつながり・IDの形・重なりを確かめました。</div></div>`
+        : `<div class="warnbox">記録に戻せない形が混ざっています：
+            ${esc((点検 && 点検.why) || '')}<br>
+            クラウド保存やバックアップからは、この分が除かれます。</div>`}
+      ${迷子 ? `<div class="warnbox">もとの記録が見あたらない分：
+          ${esc(Object.keys(迷子).map(k=>(名[k]||k)+' '+迷子[k]+'件').join('・'))}<br>
+          （書き出しには入りません。ごみ箱の「完全に消す」の消し残りなどです）</div>` : ''}
+      <div id="checkPhotos" class="card"><div class="dim small">写真を確かめています…</div></div>
+    `,
+    async onMount(){
+      const gen = screenGen();
+      let refs = 0, 実体 = 0, 実体なし = 0, 参照なし = 0;
+      try{
+        const r = photoRefs();
+        const all = await PhotoDB.all() || [];
+        if(r){
+          refs = r.size;
+          実体 = all.filter(x=>x && x.blob).length;
+          const ある = new Set(all.filter(x=>x && x.blob).map(x=>x.id));
+          実体なし = Array.from(r).filter(id=>!ある.has(id)).length;
+          参照なし = all.filter(x=>x && x.blob && !r.has(x.id)).length;
+        }
+      }catch(e){}
+      if(screenStale(gen)) return;
+      const box = $('#checkPhotos'); if(!box) return;
+      box.innerHTML = `<h3 style="margin-top:0">写真</h3>
+        <div class="row"><div class="grow">記録が指している写真</div>
+          <div style="font-weight:700">${refs}枚</div></div>
+        <div class="row"><div class="grow">この端末にある実体</div>
+          <div style="font-weight:700">${実体}枚</div></div>
+        ${実体なし ? `<div class="warnbox">実体の無い写真の参照が ${実体なし}枚あります。
+          ほかの端末で撮った分なら、クラウド保存の「写真も戻す」で取り寄せられます。</div>` : ''}
+        ${参照なし ? `<div class="dim small">どの記録にも付いていない実体が ${参照なし}枚あります
+          （撮ったが保存しなかった分。定期の片付けで消えます）。</div>` : ''}
+        ${!実体なし && !参照なし ? `<div class="dim small">参照と実体はそろっています。</div>` : ''}`;
+    }};
+};
+
 SCREENS.cloud = ()=>{
   let 件数 = 0;
   try{ 件数 = CLOUD_KEYS.reduce((a,k)=>a + DB.loadRaw(DB.key[k]).length, 0); }catch(e){ 件数 = -1; }
