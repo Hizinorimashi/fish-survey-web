@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v102';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v104';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -367,11 +367,15 @@ const DB = {
   },
   save(k, arr){
     if(!writeAllowed()) return false;
-    try{ localStorage.setItem(k, JSON.stringify(arr)); return true; }
+    try{ localStorage.setItem(k, JSON.stringify(arr)); }
     catch(e){
       toast('保存できませんでした。端末の空き容量を確認してください', 6000);
       return false;
     }
+    // 記録が変わった。少し置いてから、自動でドライブへ控えを送る
+    //（2026-08-23 の実機の声・鳥アプリから）
+    try{ autoBackupQueue(); }catch(e){}
+    return true;
   },
   get(k,u){ return this.load(k).find(x=>x.uuid===u) || null; },
   /* 生きているものだけ返す。消したはずのものが画面に出ないよう、
@@ -401,13 +405,15 @@ const DB = {
     catch(e){ toast('記録を読み取れないため、削除を中止しました', 6000); return false; }
     const t = nowISO();
     let hit=false;
-    a.forEach(x=>{ if(x.uuid===u && !x.deleted_at){ x.deleted_at=t; if(by) x.deleted_by=by; hit=true; } });
+    a.forEach(x=>{ if(x.uuid===u && !x.deleted_at){
+      x.deleted_at=t; x.updated_at=t; if(by) x.deleted_by=by; hit=true; } });
     if(!hit) return true;
     return this.save(k, a);
   },
   restore(k, u){
     let a; try{ a=this.loadRaw(k); }catch(e){ return false; }
-    a.forEach(x=>{ if(x.uuid===u){ delete x.deleted_at; delete x.deleted_by; } });
+    a.forEach(x=>{ if(x.uuid===u){
+      delete x.deleted_at; delete x.deleted_by; x.updated_at = nowISO(); } });
     return this.save(k, a);
   },
 
@@ -8231,6 +8237,9 @@ function trashPurgeMany(list){
     }
     書いた.push(kk);
   }
+  // 消したことを墓標に残す。残さないと、ほかの端末との合成で戻ってくる
+  //（2026-08-23・合成同期のため）
+  Object.keys(消す).forEach(kk=>{ 消す[kk].forEach(u=>tombstoneAdd(u)); });
   toast('完全に消しました');
   return true;
 }
@@ -8508,7 +8517,8 @@ function cloudPack(){
   const n = Object.keys(外した).reduce((a,k)=>a+外した[k], 0);
   if(n) window._cloudPruned = 外した; else window._cloudPruned = null;
   return JSON.stringify({app:'fish_survey', version:APP_VERSION,
-    saved_at: nowISO(), data: box});
+    saved_at: nowISO(), data: box,
+    tombstones: tombstones()});
 }
 /* 読んだ文字が、このアプリの控えとして使えるか */
 /* IDとして安全な形か。細工したIDが画面の作りに紛れ込むのを防ぐ
@@ -8870,19 +8880,45 @@ async function cloudRestorePhotos(token, folder){
   }
   return {戻した, 足りない: 足りない.length - 戻した};
 }
-async function cloudSave(){
+/* ---- 自動クラウドバックアップ ----
+   記録が変わってから少し置いて、自動でドライブへ送る。
+   サインインが生きているときだけ動く（現場でサインインの画面を出さない）。
+   送っている最中の変更は、終わってからもう一度送る */
+const AUTO_BACKUP_MS = 3 * 60 * 1000;   // 変わってから3分後
+let AUTO_BACKUP_T = null, AUTO_BACKUP_BUSY = false, AUTO_BACKUP_AGAIN = false;
+function autoBackupOn(){ return prefs().auto_backup !== false; }   // 既定はON
+function autoBackupQueue(){
+  if(!autoBackupOn()) return;
+  if(!gdSignedIn()) return;               // サインインが切れていたら静かに何もしない
+  if(AUTO_BACKUP_T) clearTimeout(AUTO_BACKUP_T);
+  AUTO_BACKUP_T = setTimeout(autoBackupRun, AUTO_BACKUP_MS);
+}
+async function autoBackupRun(){
+  AUTO_BACKUP_T = null;
+  if(!autoBackupOn() || !writeAllowed() || !gdSignedIn()) return;
+  if(AUTO_BACKUP_BUSY){ AUTO_BACKUP_AGAIN = true; return; }
+  AUTO_BACKUP_BUSY = true;
+  try{
+    await cloudSave({auto:true});
+  }catch(e){}
+  AUTO_BACKUP_BUSY = false;
+  if(AUTO_BACKUP_AGAIN){ AUTO_BACKUP_AGAIN = false; autoBackupQueue(); }
+}
+async function cloudSave(opt){
+  const 自動 = !!(opt && opt.auto);
+  const 言う = 自動 ? (()=>{}) : toast;
   if(!writeAllowed()){
-    toast('このタブでは保存できません。記録を入れているタブでお試しください', 7000);
+    言う('このタブでは保存できません。記録を入れているタブでお試しください', 7000);
     return;
   }
   let text;
   try{ text = cloudPack(); }
-  catch(e){ toast('記録を読み取れないため、保存できませんでした', 8000); return; }
+  catch(e){ 言う('記録を読み取れないため、保存できませんでした', 8000); return; }
   // 送る前に、戻せる控えかを自分で確かめる。
   // 確かめずに上げると、「保存しました」と出た控えを、あとで自分が拒む（監査49回目 Major）
   const 点検 = cloudCheck(text);
   if(!点検.ok){
-    toast('この控えは戻せない形なので、保存しませんでした（' + 点検.why + '）。'
+    言う('この控えは戻せない形なので、保存しませんでした（' + 点検.why + '）。'
       + '前の控えはそのまま残しています', 12000);
     return;
   }
@@ -8891,10 +8927,10 @@ async function cloudSave(){
     const 内訳 = Object.keys(外した)
       .map(k=>`${({sv:'調査',st:'箇所',ca:'魚の記録',ind:'1尾ずつ',nt:'メモ',
                    mc:'メッシュのマス'})[k] || k}${外した[k]}件`).join('・');
-    toast('もとの記録が見あたらない分（' + 内訳 + '）は、控えに入れていません。'
+    言う('もとの記録が見あたらない分（' + 内訳 + '）は、控えに入れていません。'
       + '手元の記録はそのままです', 10000);
   }
-  toast('ドライブに保存しています…', 8000);
+  言う('ドライブに保存しています…', 8000);
   try{
     const token = await gdGetToken();
     const folder = await gdFolder(token);
@@ -8913,15 +8949,132 @@ async function cloudSave(){
     try{ 写真 = await cloudSavePhotos(token, folder); }
     catch(e){ 写真 = {送った:0, 全部:-1, 失敗:-1}; }
     try{ localStorage.setItem('fs_gdrive_last', nowISO()); }catch(e){}
-    toast('ドライブに保存しました'
+    言う('ドライブに保存しました'
       + (写真.全部 > 0 ? `（写真 ${写真.全部}枚のうち、新しい ${写真.送った}枚を預けました`
           + (写真.失敗 > 0 ? `／${写真.失敗}枚は預けられませんでした` : '') + '）'
         : (写真.全部 < 0 ? '（写真は預けられませんでした）' : '')), 8000);
   }catch(e){
-    toast('保存できませんでした：' + ((e && e.message) || e), 10000);
+    言う('保存できませんでした：' + ((e && e.message) || e), 10000);
   }
   render();
 }
+/* ---- ドライブと合成（2台で使うとき） ----
+   ドライブの控えと手元の記録を、記録ごとに「新しい操作をした方」で合わせる。
+   ・同じ記録が両方にあれば、更新時刻の新しい方
+   ・片方にしかなければ、それを残す
+   ・墓標（完全に消した印）は両方を合わせ、載っている記録は戻さない
+   合わせた結果を手元に置き、ドライブへも送り返す（2026-08-23・鳥アプリの考え方） */
+function mergeBackup(remoteData, remoteTombs){
+  const tombs = {};
+  tombstones().forEach(t=>{ tombs[t.uuid] = t.at || ''; });
+  (Array.isArray(remoteTombs) ? remoteTombs : []).forEach(t=>{
+    if(t && typeof t.uuid==='string' && t.uuid && !tombs[t.uuid]) tombs[t.uuid] = t.at || '';
+  });
+  const 時 = x => String((x && (x.updated_at || x.created_at)) || '');
+  const box = {}, 数 = {手元のみ:0, ドライブのみ:0, 新しい方:0, 同じ:0, 墓標で除外:0};
+  for(const k of CLOUD_KEYS){
+    const L = {}, R = {};
+    DB.loadRaw(DB.key[k]).forEach(x=>{ if(x && x.uuid) L[x.uuid] = x; });
+    ((remoteData && remoteData[k]) || []).forEach(x=>{ if(x && x.uuid) R[x.uuid] = x; });
+    const ids = new Set(Object.keys(L).concat(Object.keys(R)));
+    const out = [];
+    ids.forEach(u=>{
+      if(tombs[u] !== undefined){ 数.墓標で除外++; return; }
+      const l = L[u], r = R[u];
+      if(l && r){
+        if(時(l) === 時(r)){ 数.同じ++; out.push(l); }
+        else { 数.新しい方++; out.push(時(l) > 時(r) ? l : r); }
+      }else if(l){ 数.手元のみ++; out.push(l); }
+      else { 数.ドライブのみ++; out.push(r); }
+    });
+    box[k] = out;
+  }
+  // 合わせた結果から、親を失った行を外す（片方で親を消していた場合など）
+  const 外した = cloudPrune(box);
+  Object.keys(外した).forEach(k=>{ 数.墓標で除外 += 0; });   // 件数は別枠で返す
+  const merged = Object.keys(tombs).map(u=>({uuid:u, at:tombs[u]}));
+  return {box, 数, 外した, tombs: merged};
+}
+async function cloudMerge(){
+  if(!writeAllowed()){
+    toast('このタブでは合成できません。記録を入れているタブでお試しください', 7000);
+    return;
+  }
+  toast('ドライブの控えを読んでいます…', 8000);
+  let remote = null;
+  try{
+    const token = await gdGetToken();
+    const folder = await gdFolder(token);
+    const q = encodeURIComponent("name='"+GD_FILE+"' and '"+folder+"' in parents and trashed=false");
+    const list = await gdFetch('drive/v3/files?spaces=drive&fields=files(id)&q='+q, {}, token);
+    if(list.files && list.files.length){
+      const r = await fetch('https://www.googleapis.com/drive/v3/files/'
+        + list.files[0].id + '?alt=media', {headers:{Authorization:'Bearer '+token}});
+      if(!r.ok) throw new Error('ドライブ ' + r.status);
+      remote = JSON.parse(await r.text());
+    }
+  }catch(e){
+    toast('ドライブの控えを読めませんでした（' + (e && e.message || '') + '）', 9000);
+    return;
+  }
+  if(!remote){
+    // ドライブがまだ空なら、いまの記録を送るだけでよい
+    if(confirm('ドライブにまだ控えがありません。いまの記録を保存しますか？')) cloudSave();
+    return;
+  }
+  const 検査 = cloudCheck(JSON.stringify({app:remote.app, version:remote.version,
+    saved_at:remote.saved_at, data:remote.data}));
+  if(!検査.ok){
+    toast('ドライブの控えが戻せない形です（' + 検査.why + '）。合成をやめました', 10000);
+    return;
+  }
+  const m = mergeBackup(検査.data, remote.tombstones);
+  const 外し数 = Object.keys(m.外した||{}).reduce((a,k)=>a+m.外した[k], 0);
+  if(!confirm('ドライブの控えと合成します。\n'
+    + '・手元だけにある記録 ' + m.数.手元のみ + '件（残ります）\n'
+    + '・ドライブだけにある記録 ' + m.数.ドライブのみ + '件（取り込みます）\n'
+    + '・両方にあって内容が違う ' + m.数.新しい方 + '件（新しい操作をした方）\n'
+    + '・完全に消した印で除くもの ' + m.数.墓標で除外 + '件'
+    + (外し数 ? '\n・もとの記録が見あたらない分 ' + 外し数 + '件（除きます）' : '')
+    + '\nよろしいですか？')) return;
+  // 手元へ書く（途中で失敗したら元に戻す。cloudApply と同じ作法）
+  const 元 = {};
+  try{ CLOUD_KEYS.forEach(k=>{ 元[k] = DB.loadRaw(DB.key[k]); }); }
+  catch(e){ toast('いまの記録を読み取れないため、合成をやめました', 8000); return; }
+  for(const k of CLOUD_KEYS){
+    if(!DB.save(DB.key[k], m.box[k] || [])){
+      let 戻せた = true;
+      CLOUD_KEYS.forEach(kk=>{
+        try{ if(!DB.save(DB.key[kk], 元[kk])) 戻せた = false; }catch(e){ 戻せた = false; }
+      });
+      toast(戻せた
+        ? '合成できませんでした（端末の空き容量をご確認ください）。記録はそのままです'
+        : '合成できませんでした。しかも元に戻せず、一部が書き換わったままです。'
+          + '空きを作ってから、ドライブから戻してください', 12000);
+      return;
+    }
+  }
+  try{ localStorage.setItem('fs_tombstones', JSON.stringify(m.tombs)); }catch(e){}
+  // 親子と代表の位置を、合わせた結果から決め直す
+  try{
+    DB.surveys().forEach(sv=>{ unitRelink(sv.uuid); spotPosFix(sv.uuid); });
+  }catch(e){}
+  toast('合成しました。ドライブへも送り返します…', 6000);
+  try{ await cloudSave({auto:true}); }catch(e){}
+  // 手元に実体の無い写真を、ドライブから取り寄せる
+  try{
+    const token = await gdGetToken();
+    const folder = await gdFolder(token);
+    const r = await cloudRestorePhotos(token, folder);
+    if(r && (r.戻した || r.足りない)){
+      toast('写真: ' + (r.戻した||0) + '枚を取り寄せました'
+        + (r.足りない ? '（見つからない分 ' + r.足りない + '枚）' : ''), 8000);
+    }
+  }catch(e){}
+  reset('home');
+  toast('合成が終わりました', 6000);
+}
+
 async function cloudRestore(){
   if(!writeAllowed()){
     toast('このタブでは戻せません。記録を入れているタブでお試しください', 7000);
@@ -9564,7 +9717,15 @@ SCREENS.cloud = ()=>{
             <div>${前回 ? esc(String(前回).slice(0,16).replace('T',' ')) : 'まだ'}</div></div>
         </div>
         <button class="btn pri" onclick="cloudSave()">ドライブに保存する</button>
+        <div class="row" style="margin-top:6px">
+          <div class="grow dim small" style="align-self:center">記録が変わったら、
+            3分後に自動で保存する（サインインが生きている間だけ）</div>
+          <button class="btn sm ${autoBackupOn()?'ok':''}" style="width:auto;margin:0"
+            onclick="prefSet('auto_backup', !autoBackupOn()); render()">${
+            autoBackupOn()?'自動ON':'自動OFF'}</button>
+        </div>
         <button class="btn" onclick="cloudRestore()">ドライブから戻す（いまの記録は消えます）</button>
+        <button class="btn" onclick="cloudMerge()">ドライブと合成する（2台で使うとき）</button>
         ${gdSignedIn() ? '<button class="btn" onclick="cloudSignOut()">サインアウト</button>' : ''}
       </div>
       <div class="card">
