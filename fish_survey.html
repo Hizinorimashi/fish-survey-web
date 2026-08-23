@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v116';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v117';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -8486,13 +8486,18 @@ const GD_FILE = 'fish_survey_backup.json';   // 前の版までの1つの共有�
    1つの共有ファイルを2台で取り合うと、どれだけ照合しても
    「確認と書き込みの間」に割り込まれる隙間が残る（監査73回目 Critical）。
    端末ごとに別のファイルなら、上書きの競合は起きようがない */
+let DEVICE_ID = '';
 function deviceId(){
+  if(DEVICE_ID) return DEVICE_ID;
   let d = '';
   try{ d = localStorage.getItem('fs_device_id') || ''; }catch(e){}
   if(!d){
     d = uuid();
     try{ localStorage.setItem('fs_device_id', d); }catch(e){}
   }
+  // 書き込めなくても、この起動の間は同じ名札を使い続ける。
+  // 呼ぶたびに変わると、ドライブに端末ファイルが増え続ける（監査81回目 Minor）
+  DEVICE_ID = d;
   return d;
 }
 function gdMyFile(){ return 'fish_survey_' + deviceId() + '.json'; }
@@ -8803,12 +8808,8 @@ function cloudApply(data, 新しい墓標){
   for(const k of CLOUD_KEYS){
     if(!DB.save(DB.key[k], data[k] || [])){
       // 途中で失敗したら、書いた分を戻す（半端な状態を残さない）。
-      // 空き容量が尽きていると、戻すことすらできない。
-      // そのときは「元のまま」と言ってはいけない（2026-08-20 のテストで判明）
-      let 戻せた = true;
-      CLOUD_KEYS.forEach(kk=>{
-        try{ if(!DB.save(DB.key[kk], 元[kk])) 戻せた = false; }catch(e){ 戻せた = false; }
-      });
+      // 縮むキーから先に戻して空きを作り、失敗分はやり直す（監査81回目 Major）
+      const 戻せた = rollbackSaveAll(元);
       toast(戻せた
         ? '戻せませんでした（端末の空き容量をご確認ください）。いまの記録はそのままです'
         : '戻せませんでした。しかも元にも戻せず、一部が書き換わったままです。'
@@ -9307,6 +9308,20 @@ function mergeBackup(remoteData, remoteTombs){
     });
     box[k] = out;
   }
+  // 墓標より新しい子の祖先を、同じ集まりから復活させる（監査81回目 Major）
+  {
+    const 全勝ち = {};
+    for(const k of CLOUD_KEYS){
+      const m2 = Object.create(null);
+      DB.loadRaw(DB.key[k]).forEach(x=>{ if(x && x.uuid) m2[x.uuid] = x; });
+      ((remoteData && remoteData[k]) || []).forEach(x=>{
+        if(!x || !x.uuid) return;
+        m2[x.uuid] = recPick(m2[x.uuid], x);
+      });
+      全勝ち[k] = m2;
+    }
+    resurrectAncestors(box, 全勝ち, tombs, 控え, 数);
+  }
   // 合わせた結果から、親を失った行を外す（片方で親を消していた場合など）。
   // 外す行の中身は控えに残す（黙って失わない。監査71回目 Critical）
   {
@@ -9321,6 +9336,62 @@ function mergeBackup(remoteData, remoteTombs){
   const 外した = cloudPrune(box);
   const merged = Object.keys(tombs).map(u=>({uuid:u, at:tombs[u]}));
   return {box, 数, 外した, tombs: merged, 控え};
+}
+/* 墓標より新しい子が生き残ったのに、親が墓標で消えていたら、
+   親（とその祖先）も同じ集まりから復活させ、祖先の墓標を下げる。
+   これをしないと「新しい編集は残す」と言いながら、親を失った子が
+   迷子として除かれてしまう（監査81回目 Major）。
+   親のたどり: 1尾ずつ→魚の記録→箇所→調査、メモ→調査、マス→箇所 */
+function resurrectAncestors(box, 全勝ち, tombs, 控え, 数){
+  const 親道 = [
+    {k:'ind', 欄:'catch_uuid',   先:'ca'},
+    {k:'ca',  欄:'station_uuid', 先:'st'},
+    {k:'mc',  欄:'station_uuid', 先:'st'},
+    {k:'st',  欄:'survey_uuid',  先:'sv'},
+    {k:'nt',  欄:'survey_uuid',  先:'sv'},
+  ];
+  const ある = {};
+  CLOUD_KEYS.forEach(k=>{
+    ある[k] = new Set((box[k]||[]).map(x=>x.uuid));
+  });
+  // 「新しい編集がある」という証拠の時刻。親をたどるとき、
+  // きっかけになった子の時刻を上へ運ぶ。運ばないと、
+  // 箇所そのものは古いために、その上の調査が復活しない
+  const 証拠 = Object.create(null);
+  const 証拠時 = x => {
+    const t = recTime(x);
+    const v = 証拠[x.uuid] || '';
+    return t > v ? t : v;
+  };
+  // 子（下の段）から親（上の段）へ、何度か回して連鎖を拾う
+  for(let 回 = 0; 回 < 4; 回++){
+    let 増えた = false;
+    親道.forEach(道=>{
+      (box[道.k]||[]).forEach(x=>{
+        const pu = x && x[道.欄];
+        if(!pu || ある[道.先].has(pu)) return;
+        const 親 = (全勝ち[道.先]||Object.create(null))[pu];
+        if(!親) return;                          // どこにも無い親は復活させようがない
+        const 墓 = tombs[pu];
+        if(墓 === undefined) return;             // 墓標が無いのに無い＝別の理由。触らない
+        // 子の編集（またはその子の証拠）が墓標より新しいときだけ、
+        // 親を返して墓標を下げる
+        const t = 証拠時(x);
+        if(!墓 || t > 墓){
+          box[道.先].push(親);
+          ある[道.先].add(pu);
+          証拠[pu] = t;                          // 証拠の時刻を上へ運ぶ
+          delete tombs[pu];
+          if(数) 数.墓標より新しい++;
+          // 控えに入れてしまっていたら、取り出す
+          const i = 控え.findIndex(c=>c && c.rec && c.rec.uuid === pu);
+          if(i >= 0) 控え.splice(i, 1);
+          増えた = true;
+        }
+      });
+    });
+    if(!増えた) break;
+  }
 }
 /* 読み合わせた控え（data＋墓標）を、そのまま使える形に整える。
    ・墓標より古い記録は除く（除いた分は札付きで返す）
@@ -9337,7 +9408,11 @@ function normalizeDataset(ds){
     if(tombs[t.uuid] === undefined || at > tombs[t.uuid]) tombs[t.uuid] = at;
   });
   const data = {}, 控え = [];
+  const 全勝ち = {};
   for(const k of CLOUD_KEYS){
+    const m2 = Object.create(null);
+    ((ds.data && ds.data[k]) || []).forEach(x=>{ if(x && x.uuid) m2[x.uuid] = x; });
+    全勝ち[k] = m2;
     data[k] = ((ds.data && ds.data[k]) || []).filter(x=>{
       if(!x || !x.uuid) return false;
       if(tombs[x.uuid] === undefined) return true;
@@ -9346,6 +9421,8 @@ function normalizeDataset(ds){
       return false;
     });
   }
+  // 墓標より新しい子の祖先を復活させる（合成と同じ決まり。監査81回目 Major）
+  resurrectAncestors(data, 全勝ち, tombs, 控え, null);
   {
     const 写し = {};
     CLOUD_KEYS.forEach(k=>{ 写し[k] = data[k].map(x=>Object.assign({}, x)); });
@@ -9375,16 +9452,6 @@ async function cloudMerge(){
       + '端末の空き容量をご確認ください', 10000);
     return;
   }
-  // それでも残っている書きかけ（開いていない画面の分など）は、
-  // 消える前に控えへ退避する（監査80回目 Major）
-  try{
-    const 残り = draftAll();
-    if(Object.keys(残り).length
-       && !repairBackupPush({種類:'合成前の書きかけ', 中身: 残り})){
-      toast('書きかけの控えを取れなかったため、合成をやめました', 10000);
-      return;
-    }
-  }catch(e){}
   toast('ドライブの控えを読んでいます…', 8000);
   let 全部 = null;
   try{
@@ -9395,20 +9462,22 @@ async function cloudMerge(){
     toast('ドライブの控えを読めませんでした（' + (e && e.message || '') + '）', 9000);
     return;
   }
-  if(!全部 || !全部.合わせ){
-    // ドライブがまだ空なら、いまの記録を送るだけでよい
-    if(confirm('ドライブにまだ控えがありません。いまの記録を保存しますか？')){
-      await cloudSave({nested:true});
-    }
-    return;
-  }
-  if(全部.読めない){
+  // 「読めない」を先に見る。全部読めなかったときに「控えが無い」と
+  // 取り違えると、欠けた内容で上書きしてしまう（監査81回目 Major）
+  if(全部 && 全部.読めない){
     // 欠けた控えに、墓標より新しい編集が入っているかもしれない。
     // 欠けたまま墓標を効かせると、その編集が消える（監査80回目 Major）。
     // 「戻す」と同じく、読み切れないときはやめる
     toast('控えのうち ' + 全部.読めない + 'ファイルを読めませんでした。'
       + '欠けたまま合成すると記録が消えることがあるため、やめました。'
       + '電波の良いところでもう一度お試しください', 12000);
+    return;
+  }
+  if(!全部 || !全部.合わせ){
+    // ドライブがまだ空なら、いまの記録を送るだけでよい
+    if(confirm('ドライブにまだ控えがありません。いまの記録を保存しますか？')){
+      await cloudSave({nested:true});
+    }
     return;
   }
   const m = mergeBackup(全部.合わせ.data, 全部.合わせ.tombstones);
@@ -9422,6 +9491,22 @@ async function cloudMerge(){
         + '件（残します）' : '')
     + (外し数 ? '\n・もとの記録が見あたらない分 ' + 外し数 + '件（端末に控えて除きます）' : '')
     + '\nよろしいですか？')) return;
+  // 読んでいる間・確認を待つ間にも、入力は進んでいることがある（監査81回目 Major）。
+  // ここでもう一度打ちかけを書き、残りを控えてから、いまの手元で合成を組み直す
+  try{ if(!flushAllForms()){
+    toast('打ちかけを保存できないため、合成をやめました', 10000);
+    return;
+  } }catch(e){}
+  try{
+    const 残り = draftAll();
+    if(Object.keys(残り).length
+       && !repairBackupPush({種類:'合成前の書きかけ', 中身: 残り})){
+      toast('書きかけの控えを取れなかったため、合成をやめました', 10000);
+      return;
+    }
+  }catch(e){}
+  const m2 = mergeBackup(全部.合わせ.data, 全部.合わせ.tombstones);
+  m.box = m2.box; m.tombs = m2.tombs; m.控え = m2.控え; m.外した = m2.外した;
   // 除く分の中身を、先に端末へ控える（黙って失わない。監査71回目 Critical）。
   // 控えられないときは、合成をやめる
   // 控えは「種類＋中身」の形でそろえる。形が違うと、点検の行数に出ず、
