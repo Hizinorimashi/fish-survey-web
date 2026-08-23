@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v115';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v116';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -306,9 +306,14 @@ function releaseLock(){
   if(o && o.id===TAB_ID){ try{ localStorage.removeItem(LOCK_KEY); }catch(e){} }
 }
 function flushAllForms(){
-  // 使用権を手放す前に、打ちかけを書いてしまう（監査47・51回目 Critical）
-  try{ if(typeof spotInfoFlush==='function') spotInfoFlush(); }catch(e){}
-  try{ if(typeof envFlush==='function') envFlush(); }catch(e){}
+  // 使用権を手放す前に、打ちかけを書いてしまう（監査47・51回目 Critical）。
+  // 書けたかどうかを返す（合成の前ぶれで使う。監査80回目 Major）
+  let ok = true;
+  try{ if(typeof spotInfoFlush==='function' && spotInfoFlush() === false) ok = false; }
+  catch(e){ ok = false; }
+  try{ if(typeof envFlush==='function' && envFlush() === false) ok = false; }
+  catch(e){ ok = false; }
+  return ok;
 }
 window.addEventListener('pagehide', ()=>{ flushAllForms(); releaseLock(); });
 document.addEventListener('visibilitychange', ()=>{
@@ -5750,7 +5755,7 @@ function spotInfoDrop(uu){
 }
 function spotInfoFlush(){
   if(SPOT_TYPE_T){ clearTimeout(SPOT_TYPE_T); SPOT_TYPE_T = null; }
-  try{ spotInfoSave(); }catch(e){}
+  try{ return spotInfoSave(); }catch(e){ return false; }
 }
 function spotInfoSave(){
   if(SPOT_TYPE_T){ clearTimeout(SPOT_TYPE_T); SPOT_TYPE_T = null; }
@@ -8752,6 +8757,25 @@ function cloudCheck(text){
           tombstones: Array.isArray(o.tombstones) ? o.tombstones : []};
 }
 /* 控えで置き換える。いまの記録は消えるので、必ず確かめてから呼ぶ */
+/* 保存領域が詰まっているときの巻き戻し。
+   縮む（空きが増える）キーから先に戻し、空いたところで残りを戻す。
+   1周で戻らなかったキーは、もう1周だけやり直す（監査80回目 Major） */
+function rollbackSaveAll(元){
+  const 大きさ = k => { try{ return JSON.stringify(元[k]).length; }catch(e){ return 0; } };
+  const いまの大きさ = k => {
+    try{ return (localStorage.getItem(DB.key[k]) || '').length; }catch(e){ return 0; }
+  };
+  const 順 = CLOUD_KEYS.slice().sort((a,b)=>
+    (大きさ(a) - いまの大きさ(a)) - (大きさ(b) - いまの大きさ(b)));
+  const 失敗 = [];
+  順.forEach(k=>{
+    try{ if(!DB.save(DB.key[k], 元[k])) 失敗.push(k); }catch(e){ 失敗.push(k); }
+  });
+  失敗.slice().forEach(k=>{
+    try{ if(DB.save(DB.key[k], 元[k])) 失敗.splice(失敗.indexOf(k), 1); }catch(e){}
+  });
+  return 失敗.length === 0;
+}
 /* 記録を丸ごと入れ替えたあとの、打ちかけの片付け。
    古い打ちかけが残っていると、同じIDの記録を開いたときに
    そちらが優先されて、入れ替えた内容が元へ戻る（監査67回目 Major）。
@@ -8801,10 +8825,7 @@ function cloudApply(data, 新しい墓標){
       JSON.stringify(Array.isArray(新しい墓標) ? 新しい墓標 : [])); 書けた = true; }
     catch(e){}
     if(!書けた){
-      let 戻せた = true;
-      CLOUD_KEYS.forEach(kk=>{
-        try{ if(!DB.save(DB.key[kk], 元[kk])) 戻せた = false; }catch(e){ 戻せた = false; }
-      });
+      const 戻せた = rollbackSaveAll(元);
       toast(戻せた
         ? '戻せませんでした（消した印を書けません）。いまの記録はそのままです'
         : '戻せませんでした。しかも元にも戻せず、一部が書き換わったままです', 12000);
@@ -9208,8 +9229,9 @@ async function cloudFetchAll(token, folder){
   const q = encodeURIComponent("name contains 'fish_survey_' and '"+folder
     + "' in parents and trashed=false");
   // 一覧は続きのページまで読み切る（監査79回目 Minor）
-  let 全ファイル = [], page = '';
-  for(let i=0; i<50; i++){
+  let 全ファイル = [], page = '', 読み切れず = false;
+  for(let i=0; ; i++){
+    if(i >= 50){ 読み切れず = true; break; }   // 異常な数。読み切れなかったと扱う
     const list = await gdFetch('drive/v3/files?spaces=drive'
       + '&fields=nextPageToken,files(id,name,modifiedTime)&q='+q
       + (page ? '&pageToken='+encodeURIComponent(page) : ''), {}, token);
@@ -9218,7 +9240,7 @@ async function cloudFetchAll(token, folder){
     page = list.nextPageToken;
   }
   const files = 全ファイル.filter(f=>f && /\.json$/.test(String(f.name||'')));
-  let 合わせ = null, 読めた = 0, 読めない = 0;
+  let 合わせ = null, 読めた = 0, 読めない = 読み切れず ? 1 : 0;
   for(const f of files){
     try{
       const r = await fetch('https://www.googleapis.com/drive/v3/files/'
@@ -9345,8 +9367,24 @@ async function cloudMerge(){
   try{
   // 打ちかけがあれば、先に記録へ書いてしまう。書かずに合成すると、
   // そのあと開いた画面で古い打ちかけが復元され、合成した内容を上書きする
-  //（監査79回目 Major）
-  try{ flushAllForms(); }catch(e){}
+  //（監査79回目 Major）。書けなければ合成をやめる（監査80回目 Major）
+  let 書けた = false;
+  try{ 書けた = flushAllForms(); }catch(e){}
+  if(!書けた){
+    toast('打ちかけを保存できないため、合成をやめました。'
+      + '端末の空き容量をご確認ください', 10000);
+    return;
+  }
+  // それでも残っている書きかけ（開いていない画面の分など）は、
+  // 消える前に控えへ退避する（監査80回目 Major）
+  try{
+    const 残り = draftAll();
+    if(Object.keys(残り).length
+       && !repairBackupPush({種類:'合成前の書きかけ', 中身: 残り})){
+      toast('書きかけの控えを取れなかったため、合成をやめました', 10000);
+      return;
+    }
+  }catch(e){}
   toast('ドライブの控えを読んでいます…', 8000);
   let 全部 = null;
   try{
@@ -9365,7 +9403,13 @@ async function cloudMerge(){
     return;
   }
   if(全部.読めない){
-    toast('読めない控えが ' + 全部.読めない + 'ファイルありました（飛ばして続けます）', 8000);
+    // 欠けた控えに、墓標より新しい編集が入っているかもしれない。
+    // 欠けたまま墓標を効かせると、その編集が消える（監査80回目 Major）。
+    // 「戻す」と同じく、読み切れないときはやめる
+    toast('控えのうち ' + 全部.読めない + 'ファイルを読めませんでした。'
+      + '欠けたまま合成すると記録が消えることがあるため、やめました。'
+      + '電波の良いところでもう一度お試しください', 12000);
+    return;
   }
   const m = mergeBackup(全部.合わせ.data, 全部.合わせ.tombstones);
   const 外し数 = Object.keys(m.外した||{}).reduce((a,k)=>a+m.外した[k], 0);
@@ -9393,10 +9437,7 @@ async function cloudMerge(){
   catch(e){ toast('いまの記録を読み取れないため、合成をやめました', 8000); return; }
   for(const k of CLOUD_KEYS){
     if(!DB.save(DB.key[k], m.box[k] || [])){
-      let 戻せた = true;
-      CLOUD_KEYS.forEach(kk=>{
-        try{ if(!DB.save(DB.key[kk], 元[kk])) 戻せた = false; }catch(e){ 戻せた = false; }
-      });
+      const 戻せた = rollbackSaveAll(元);
       toast(戻せた
         ? '合成できませんでした（端末の空き容量をご確認ください）。記録はそのままです'
         : '合成できませんでした。しかも元に戻せず、一部が書き換わったままです。'
@@ -9411,10 +9452,7 @@ async function cloudMerge(){
   try{ localStorage.setItem('fs_tombstones', JSON.stringify(m.tombs)); 墓標書けた = true; }
   catch(e){}
   if(!墓標書けた){
-    let 戻せた = true;
-    CLOUD_KEYS.forEach(kk=>{
-      try{ if(!DB.save(DB.key[kk], 元[kk])) 戻せた = false; }catch(e){ 戻せた = false; }
-    });
+    const 戻せた = rollbackSaveAll(元);
     toast(戻せた
       ? '合成できませんでした（消した印を書けません）。記録はそのままです'
       : '合成できませんでした。しかも元に戻せず、一部が書き換わったままです', 12000);
@@ -10177,24 +10215,16 @@ function repairSnapshotRestore(){
   const 最新 = 候補[候補.length - 1];
   if(!confirm('修復前の丸ごとの控え（' + String(最新.at||'').slice(0,16).replace('T',' ')
     + '）で、いまの記録を置き換えます。\nいまの記録は消えます。よろしいですか？')) return;
-  const 元 = {};
-  try{ CLOUD_KEYS.forEach(k=>{ 元[k] = DB.loadRaw(DB.key[k]); }); }
-  catch(e){ toast('いまの記録を読み取れないため、やめました', 8000); return; }
-  for(const k of CLOUD_KEYS){
-    const rows = 最新.記録.中身[k];
-    if(!Array.isArray(rows)) continue;
-    if(!DB.save(DB.key[k], rows)){
-      let 戻せた = true;
-      CLOUD_KEYS.forEach(kk=>{
-        try{ if(!DB.save(DB.key[kk], 元[kk])) 戻せた = false; }catch(e){ 戻せた = false; }
-      });
-      toast(戻せた ? '戻せませんでした。いまの記録はそのままです'
-                  : '戻せませんでした。しかも元に戻せず、一部が書き換わったままです', 12000);
-      return;
-    }
+  // 記録・墓標・打ちかけの片付けまで、「戻す」と同じ道（cloudApply）を通す。
+  // 別の道で書くと、墓標が古いまま残って次の合成でまた消える（監査80回目 Major）
+  const rows = {};
+  CLOUD_KEYS.forEach(k=>{
+    rows[k] = Array.isArray(最新.記録.中身[k]) ? 最新.記録.中身[k] : [];
+  });
+  if(cloudApply(rows, Array.isArray(最新.記録.墓標) ? 最新.記録.墓標 : undefined)){
+    toast('修復前の控えに置き換えました', 8000);
+    reset('home');
   }
-  toast('修復前の控えに置き換えました', 8000);
-  reset('home');
 }
 function repairBackupClear(){
   const a = repairBackupList();
@@ -10224,7 +10254,7 @@ function repairRun(){
   try{
     for(const k of CLOUD_KEYS){ 丸ごと[k] = DB.loadRaw(DB.key[k]); }
   }catch(e){ toast('記録を読み取れないため、やめました', 8000); return; }
-  if(!repairBackupPush({種類:'修復前の控え', 中身:丸ごと})){
+  if(!repairBackupPush({種類:'修復前の控え', 中身:丸ごと, 墓標: tombstones()})){
     toast('直す前の控えを取れなかったため、やめました。'
       + '端末の空き容量をご確認ください', 10000);
     return;
@@ -11681,7 +11711,8 @@ function envShowError(err){
 /* いま自動保存を待っている分があれば、先に書いてしまう */
 function envFlush(){
   if(ENV_AUTO_TIMER){ clearTimeout(ENV_AUTO_TIMER); ENV_AUTO_TIMER = null; }
-  if(ENV_FORM) envAutoSaveNow(ENV_FORM);
+  if(ENV_FORM) return envAutoSaveNow(ENV_FORM);
+  return true;
 }
 
 function saveEnvItem(stUuid, opt){
