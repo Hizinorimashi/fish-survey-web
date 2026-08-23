@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v111';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v112';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2237,7 +2237,7 @@ function envPickDelete(svUuid){
   let n = 0;
   all.forEach(x=>{
     if(x && ENV_PICK.set.has(x.uuid) && x.survey_uuid===svUuid && !x.deleted_at){
-      x.deleted_at = t; n++;
+      x.deleted_at = t; x.updated_at = t; n++;
     }
   });
   if(!n){ toast('消せるものがありませんでした'); ENV_PICK = null; render(); return; }
@@ -8428,7 +8428,8 @@ function pickTrashSurveys(){
   catch(e){ toast('保存された記録を読み取れないため、消せませんでした', 7000); return false; }
   const t = nowISO();
   let n = 0;
-  all.forEach(x=>{ if(x && PICK_SET.has(x.uuid) && !x.deleted_at){ x.deleted_at = t; n++; } });
+  all.forEach(x=>{ if(x && PICK_SET.has(x.uuid) && !x.deleted_at){
+    x.deleted_at = t; x.updated_at = t; n++; } });
   if(!n){ toast('消せるものがありませんでした'); PICK_SET = null; return true; }
   if(!DB.save(DB.key.sv, all)){
     toast('消せませんでした（端末の空き容量をご確認ください）', 8000);
@@ -9048,10 +9049,12 @@ async function autoBackupRun(){
   if(!autoBackupOn() || !writeAllowed() || !gdSignedIn()) return;
   if(AUTO_BACKUP_BUSY){ AUTO_BACKUP_AGAIN = true; return; }
   AUTO_BACKUP_BUSY = true;
-  try{
-    await cloudSave({auto:true});
-  }catch(e){}
+  let r = 'error';
+  try{ r = await cloudSave({auto:true}); }catch(e){}
   AUTO_BACKUP_BUSY = false;
+  // 手動のクラウド操作とぶつかった・送れなかったときは、あとでもう一度
+  //（監査76回目 Minor）
+  if(r !== 'ok') AUTO_BACKUP_AGAIN = true;
   if(AUTO_BACKUP_AGAIN){ AUTO_BACKUP_AGAIN = false; autoBackupQueue(); }
 }
 async function cloudSave(opt){
@@ -9130,9 +9133,22 @@ async function cloudSave(opt){
   return 'error';
   }finally{ if(!(opt && opt.nested)) CLOUD_BUSY = false; }
 }
+/* 記録の「いつの操作か」。更新・削除・作成のうち、いちばん新しい時刻。
+   まとめて消す経路や前の版の削除は deleted_at しか持たないことがあり、
+   updated_at だけで比べると、別の端末の生きた古い記録と同点になって
+   合成の結果が揺れる（監査76回目 Major） */
+function recTime(x){
+  if(!x) return '';
+  const a = String(x.updated_at||''), b = String(x.deleted_at||''),
+        c = String(x.created_at||'');
+  let t = a;
+  if(b > t) t = b;
+  if(c > t) t = c;
+  return t;
+}
 /* 2つの控え（data＋墓標）を、記録ごとに「新しい方」で合わせる純粋な関数 */
 function mergeDatasets(A, B){
-  const 時 = x => String((x && (x.updated_at || x.created_at)) || '');
+  const 時 = recTime;
   const data = {};
   for(const k of CLOUD_KEYS){
     const m = Object.create(null);
@@ -9194,7 +9210,7 @@ function mergeBackup(remoteData, remoteTombs){
     // 同じ記録に墓標が2つあれば、新しい方の日時で持つ
     if(tombs[t.uuid] === undefined || at > tombs[t.uuid]) tombs[t.uuid] = at;
   });
-  const 時 = x => String((x && (x.updated_at || x.created_at)) || '');
+  const 時 = recTime;
   const box = {}, 控え = [];
   const 数 = {手元のみ:0, ドライブのみ:0, 新しい方:0, 同じ:0, 墓標で除外:0, 墓標より新しい:0};
   for(const k of CLOUD_KEYS){
@@ -9250,7 +9266,7 @@ function mergeBackup(remoteData, remoteTombs){
    「戻す」で墓標を効かせないと、別の端末で消した記録が復活し、
    次の合成でまた消える＝結果が揺れる（監査74回目 Major） */
 function normalizeDataset(ds){
-  const 時 = x => String((x && (x.updated_at || x.created_at)) || '');
+  const 時 = recTime;
   const tombs = Object.create(null);
   (ds.tombstones||[]).forEach(t=>{
     if(!t || !safeId(t.uuid)) return;
@@ -10101,6 +10117,38 @@ function repairBackupRestore(){
     + 'ごみ箱から中身を確かめられます', 9000);
   render();
 }
+/* 修復前の「丸ごとの控え」で、記録をそのまま置き換えて戻す */
+function repairSnapshotRestore(){
+  if(!writeAllowed()){
+    toast('このタブでは戻せません。記録を入れているタブでお試しください', 7000);
+    return;
+  }
+  const a = repairBackupList();
+  const 候補 = a.filter(e=>e && e.記録 && e.記録.種類 === '修復前の控え'
+    && e.記録.中身 && typeof e.記録.中身 === 'object' && !Array.isArray(e.記録.中身));
+  if(!候補.length){ toast('丸ごとの控えはありません', 6000); return; }
+  const 最新 = 候補[候補.length - 1];
+  if(!confirm('修復前の丸ごとの控え（' + String(最新.at||'').slice(0,16).replace('T',' ')
+    + '）で、いまの記録を置き換えます。\nいまの記録は消えます。よろしいですか？')) return;
+  const 元 = {};
+  try{ CLOUD_KEYS.forEach(k=>{ 元[k] = DB.loadRaw(DB.key[k]); }); }
+  catch(e){ toast('いまの記録を読み取れないため、やめました', 8000); return; }
+  for(const k of CLOUD_KEYS){
+    const rows = 最新.記録.中身[k];
+    if(!Array.isArray(rows)) continue;
+    if(!DB.save(DB.key[k], rows)){
+      let 戻せた = true;
+      CLOUD_KEYS.forEach(kk=>{
+        try{ if(!DB.save(DB.key[kk], 元[kk])) 戻せた = false; }catch(e){ 戻せた = false; }
+      });
+      toast(戻せた ? '戻せませんでした。いまの記録はそのままです'
+                  : '戻せませんでした。しかも元に戻せず、一部が書き換わったままです', 12000);
+      return;
+    }
+  }
+  toast('修復前の控えに置き換えました', 8000);
+  reset('home');
+}
 function repairBackupClear(){
   const a = repairBackupList();
   if(!a.length){ toast('控えはありません'); return; }
@@ -10263,6 +10311,9 @@ SCREENS.check = ()=>{
             <button class="btn" onclick="repairBackupRestore()">ごみ箱として戻す</button>
             <button class="btn" onclick="repairBackupExport()">JSONで書き出す</button>
           </div>
+          ${a.some(e=>e && e.記録 && e.記録.種類 === '修復前の控え')
+            ? `<button class="btn" onclick="repairSnapshotRestore()"
+                >修復前の丸ごと控えで置き換えて戻す</button>` : ''}
           <button class="btn ng" onclick="repairBackupClear()">控えを消す</button>
         </div>`;
       })()}
@@ -11335,7 +11386,7 @@ function envUndo(svUuid){
         x.updated_at = t;
       }
       // つなげるで自動的に始まったラインも、一緒に取り消す
-      if(h.next && x.uuid === h.next && !x.deleted_at) x.deleted_at = t;
+      if(h.next && x.uuid === h.next && !x.deleted_at){ x.deleted_at = t; x.updated_at = t; }
     });
     if(!DB.save(DB.key.st, all)){
       toast('戻せませんでした（端末の空き容量をご確認ください）', 8000);
