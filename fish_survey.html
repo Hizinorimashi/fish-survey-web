@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v104';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v105';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -9634,6 +9634,132 @@ SCREENS.refdocs = ()=>({
     </div>`).join('') : '<div class="dim small">まだ資料がありません。</div>';
   }});
 
+/* ---- データ修復（2026-08-23 の実機の声・鳥アプリの考え方） ----
+   点検で見つかる壊れ方のうち、機械的に直せるものを直す。
+   直す前に、消す・書き替える分を fs_repair_backup へ控える（人が見られるように） */
+function repairScan(){
+  const out = {読めない:[], 重なり:0, ID無し:0, 迷子:{ca:0, ind:0, つながり:0}};
+  for(const k of CLOUD_KEYS){
+    try{ DB.loadRaw(DB.key[k]); }
+    catch(e){ out.読めない.push(k); }
+  }
+  try{
+    const seen = {};
+    for(const k of CLOUD_KEYS){
+      if(out.読めない.indexOf(k) >= 0) continue;
+      DB.loadRaw(DB.key[k]).forEach(x=>{
+        if(!x || typeof x !== 'object'){ out.ID無し++; return; }
+        if(!x.uuid){ out.ID無し++; return; }
+        const kk = k + ':' + x.uuid;
+        if(seen[kk]) out.重なり++; else seen[kk] = 1;
+      });
+    }
+    const st = {}, ca = {};
+    DB.loadRaw(DB.key.st).forEach(x=>{ if(x && x.uuid) st[x.uuid] = x; });
+    DB.loadRaw(DB.key.ca).forEach(x=>{ if(x && x.uuid) ca[x.uuid] = x; });
+    // ごみ箱の中の分は数えない（修復でごみ箱へ移した分が、また数えられてしまう）
+    DB.loadRaw(DB.key.ca).forEach(x=>{
+      if(x && x.uuid && !x.deleted_at
+         && (!x.station_uuid || !st[x.station_uuid])) out.迷子.ca++;
+    });
+    DB.loadRaw(DB.key.ind).forEach(x=>{
+      if(x && x.uuid && !x.deleted_at
+         && (!x.catch_uuid || !ca[x.catch_uuid])) out.迷子.ind++;
+    });
+    Object.keys(st).forEach(u=>{
+      const x = st[u];
+      ['spot_uuid','parent_uuid'].forEach(f=>{
+        if(x[f] && !st[x[f]]) out.迷子.つながり++;
+      });
+    });
+  }catch(e){}
+  out.何かある = !!(out.読めない.length || out.重なり || out.ID無し
+    || out.迷子.ca || out.迷子.ind || out.迷子.つながり);
+  return out;
+}
+function repairBackupPush(記録たち){
+  try{
+    const a = JSON.parse(localStorage.getItem('fs_repair_backup')||'[]');
+    a.push({at: nowISO(), 記録: 記録たち});
+    localStorage.setItem('fs_repair_backup', JSON.stringify(a.slice(-5)));
+    return true;
+  }catch(e){ return false; }
+}
+function repairRun(){
+  if(!writeAllowed()){
+    toast('このタブでは直せません。記録を入れているタブでお試しください', 7000);
+    return;
+  }
+  const sc = repairScan();
+  if(!sc.何かある){ toast('直すものはありません'); return; }
+  if(!confirm('見つかった壊れ方を直します。\n'
+    + '・同じIDの重なり ' + sc.重なり + '件（新しい方を残す）\n'
+    + '・IDの無い行 ' + sc.ID無し + '件（控えを取って除く）\n'
+    + '・親の無い魚の記録 ' + sc.迷子.ca + '件・1尾ずつ ' + sc.迷子.ind
+    + '件（ごみ箱へ）\n'
+    + '・切れたつながり ' + sc.迷子.つながり + '件（つながりだけ外す）\n'
+    + '除いた分は端末の中に控えます。よろしいですか？')) return;
+  const 控え = [];
+  let 直した = 0;
+  const 時 = x => String((x && (x.updated_at || x.created_at)) || '');
+  try{
+    // 重なり・ID無し
+    for(const k of CLOUD_KEYS){
+      if(!DB.key[k]) continue;
+      let a; try{ a = DB.loadRaw(DB.key[k]); }catch(e){ continue; }
+      const byId = {};
+      const out = [];
+      a.forEach(x=>{
+        if(!x || typeof x !== 'object' || !x.uuid){
+          if(x !== null && x !== undefined){ 控え.push(x); 直した++; }
+          return;
+        }
+        const 既 = byId[x.uuid];
+        if(既 === undefined){ byId[x.uuid] = out.length; out.push(x); return; }
+        // 新しい方を残す
+        if(時(x) > 時(out[既])){ 控え.push(out[既]); out[既] = x; }
+        else 控え.push(x);
+        直した++;
+      });
+      if(out.length !== a.length || 控え.length){
+        if(!DB.save(DB.key[k], out)){ toast('書き込めませんでした。やめました', 8000); return; }
+      }
+    }
+    // 迷子の魚の記録・1尾ずつ → ごみ箱へ（消さない。人が見て決められる）
+    const st = {}, ca2 = {};
+    DB.loadRaw(DB.key.st).forEach(x=>{ if(x && x.uuid) st[x.uuid] = x; });
+    DB.loadRaw(DB.key.ca).forEach(x=>{ if(x && x.uuid) ca2[x.uuid] = x; });
+    DB.loadRaw(DB.key.ca).forEach(x=>{
+      if(x && x.uuid && !x.deleted_at && (!x.station_uuid || !st[x.station_uuid])){
+        DB.softDelete(DB.key.ca, x.uuid); 直した++;
+      }
+    });
+    DB.loadRaw(DB.key.ind).forEach(x=>{
+      if(x && x.uuid && !x.deleted_at && (!x.catch_uuid || !ca2[x.catch_uuid])){
+        DB.softDelete(DB.key.ind, x.uuid); 直した++;
+      }
+    });
+    // 切れたつながりを外す
+    let a2; try{ a2 = DB.loadRaw(DB.key.st); }catch(e){ a2 = null; }
+    if(a2){
+      let 変えた = false;
+      const st2 = {};
+      a2.forEach(x=>{ if(x && x.uuid) st2[x.uuid] = x; });
+      a2.forEach(x=>{
+        if(!x) return;
+        ['spot_uuid','parent_uuid'].forEach(f=>{
+          if(x[f] && !st2[x[f]]){ x[f] = ''; 変えた = true; 直した++; }
+        });
+      });
+      if(変えた) DB.save(DB.key.st, a2);
+    }
+  }catch(e){ toast('途中で読めなくなったため、やめました', 8000); return; }
+  if(控え.length) repairBackupPush(控え);
+  try{ DB.surveys().forEach(sv=>{ unitRelink(sv.uuid); spotPosFix(sv.uuid); }); }catch(e){}
+  toast('直しました（' + 直した + 'か所）。除いた分は端末の中に控えてあります', 8000);
+  render();
+}
+
 /* ---- データ点検 ---- */
 SCREENS.check = ()=>{
   let 件数 = {}, 点検 = null, 迷子 = null;
@@ -9666,6 +9792,15 @@ SCREENS.check = ()=>{
           ${esc(Object.keys(迷子).map(k=>(名[k]||k)+' '+迷子[k]+'件').join('・'))}<br>
           （書き出しには入りません。ごみ箱の「完全に消す」の消し残りなどです）</div>` : ''}
       <div id="checkPhotos" class="card"><div class="dim small">写真を確かめています…</div></div>
+      ${(()=>{
+        const sc = repairScan();
+        if(!sc.何かある) return '';
+        return `<div class="warnbox">機械的に直せる壊れ方があります：
+          同じIDの重なり ${sc.重なり}・IDの無い行 ${sc.ID無し}・
+          親の無い記録 ${sc.迷子.ca + sc.迷子.ind}・切れたつながり ${sc.迷子.つながり}
+          <button class="btn" style="margin-top:8px" onclick="repairRun()">直す
+          （除いた分は端末に控えます）</button></div>`;
+      })()}
     `,
     async onMount(){
       const gen = screenGen();
