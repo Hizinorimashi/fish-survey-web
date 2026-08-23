@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v106';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v107';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1459,6 +1459,7 @@ function surveyTally(svUuid){
     const 地点 = st.is_spot ? st : (st.spot_uuid ? DB.liveStation(st.spot_uuid) : null);
     const 見出し = 地点 ? (地点.name || 名) : 名;
     const 行 = {name: 見出し, 種: 種数, 尾: n, 種集: Object.assign({}, 種),
+                鍵: 場所鍵,
                 印: 地点 ? '' : (UNIT_MARK[unitKindOf(st)] || '')};
     場所索引[場所鍵] = 行;
     場所.push(行);
@@ -7550,20 +7551,31 @@ function polyProblem(pts){
 const 移す欄 = ['gears','effort_seconds','effort_started_at','effort_passes',
                 'width_m','length_m_manual','area_m2_manual'];
 function unitMoveOwn(親uuid, 子uuid){
-  const 親 = DB.liveStation(親uuid), 子 = DB.liveStation(子uuid);
+  // 1つの入れ物につき1回の保存にまとめる。別々に保存すると、
+  // 途中で失敗したとき親と子の両方に値が残る（監査71回目 Minor）
+  let sts, cas;
+  try{ sts = DB.loadRaw(DB.key.st); cas = DB.loadRaw(DB.key.ca); }
+  catch(e){ return false; }
+  const 親 = sts.find(x=>x && x.uuid===親uuid);
+  const 子 = sts.find(x=>x && x.uuid===子uuid);
   if(!親 || !子) return false;
-  const cs = DB.catchesOf(親uuid);
-  // 先に全部を書き換えてから保存する（片方だけ動くのを防ぐ）
+  const t = nowISO();
   移す欄.forEach(k=>{
     if(親[k] === undefined || 親[k] === '') return;
     if(子[k] === undefined || 子[k] === '') 子[k] = 親[k];
     delete 親[k];
   });
-  if(!DB.upsert(DB.key.st, 子)) return false;
-  if(!DB.upsert(DB.key.st, 親)) return false;
-  for(const c of cs){
-    c.station_uuid = 子uuid;
-    if(!DB.upsert(DB.key.ca, c)) return false;
+  親.updated_at = t; 子.updated_at = t;
+  cas.forEach(c=>{
+    if(c && !c.deleted_at && c.station_uuid === 親uuid){
+      c.station_uuid = 子uuid; c.updated_at = t;
+    }
+  });
+  if(!DB.save(DB.key.st, sts)) return false;
+  if(!DB.save(DB.key.ca, cas)){
+    // 魚を書けなかったら、箇所も元へ（読み直して戻す）
+    try{ DB.save(DB.key.st, DB.loadRaw(DB.key.st)); }catch(e){}
+    return false;
   }
   return true;
 }
@@ -8642,6 +8654,21 @@ function cloudCheck(text){
     }
     return '';
   };
+  // 墓標（完全に消した印）も、あれば検査する（監査71回目 Major）。
+  // 細工された墓標で、手元の記録を消させないため
+  if(o.tombstones !== undefined){
+    if(!Array.isArray(o.tombstones)) return {ok:false, why:'墓標の形がちがいます'};
+    if(o.tombstones.length > 20000) return {ok:false, why:'墓標が多すぎます'};
+    for(const t of o.tombstones){
+      if(!t || typeof t !== 'object' || Array.isArray(t)){
+        return {ok:false, why:'墓標の形がちがいます'};
+      }
+      if(!safeId(t.uuid)) return {ok:false, why:'墓標のIDの形がちがいます'};
+      if(t.at !== undefined && (typeof t.at !== 'string' || t.at.length > 40)){
+        return {ok:false, why:'墓標の日時の形がちがいます'};
+      }
+    }
+  }
   const 迷子 = 親を確かめる('st','survey_uuid','sv','箇所と調査')
     || 親を確かめる('ca','station_uuid','st','魚の記録と箇所')
     || 親を確かめる('ind','catch_uuid','ca','1尾ずつの記録と魚の記録')
@@ -8650,10 +8677,11 @@ function cloudCheck(text){
     || 同じ調査か('st','spot_uuid','st','地点の結び付き')
     || 同じ調査か('st','parent_uuid','st','親の単位');
   if(迷子) return {ok:false, why:迷子};
-  return {ok:true, saved_at:o.saved_at||'', version:o.version||'', 数, data:o.data};
+  return {ok:true, saved_at:o.saved_at||'', version:o.version||'', 数, data:o.data,
+          tombstones: Array.isArray(o.tombstones) ? o.tombstones : []};
 }
 /* 控えで置き換える。いまの記録は消えるので、必ず確かめてから呼ぶ */
-function cloudApply(data){
+function cloudApply(data, 新しい墓標){
   // 通信を待っている間に、別のタブへ使用権が移ることがある。
   // そのまま置き換えると、別のタブで入れた記録を消す（監査38回目 Critical）
   if(!writeAllowed()){
@@ -8689,6 +8717,12 @@ function cloudApply(data){
           + '空きを作ってから、もう一度ドライブから戻してください', 12000);
       return false;
     }
+  }
+  // 墓標も控えのものへ置き換える。古い墓標が残っていると、
+  // いま戻した記録が、次の合成でまた消える（監査71回目 Major）
+  if(新しい墓標 !== undefined){
+    try{ localStorage.setItem('fs_tombstones',
+      JSON.stringify(Array.isArray(新しい墓標) ? 新しい墓標 : [])); }catch(e){}
   }
   打ちかけを捨てる();     // ぜんぶ置き換えられたときだけ
   // 写真の「付ける先」の印も片付ける。残すと、置き換えたあとの画面で
@@ -8977,16 +9011,30 @@ async function cloudSave(opt){
     const token = await gdGetToken();
     const folder = await gdFolder(token);
     const q = encodeURIComponent("name='"+GD_FILE+"' and '"+folder+"' in parents and trashed=false");
-    const list = await gdFetch('drive/v3/files?spaces=drive&fields=files(id)&q='+q, {}, token);
+    const list = await gdFetch('drive/v3/files?spaces=drive&fields=files(id,modifiedTime)&q='+q, {}, token);
     let id = (list.files && list.files.length) ? list.files[0].id : '';
+    // 別の端末が保存した控えを、知らずに上書きしない（監査71回目 Critical）。
+    // 「この端末が最後に書いたときの、ドライブ側の時刻」を控えておき、
+    // いまのドライブの時刻と食い違っていたら、丸ごと置き換えをやめて合成を促す
+    const いまの時刻 = id ? String((list.files[0].modifiedTime)||'') : '';
+    const 控えた時刻 = localStorage.getItem('fs_gdrive_mtime') || '';
+    if(id && 控えた時刻 && いまの時刻 && 控えた時刻 !== いまの時刻 && !(opt && opt.force)){
+      言う('別の端末がドライブへ保存しています。上書きすると、その端末の記録が消えます。'
+        + '先に「ドライブと合成する」を押してください', 12000);
+      if(自動) return;                 // 自動は静かに見送る（次の合成で合わさる）
+      if(!confirm('別の端末が保存した控えがドライブにあります。\n'
+        + '「OK」＝それを消して、この端末の記録で上書きする\n'
+        + '「キャンセル」＝やめる（先に「ドライブと合成する」がおすすめ）')) return;
+    }
     if(!id){
       const made = await gdFetch('drive/v3/files?fields=id', {method:'POST',
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify({name:GD_FILE, parents:[folder]})}, token);
       id = made.id;
     }
-    await gdFetch('upload/drive/v3/files/'+id+'?uploadType=media&fields=id,modifiedTime',
+    const 書けた = await gdFetch('upload/drive/v3/files/'+id+'?uploadType=media&fields=id,modifiedTime',
       {method:'PATCH', headers:{'Content-Type':'application/json'}, body:text}, token);
+    try{ localStorage.setItem('fs_gdrive_mtime', String((書けた && 書けた.modifiedTime)||'')); }catch(e){}
     let 写真 = {送った:0, 全部:0, 失敗:0};
     try{ 写真 = await cloudSavePhotos(token, folder); }
     catch(e){ 写真 = {送った:0, 全部:-1, 失敗:-1}; }
@@ -8998,7 +9046,8 @@ async function cloudSave(opt){
   }catch(e){
     言う('保存できませんでした：' + ((e && e.message) || e), 10000);
   }
-  render();
+  // 自動のときは画面を作り直さない。打っている最中の欄が消える（監査71回目 Major）
+  if(!自動) render();
 }
 /* ---- ドライブと合成（2台で使うとき） ----
    ドライブの控えと手元の記録を、記録ごとに「新しい操作をした方」で合わせる。
@@ -9007,35 +9056,62 @@ async function cloudSave(opt){
    ・墓標（完全に消した印）は両方を合わせ、載っている記録は戻さない
    合わせた結果を手元に置き、ドライブへも送り返す（2026-08-23・鳥アプリの考え方） */
 function mergeBackup(remoteData, remoteTombs){
-  const tombs = {};
+  const tombs = Object.create(null);
   tombstones().forEach(t=>{ tombs[t.uuid] = t.at || ''; });
   (Array.isArray(remoteTombs) ? remoteTombs : []).forEach(t=>{
-    if(t && typeof t.uuid==='string' && t.uuid && !tombs[t.uuid]) tombs[t.uuid] = t.at || '';
+    if(!t || typeof t.uuid !== 'string' || !safeId(t.uuid)) return;
+    const at = (typeof t.at === 'string') ? t.at : '';
+    // 同じ記録に墓標が2つあれば、新しい方の日時で持つ
+    if(tombs[t.uuid] === undefined || at > tombs[t.uuid]) tombs[t.uuid] = at;
   });
   const 時 = x => String((x && (x.updated_at || x.created_at)) || '');
-  const box = {}, 数 = {手元のみ:0, ドライブのみ:0, 新しい方:0, 同じ:0, 墓標で除外:0};
+  const box = {}, 控え = [];
+  const 数 = {手元のみ:0, ドライブのみ:0, 新しい方:0, 同じ:0, 墓標で除外:0, 墓標より新しい:0};
   for(const k of CLOUD_KEYS){
-    const L = {}, R = {};
+    const L = Object.create(null), R = Object.create(null);
     DB.loadRaw(DB.key[k]).forEach(x=>{ if(x && x.uuid) L[x.uuid] = x; });
     ((remoteData && remoteData[k]) || []).forEach(x=>{ if(x && x.uuid) R[x.uuid] = x; });
     const ids = new Set(Object.keys(L).concat(Object.keys(R)));
     const out = [];
     ids.forEach(u=>{
-      if(tombs[u] !== undefined){ 数.墓標で除外++; return; }
       const l = L[u], r = R[u];
+      const 勝ち = (l && r) ? (時(l) >= 時(r) ? l : r) : (l || r);
+      if(tombs[u] !== undefined){
+        // 墓標より新しい編集は消さない（消したあとに、別の端末で直した記録。
+        // 無条件に消すと、その編集が黙って失われる。監査71回目 Critical）。
+        // 日時の分からない墓標も、消す側に倒さない
+        if(!tombs[u] || 時(勝ち) > tombs[u]){
+          数.墓標より新しい++;
+          delete tombs[u];               // 記録が生きるので、墓標を下げる
+        }else{
+          数.墓標で除外++;
+          控え.push(勝ち);               // 消す分は控えに残す
+          return;
+        }
+      }
       if(l && r){
-        if(時(l) === 時(r)){ 数.同じ++; out.push(l); }
-        else { 数.新しい方++; out.push(時(l) > 時(r) ? l : r); }
-      }else if(l){ 数.手元のみ++; out.push(l); }
-      else { 数.ドライブのみ++; out.push(r); }
+        if(時(l) === 時(r)) 数.同じ++;
+        else 数.新しい方++;
+      }else if(l) 数.手元のみ++;
+      else 数.ドライブのみ++;
+      out.push(勝ち);
     });
     box[k] = out;
   }
-  // 合わせた結果から、親を失った行を外す（片方で親を消していた場合など）
+  // 合わせた結果から、親を失った行を外す（片方で親を消していた場合など）。
+  // 外す行の中身は控えに残す（黙って失わない。監査71回目 Critical）
+  {
+    const 写し = {};
+    CLOUD_KEYS.forEach(k=>{ 写し[k] = box[k].map(x=>Object.assign({}, x)); });
+    cloudPrune(写し);
+    CLOUD_KEYS.forEach(k=>{
+      const 残る = new Set(写し[k].map(x=>x.uuid));
+      box[k].forEach(x=>{ if(!残る.has(x.uuid)) 控え.push(x); });
+    });
+  }
   const 外した = cloudPrune(box);
-  Object.keys(外した).forEach(k=>{ 数.墓標で除外 += 0; });   // 件数は別枠で返す
   const merged = Object.keys(tombs).map(u=>({uuid:u, at:tombs[u]}));
-  return {box, 数, 外した, tombs: merged};
+  return {box, 数, 外した, tombs: merged, 控え};
 }
 async function cloudMerge(){
   if(!writeAllowed()){
@@ -9048,12 +9124,16 @@ async function cloudMerge(){
     const token = await gdGetToken();
     const folder = await gdFolder(token);
     const q = encodeURIComponent("name='"+GD_FILE+"' and '"+folder+"' in parents and trashed=false");
-    const list = await gdFetch('drive/v3/files?spaces=drive&fields=files(id)&q='+q, {}, token);
+    const list = await gdFetch('drive/v3/files?spaces=drive&fields=files(id,modifiedTime)&q='+q, {}, token);
     if(list.files && list.files.length){
       const r = await fetch('https://www.googleapis.com/drive/v3/files/'
         + list.files[0].id + '?alt=media', {headers:{Authorization:'Bearer '+token}});
       if(!r.ok) throw new Error('ドライブ ' + r.status);
       remote = JSON.parse(await r.text());
+      // いま読んだ控えの時刻を控える。控えないと、このあとの送り返しが
+      // 「別の端末が保存した」と勘違いして止まる
+      try{ localStorage.setItem('fs_gdrive_mtime',
+        String(list.files[0].modifiedTime||'')); }catch(e){}
     }
   }catch(e){
     toast('ドライブの控えを読めませんでした（' + (e && e.message || '') + '）', 9000);
@@ -9070,15 +9150,24 @@ async function cloudMerge(){
     toast('ドライブの控えが戻せない形です（' + 検査.why + '）。合成をやめました', 10000);
     return;
   }
-  const m = mergeBackup(検査.data, remote.tombstones);
+  const m = mergeBackup(検査.data, 検査.tombstones);
   const 外し数 = Object.keys(m.外した||{}).reduce((a,k)=>a+m.外した[k], 0);
   if(!confirm('ドライブの控えと合成します。\n'
     + '・手元だけにある記録 ' + m.数.手元のみ + '件（残ります）\n'
     + '・ドライブだけにある記録 ' + m.数.ドライブのみ + '件（取り込みます）\n'
     + '・両方にあって内容が違う ' + m.数.新しい方 + '件（新しい操作をした方）\n'
     + '・完全に消した印で除くもの ' + m.数.墓標で除外 + '件'
-    + (外し数 ? '\n・もとの記録が見あたらない分 ' + 外し数 + '件（除きます）' : '')
+    + (m.数.墓標より新しい ? '\n・消した後に直されていた記録 ' + m.数.墓標より新しい
+        + '件（残します）' : '')
+    + (外し数 ? '\n・もとの記録が見あたらない分 ' + 外し数 + '件（端末に控えて除きます）' : '')
     + '\nよろしいですか？')) return;
+  // 除く分の中身を、先に端末へ控える（黙って失わない。監査71回目 Critical）。
+  // 控えられないときは、合成をやめる
+  if((m.控え||[]).length && !repairBackupPush(m.控え)){
+    toast('除く分の控えを取れなかったため、合成をやめました。'
+      + '端末の空き容量をご確認ください', 10000);
+    return;
+  }
   // 手元へ書く（途中で失敗したら元に戻す。cloudApply と同じ作法）
   const 元 = {};
   try{ CLOUD_KEYS.forEach(k=>{ 元[k] = DB.loadRaw(DB.key[k]); }); }
@@ -9143,7 +9232,7 @@ async function cloudRestore(){
     if(!confirm(`ドライブの控え（${String(中.saved_at).slice(0,16).replace('T',' ')}／`
       + `${控え}件）で、いまの記録（${いま}件）を置き換えます。\n`
       + 'いまの記録は消えます。よろしいですか？')) return;
-    if(cloudApply(中.data)){
+    if(cloudApply(中.data, 中.tombstones)){
       let 写真 = {戻した:0, 足りない:0}, 写真の失敗 = '';
       try{ 写真 = await cloudRestorePhotos(token, folder); }
       catch(e){ 写真の失敗 = (e && e.message) || String(e); }
@@ -9269,7 +9358,16 @@ function exportGeoJSON(svUuid){
    記録はいちばん小さい単位の分だけ数え、場所は地点でまとめる */
 function buildReport(sv){
   const t = surveyTally(sv.uuid);
-  const 場所列 = (t.場所||[]).map(x=>x.name||'');
+  // 列は場所の「鍵」で組む。名前だけで組むと、同じ名前の地点があったとき
+  // 別の地点の尾数が同じ列に混ざる（監査71回目 Major）。
+  // 同じ名前が重なったら (2)(3) を付けて見分ける
+  const 名の数 = Object.create(null);
+  const 場所たち = (t.場所||[]).map(x=>{
+    const 名 = x.name || '（名前なし）';
+    名の数[名] = (名の数[名]||0) + 1;
+    return {鍵: x.鍵, 名: 名の数[名] > 1 ? `${名}(${名の数[名]})` : 名};
+  });
+  const 場所列 = 場所たち.map(x=>x.名);
   // 種一覧
   const 種一覧 = (t.種||[]).map(k=>{
     const sp = speciesById(k.id);
@@ -9281,10 +9379,9 @@ function buildReport(sv){
   // 地点×種（行＝種、列＝地点）
   const クロス = (t.種||[]).map(k=>{
     const row = {'種名': k.name||''};
-    場所列.forEach(nm=>{ row[nm] = ''; });
-    Object.keys(k.場所||{}).forEach(pid=>{
-      const b = k.場所[pid];
-      if(b && b.name !== undefined) row[b.name] = b.尾;
+    場所たち.forEach(x=>{
+      const b = (k.場所||{})[x.鍵];
+      row[x.名] = b ? b.尾 : '';
     });
     row['合計'] = k.尾;
     return row;
@@ -9320,7 +9417,10 @@ function searchAll(q){
       if(当たる(文)) out.push({種類:'調査', 見出し:svName[sv.uuid],
         添え: sv.memo||'', 開く:()=>goTo('survey', sv.uuid)});
     });
-    DB.loadRaw(DB.key.st).filter(x=>x && !x.deleted_at).forEach(st=>{
+    // 親（調査・箇所）が消えている記録は出さない。
+    // 出すと、押しても開けない（監査71回目 Minor）
+    DB.loadRaw(DB.key.st).filter(x=>x && !x.deleted_at
+        && svName[x.survey_uuid] !== undefined).forEach(st=>{
       const 文 = [st.name, st.memo, st.site_name, st.section_name,
         st.habitat_type].join(' ');
       if(当たる(文)) out.push({種類: st.is_spot ? '地点' : '箇所・単位',
@@ -9331,12 +9431,14 @@ function searchAll(q){
       const 文 = [c.species_name, c.notes].join(' ');
       if(当たる(文)){
         const st = DB.liveStation(c.station_uuid);
+        if(!st || svName[c.survey_uuid] === undefined) return;
         out.push({種類:'魚の記録',
-          見出し: `${c.species_name||''} ${catchTotal(c)}尾（${st?st.name:''}・${svName[c.survey_uuid]||''}）`,
+          見出し: `${c.species_name||''} ${catchTotal(c)}尾（${st.name||''}・${svName[c.survey_uuid]||''}）`,
           添え: c.notes||'', 開く:()=>nav('catchEdit',{uuid:c.uuid})});
       }
     });
-    DB.loadRaw(DB.key.nt).filter(x=>x && !x.deleted_at).forEach(nt=>{
+    DB.loadRaw(DB.key.nt).filter(x=>x && !x.deleted_at
+        && svName[x.survey_uuid] !== undefined).forEach(nt=>{
       if(当たる(nt.content||'')) out.push({種類:'メモ',
         見出し: `${String(nt.content||'').slice(0,24)}（${svName[nt.survey_uuid]||''}）`,
         添え: String(nt.content||'').slice(0,60),
@@ -9437,22 +9539,34 @@ async function doImport(){
   delete o.photos;
   const 点検 = cloudCheck(JSON.stringify(o));
   if(!点検.ok){ toast('取り込めない形です（' + 点検.why + '）', 10000); return; }
+  // 写真も、記録を置き換える前に形を確かめる（監査71回目 Minor）。
+  // 壊れた1枚で全体を止めず、その枚だけ飛ばす。ただし多すぎ・大きすぎは全体を断る
+  if(photos.length > 5000){ toast('写真が多すぎます', 9000); return; }
+  for(const pp of photos){
+    if(pp && typeof pp.b64 === 'string' && pp.b64.length > 40*1024*1024){
+      toast('大きすぎる写真が入っています。取り込みをやめました', 9000);
+      return;
+    }
+  }
   const 名 = {sv:'調査',st:'箇所',ca:'魚の記録',ind:'1尾ずつ',nt:'メモ',mc:'メッシュのマス'};
   const 数 = CLOUD_KEYS.map(k=>名[k] + ' ' + (点検.数[k]||0) + '件').join('・');
   if(!confirm('このバックアップで、いまの記録を丸ごと置き換えます。\n'
     + '（' + 数 + '・写真 ' + photos.length + '枚）\n'
     + 'いまの記録は消えます。よろしいですか？')) return;
-  if(!cloudApply(点検.data)) return;
+  if(!cloudApply(点検.data, 点検.tombstones)) return;
   // 写真を戻す（形のおかしいものは飛ばす）
   let 戻した = 0, 飛ばした = 0;
   for(const pp of photos){
     if(!pp || !safeId(pp.id) || typeof pp.b64 !== 'string' || !pp.b64){ 飛ばした++; continue; }
+    if(pp.ext !== undefined && !/^[A-Za-z0-9]{1,8}$/.test(String(pp.ext))){ 飛ばした++; continue; }
     try{
       const bin = atob(pp.b64);
       const buf = new Uint8Array(bin.length);
       for(let i=0;i<bin.length;i++) buf[i] = bin.charCodeAt(i);
       const blob = new Blob([buf]);
       if(!blob.size){ 飛ばした++; continue; }
+      // 大きさの控えがあるのに合わないものは、壊れているので入れない
+      if(pp.size !== undefined && +pp.size !== blob.size){ 飛ばした++; continue; }
       await PhotoDB.put({id: pp.id, blob, ext: String(pp.ext||'jpg').slice(0,8),
         size: blob.size, added_at: nowISO()});
       戻した++;
@@ -9637,7 +9751,12 @@ async function docOpen(id){
     setTimeout(()=>{ try{ URL.revokeObjectURL(url); }catch(e){} }, 60000);
   }catch(e){ toast('開けませんでした', 6000); }
 }
-async function docDel(id, name){
+async function docDel(id){
+  // 名前は押す仕組みに埋め込まず、ここで引く。
+  // ファイル名に ' が入っているだけでボタンが壊れていた（監査71回目 Major）
+  let name = '';
+  try{ const all = await DocDB.all();
+    name = ((all||[]).find(x=>x.id===id)||{}).name || ''; }catch(e){}
   if(!confirm('「' + name + '」を消します。よろしいですか？（元に戻せません）')) return;
   try{ await DocDB.del(id); toast('消しました'); render(); }
   catch(e){ toast('消せませんでした', 6000); }
@@ -9669,9 +9788,9 @@ SCREENS.refdocs = ()=>({
           <div class="dim small">${fmtBytes(r.size||0)}</div>
         </div>
         <button class="btn sm" style="width:auto;margin:0"
-          onclick="docOpen('${r.id}')">開く</button>
+          onclick="docOpen('${esc(r.id)}')">開く</button>
         <button class="btn sm ng" style="width:auto;margin:0"
-          onclick="docDel('${r.id}','${esc(r.name||'')}')">消す</button>
+          onclick="docDel('${esc(r.id)}')">消す</button>
       </div>
     </div>`).join('') : '<div class="dim small">まだ資料がありません。</div>';
   }});
@@ -9686,7 +9805,9 @@ function repairScan(){
     catch(e){ out.読めない.push(k); }
   }
   try{
-    const seen = {};
+    // ふつうのオブジェクトを辞書にすると、__proto__ などのIDで
+    // 入っていないのに「ある」と見えてしまう（監査71回目 Major）
+    const seen = Object.create(null);
     for(const k of CLOUD_KEYS){
       if(out.読めない.indexOf(k) >= 0) continue;
       DB.loadRaw(DB.key[k]).forEach(x=>{
@@ -9741,6 +9862,27 @@ function repairRun(){
     + '件（ごみ箱へ）\n'
     + '・切れたつながり ' + sc.迷子.つながり + '件（つながりだけ外す）\n'
     + '除いた分は端末の中に控えます。よろしいですか？')) return;
+  // 直す前に、いまの記録を丸ごと控える（監査71回目 Major）。
+  // 途中で失敗しても、この控えから戻せる。控えが取れなければ直さない
+  const 丸ごと = {};
+  try{
+    for(const k of CLOUD_KEYS){ 丸ごと[k] = DB.loadRaw(DB.key[k]); }
+  }catch(e){ toast('記録を読み取れないため、やめました', 8000); return; }
+  if(!repairBackupPush({種類:'修復前の控え', 中身:丸ごと})){
+    toast('直す前の控えを取れなかったため、やめました。'
+      + '端末の空き容量をご確認ください', 10000);
+    return;
+  }
+  const 戻す = ()=>{
+    let 戻せた = true;
+    CLOUD_KEYS.forEach(k=>{
+      try{ if(!DB.save(DB.key[k], 丸ごと[k])) 戻せた = false; }
+      catch(e){ 戻せた = false; }
+    });
+    toast(戻せた
+      ? '書き込めなかったため、直す前に戻しました'
+      : '書き込めず、元にも戻せませんでした。「データ点検」の控えから戻せます', 12000);
+  };
   const 控え = [];
   let 直した = 0;
   const 時 = x => String((x && (x.updated_at || x.created_at)) || '');
@@ -9749,11 +9891,12 @@ function repairRun(){
     for(const k of CLOUD_KEYS){
       if(!DB.key[k]) continue;
       let a; try{ a = DB.loadRaw(DB.key[k]); }catch(e){ continue; }
-      const byId = {};
+      const byId = Object.create(null);
       const out = [];
+      let この鍵で直した = 0;
       a.forEach(x=>{
         if(!x || typeof x !== 'object' || !x.uuid){
-          if(x !== null && x !== undefined){ 控え.push(x); 直した++; }
+          if(x !== null && x !== undefined){ 控え.push(x); この鍵で直した++; }
           return;
         }
         const 既 = byId[x.uuid];
@@ -9761,10 +9904,11 @@ function repairRun(){
         // 新しい方を残す
         if(時(x) > 時(out[既])){ 控え.push(out[既]); out[既] = x; }
         else 控え.push(x);
-        直した++;
+        この鍵で直した++;
       });
-      if(out.length !== a.length || 控え.length){
-        if(!DB.save(DB.key[k], out)){ toast('書き込めませんでした。やめました', 8000); return; }
+      直した += この鍵で直した;
+      if(この鍵で直した){
+        if(!DB.save(DB.key[k], out)){ 戻す(); return; }
       }
     }
     // 迷子の魚の記録・1尾ずつ → ごみ箱へ（消さない。人が見て決められる）
@@ -9793,10 +9937,10 @@ function repairRun(){
           if(x[f] && !st2[x[f]]){ x[f] = ''; 変えた = true; 直した++; }
         });
       });
-      if(変えた) DB.save(DB.key.st, a2);
+      if(変えた && !DB.save(DB.key.st, a2)){ 戻す(); return; }
     }
-  }catch(e){ toast('途中で読めなくなったため、やめました', 8000); return; }
-  if(控え.length) repairBackupPush(控え);
+  }catch(e){ 戻す(); return; }
+  if(控え.length) repairBackupPush({種類:'修復で除いた行', 中身:控え});
   try{ DB.surveys().forEach(sv=>{ unitRelink(sv.uuid); spotPosFix(sv.uuid); }); }catch(e){}
   toast('直しました（' + 直した + 'か所）。除いた分は端末の中に控えてあります', 8000);
   render();
