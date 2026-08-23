@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v119';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v120';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2479,6 +2479,42 @@ function envAddAt(svUuid, lat, lon, acc, targetUuid){
   // 新しい点のつもりで前の記録に書き込んでしまう（監査 Major）
   ENV_SEL = rec.uuid;
   toast(`${rec.name} を置きました`);
+  return rec.uuid;
+}
+/* メッシュの範囲を、物理環境の地図から作る（地点ごとのメッシュ入口）。
+   地点から開いていれば、その地点のメッシュとして作る。
+   「取り方＝メッシュ」「どの地点か」「調査日」を最初の1回の保存で入れる
+   （あとから入れる作りだと、途中で閉じたときに欠けた記録が残る。監査37回目 Major）。
+   既存の地点（目印）をメッシュに作り替えることはしない。常に新しい記録を作る */
+function meshCreate(svUuid){
+  if(MAP_LOOSE){
+    toast('ここは、地点に属さない以前の記録を見る画面です。'
+      + '新しく作るときは、地点を選んでから開いてください', 8000);
+    return null;
+  }
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return null;
+  envFlush();            // いま打っている分を、作る前に書いてしまう
+  if(!writeAllowed()){
+    toast('このタブでは作れません。記録を入れているタブでお試しください', 6000);
+    return null;
+  }
+  const no = nextStationNo(svUuid);
+  if(no === null){ toast('番号が大きすぎて、これ以上作れません', 7000); return null; }
+  const rec = {
+    uuid: uuid(), survey_uuid: svUuid,
+    station_no: no,
+    spot_uuid: MAP_SPOT || '',      // どの地点の地図で作ったか
+    record_kind: 'env',             // 物理環境の記録。前のやり方の箇所と混ぜない
+    survey_date: recDay(sv),
+    started_at: nowISO(),
+    survey_time_start: autoTime(sv),
+    survey_type: sv.survey_type_default || '目視',
+    env_method: 'メッシュ',
+    name: envAutoName(svUuid, 'M'),
+  };
+  if(!DB.upsert(DB.key.st, rec)) return null;
+  toast(rec.name + ' を作りました。川の四隅を押さえて格子を決めてください', 6000);
+  nav('meshSetup', rec.uuid);
   return rec.uuid;
 }
 
@@ -11197,11 +11233,13 @@ SCREENS.envMap = (arg)=>{
   if(指名 && mapStations(svUuid, 'env', spot).some(x=>x.uuid===指名)) ENV_SEL = 指名;
   const all = DB.stationsOf(svUuid);
   // メッシュの範囲は位置の持ち方が違うので、点・線の並びに混ぜない。
-  // 混ぜると、位置の無い点として並んでしまう
-  // メッシュは地点で絞らない。地点ごとのメッシュを作る入口がまだ無いので、
-  // 絞ると前に作ったメッシュが地点から開いた画面で見えなくなるだけ。
-  // 「地点ごとのメッシュ」は tasks/todo.md に回した（監査37回目 Major）
+  // 混ぜると、位置の無い点として並んでしまう。
+  // 地点から開いたときは、その地点のメッシュだけを出す（点・線と同じ決まり）。
+  // ただし、入口ができる前に作った「地点の決まっていないメッシュ」は
+  // 見えなくならないよう、小見出しを付けて併せて出す（監査37回目の宿題・2026-08-24）
   const meshes = all.filter(isMesh);
+  const spotMeshes = meshes.filter(st=>ofSpot(st, spot));
+  const looseMeshes = spot ? meshes.filter(st=>!st.spot_uuid) : [];
   // 地点（新しい調査の地図で置いたもの）は、ここでは記録として扱わない。
   // 地点は「大まかにこの辺」の目印で、詳しい記録はこの画面で作る
   // 魚の単位（E・P/F・P）も、この一覧には出さない。
@@ -11253,11 +11291,15 @@ SCREENS.envMap = (arg)=>{
       <div class="dim small" id="envGps"></div>
       <div id="envPending"></div>
 
-      ${meshes.length ? `<div class="card">
+      ${(spotMeshes.length || looseMeshes.length || !MAP_LOOSE) ? `<div class="card">
         <h3 style="margin-top:0">メッシュの範囲</h3>
-        ${meshes.map(st=>`<button class="btn sm"
+        ${spotMeshes.map(st=>`<button class="btn sm"
           onclick="nav('mesh','${st.uuid}')">${esc(st.name||'')}（${meshCellsOf(st.uuid).length}マス）</button>`).join('')}
-        <div class="dim small">メッシュは別の画面で記録します。</div>
+        ${looseMeshes.length ? `<div class="dim small">地点の決まっていない、前に作ったメッシュ</div>` : ''}
+        ${looseMeshes.map(st=>`<button class="btn sm"
+          onclick="nav('mesh','${st.uuid}')">${esc(st.name||'')}（${meshCellsOf(st.uuid).length}マス）</button>`).join('')}
+        ${MAP_LOOSE ? '' : `<div><button class="btn sm" onclick="meshCreate('${svUuid}')">${spot ? 'この地点にメッシュの範囲を作る' : 'メッシュの範囲を作る'}</button></div>`}
+        <div class="dim small">メッシュは別の画面で記録します。マスごとに水深・流速・河床材料を入れられます。</div>
       </div>` : ''}
 
       <div class="card">
