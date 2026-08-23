@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v114';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v115';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -8752,6 +8752,20 @@ function cloudCheck(text){
           tombstones: Array.isArray(o.tombstones) ? o.tombstones : []};
 }
 /* 控えで置き換える。いまの記録は消えるので、必ず確かめてから呼ぶ */
+/* 記録を丸ごと入れ替えたあとの、打ちかけの片付け。
+   古い打ちかけが残っていると、同じIDの記録を開いたときに
+   そちらが優先されて、入れ替えた内容が元へ戻る（監査67回目 Major）。
+   「戻す」だけでなく「合成」でも同じことが起きる（監査79回目 Major）ので、
+   1つの関数にして両方から呼ぶ */
+function cloudDraftReset(){
+  try{ localStorage.removeItem('fs_draft_edit'); }catch(e){}
+  try{ Object.keys(DRAFT_HOLD).forEach(k=>{ delete DRAFT_HOLD[k]; }); }catch(e){}
+  try{ Object.keys(SPOT_HOLD).forEach(k=>{ delete SPOT_HOLD[k]; }); }catch(e){}
+  try{ draftUnbind(); }catch(e){}
+  try{ if(SPOT_TYPE_T){ clearTimeout(SPOT_TYPE_T); SPOT_TYPE_T = null; } }catch(e){}
+  try{ if(ENV_AUTO_TIMER){ clearTimeout(ENV_AUTO_TIMER); ENV_AUTO_TIMER = null; }
+       ENV_FORM = ''; ENV_DIRTY = false; }catch(e){}
+}
 function cloudApply(data, 新しい墓標){
   // 通信を待っている間に、別のタブへ使用権が移ることがある。
   // そのまま置き換えると、別のタブで入れた記録を消す（監査38回目 Critical）
@@ -8762,17 +8776,6 @@ function cloudApply(data, 新しい墓標){
   const 元 = {};
   try{ CLOUD_KEYS.forEach(k=>{ 元[k] = DB.loadRaw(DB.key[k]); }); }
   catch(e){ toast('いまの記録を読み取れないため、戻せませんでした', 8000); return false; }
-  const 打ちかけを捨てる = ()=>{
-    // 控えで置き換えたのに古い打ちかけが残っていると、
-    // 同じIDの記録を開いたときに、そちらが優先されて元へ戻る（監査67回目 Major）
-    try{ localStorage.removeItem('fs_draft_edit'); }catch(e){}
-    try{ Object.keys(DRAFT_HOLD).forEach(k=>{ delete DRAFT_HOLD[k]; }); }catch(e){}
-    try{ Object.keys(SPOT_HOLD).forEach(k=>{ delete SPOT_HOLD[k]; }); }catch(e){}
-    try{ draftUnbind(); }catch(e){}
-    try{ if(SPOT_TYPE_T){ clearTimeout(SPOT_TYPE_T); SPOT_TYPE_T = null; } }catch(e){}
-    try{ if(ENV_AUTO_TIMER){ clearTimeout(ENV_AUTO_TIMER); ENV_AUTO_TIMER = null; }
-         ENV_FORM = ''; ENV_DIRTY = false; }catch(e){}
-  };
   for(const k of CLOUD_KEYS){
     if(!DB.save(DB.key[k], data[k] || [])){
       // 途中で失敗したら、書いた分を戻す（半端な状態を残さない）。
@@ -8808,7 +8811,7 @@ function cloudApply(data, 新しい墓標){
       return false;
     }
   }
-  打ちかけを捨てる();     // ぜんぶ置き換えられたときだけ
+  cloudDraftReset();      // ぜんぶ置き換えられたときだけ
   // 写真の「付ける先」の印も片付ける。残すと、置き換えたあとの画面で
   // 前の写真が出てきて、別の記録に付いてしまう（監査70回目 Major）
   try{ if(typeof photoOwnerResetAll === 'function') photoOwnerResetAll(); }catch(e){}
@@ -9204,9 +9207,17 @@ function mergeDatasets(A, B){
 async function cloudFetchAll(token, folder){
   const q = encodeURIComponent("name contains 'fish_survey_' and '"+folder
     + "' in parents and trashed=false");
-  const list = await gdFetch('drive/v3/files?spaces=drive'
-    + '&fields=files(id,name,modifiedTime)&q='+q, {}, token);
-  const files = (list.files||[]).filter(f=>f && /\.json$/.test(String(f.name||'')));
+  // 一覧は続きのページまで読み切る（監査79回目 Minor）
+  let 全ファイル = [], page = '';
+  for(let i=0; i<50; i++){
+    const list = await gdFetch('drive/v3/files?spaces=drive'
+      + '&fields=nextPageToken,files(id,name,modifiedTime)&q='+q
+      + (page ? '&pageToken='+encodeURIComponent(page) : ''), {}, token);
+    (list.files||[]).forEach(f=>全ファイル.push(f));
+    if(!list.nextPageToken) break;
+    page = list.nextPageToken;
+  }
+  const files = 全ファイル.filter(f=>f && /\.json$/.test(String(f.name||'')));
   let 合わせ = null, 読めた = 0, 読めない = 0;
   for(const f of files){
     try{
@@ -9332,6 +9343,10 @@ async function cloudMerge(){
   }
   if(cloudBusy()) return;
   try{
+  // 打ちかけがあれば、先に記録へ書いてしまう。書かずに合成すると、
+  // そのあと開いた画面で古い打ちかけが復元され、合成した内容を上書きする
+  //（監査79回目 Major）
+  try{ flushAllForms(); }catch(e){}
   toast('ドライブの控えを読んでいます…', 8000);
   let 全部 = null;
   try{
@@ -9405,6 +9420,8 @@ async function cloudMerge(){
       : '合成できませんでした。しかも元に戻せず、一部が書き換わったままです', 12000);
     return;
   }
+  // 残った打ちかけは捨てる（先に flushAllForms で書いた分は記録に入っている）
+  cloudDraftReset();
   // 親子と代表の位置を、合わせた結果から決め直す
   try{
     DB.surveys().forEach(sv=>{ unitRelink(sv.uuid); spotPosFix(sv.uuid); });
