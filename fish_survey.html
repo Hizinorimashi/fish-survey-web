@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v120';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v121';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1733,7 +1733,8 @@ function gearRemove(stUuid, i){
    3分の1になり、労力を記録する意味が消える。
    だから既定は「始点から終点までの直線」。軌跡も残して、後から確かめられるようにする */
 /* ===== メッシュ =====
-   四隅を押さえて、縦の間隔と横の分割数からマスを作る。
+   四隅を押さえて、縦と横の間隔（m）からマスを作る。
+   （前の版は横を「分割数」で持っている。その記録もそのまま使える）
    マスの位置は四隅から計算で出す（1マスずつGPSを取ると、
    誤差で格子から外れてしまう）。
    四隅の順番は 上流左岸 → 上流右岸 → 下流右岸 → 下流左岸 */
@@ -1800,9 +1801,17 @@ function meshRowsOf(st){
   if(L==='' || gap==='' || !(gap>0)) return 0;
   return Math.max(1, Math.round(L/gap));
 }
+/* 横に何列できるか。いまは「横の間隔m」（mesh_col_m）から数える。
+   何m×何mでも作れるように（2026-08-24 の実機の声）。
+   幅を間隔で割って丸めるので、全マスが同じ幅に少しずつ伸び縮みする
+   （端に半端なマスを作らない。指定と多少ずれるのは承知のうえ）。
+   前の版の「分割数」（mesh_cols）が入っていれば、そちらをそのまま使う */
 function meshColsOf(st){
   const n = countOf(st && st.mesh_cols);
-  return (n===null || n==='' || n<=0) ? 0 : n;
+  if(n!==null && n!=='' && n>0) return n;
+  const W = meshWidth(st), gap = numOf(st && st.mesh_col_m);
+  if(W==='' || gap==='' || !(gap>0)) return 0;
+  return Math.max(1, Math.round(W/gap));
 }
 /* 四隅の中を、行と列で分けたときのマスの中心。
    4つの角を「上下」「左右」で混ぜる（双線形内挿）。
@@ -1859,7 +1868,8 @@ function meshGridId(st){ return String((st && st.mesh_grid_id) || ''); }
 /* その格子の定義を、文字にしたもの。同じなら版を変えない */
 function meshGridSig(st){
   const c = (st && st.mesh_corners) || [];
-  return JSON.stringify([c, numOf(st && st.mesh_row_m), countOf(st && st.mesh_cols)]);
+  return JSON.stringify([c, numOf(st && st.mesh_row_m), countOf(st && st.mesh_cols),
+                         numOf(st && st.mesh_col_m)]);
 }
 function meshIsCurrent(st, cell){
   return String((cell && cell.grid_id) || '') === meshGridId(st);
@@ -5130,7 +5140,8 @@ function buildStationRows(sv, snap){
       '距離_区間折れ線m': round1(stationLengths(st).line),
       '曲がり数': isLine(st) ? lineVias(st).length : '',
       '流量': numOf(st.flow_rate),
-      'メッシュ縦間隔m': numOf(st.mesh_row_m), 'メッシュ横分割数': countOf(st.mesh_cols),
+      'メッシュ縦間隔m': numOf(st.mesh_row_m), 'メッシュ横間隔m': numOf(st.mesh_col_m),
+      'メッシュ横分割数': countOf(st.mesh_cols),
       'メッシュ行数': mg ? mg.rows : '', 'メッシュ列数': mg ? mg.cols : '',
       'メッシュ入力済み数': isMesh(st) ? meshCurrentCells(st, snapCells(st, snap)).length : '',
       'メッシュ前の格子のマス数': meshOldCells(st, snapCells(st, snap)).length,
@@ -5451,7 +5462,7 @@ const FS_STATION_COLS = ['調査日','河川名','地点名','区間名','河川
   '記録の単位','単位の呼び名','親の単位','囲いの角数','囲い座標',
   '中の記録の種数','中の記録の尾数',
   '距離_始終点直線m','距離_区間折れ線m','曲がり数','流量',
-  'メッシュ縦間隔m','メッシュ横分割数','メッシュ行数','メッシュ列数','メッシュ入力済み数',
+  'メッシュ縦間隔m','メッシュ横間隔m','メッシュ横分割数','メッシュ行数','メッシュ列数','メッシュ入力済み数',
   'メッシュ前の格子のマス数','メッシュ格子ID','メッシュ縦m','メッシュ横m',
   '緯度','経度','GPS精度m','位置の決め方',
   '環境区分','河川形態B','調査区分','調査方法','漁具の件数','開始時刻','終了時刻','水温',
@@ -12002,8 +12013,8 @@ SCREENS.meshSetup = (stUuid)=>{
   const pr = prefs();
   const gapDef = st.mesh_row_m!==undefined && st.mesh_row_m!=='' ? st.mesh_row_m
                : (pr.mesh_row_m!==undefined ? pr.mesh_row_m : '');
-  const colDef = st.mesh_cols!==undefined && st.mesh_cols!=='' ? st.mesh_cols
-               : (pr.mesh_cols!==undefined ? pr.mesh_cols : '');
+  const colDef = st.mesh_col_m!==undefined && st.mesh_col_m!=='' ? st.mesh_col_m
+               : (pr.mesh_col_m!==undefined ? pr.mesh_col_m : '');
   const cells = meshCellsOf(stUuid).length;
   return {
     title:'範囲と格子',
@@ -12037,11 +12048,16 @@ SCREENS.meshSetup = (stUuid)=>{
         <label>縦の間隔（m）</label>
         <input id="mesh_gap" inputmode="decimal" value="${esc(gapDef)}"
           oninput="showMeshPlan()" placeholder="例）5">
-        <label>横の分割数</label>
-        <input id="mesh_cols" inputmode="numeric" value="${esc(colDef)}"
+        <label>横の間隔（m）</label>
+        <input id="mesh_colm" inputmode="decimal" value="${esc(colDef)}"
           oninput="showMeshPlan()" placeholder="例）5">
         <div class="dim small" style="margin-top:8px" id="mesh_plan"></div>
-        <div class="dim small">前に使った値を初期値にしています。現場に合わせて変えてください。</div>
+        <div class="dim small">前に使った値を初期値にしています。現場に合わせて変えてください。<br>
+          割り切れない分は、全部のマスに均して少しずつ伸び縮みします
+          （端にだけ半端なマスは作りません）。</div>
+        ${(st.mesh_cols && (st.mesh_col_m===undefined || st.mesh_col_m===''))
+          ? `<div class="dim small">この範囲はいま「横${esc(st.mesh_cols)}分割」です。
+             横の間隔を入れて決め直すと、間隔での持ち方に変わります。</div>` : ''}
       </div>
 
       <button class="btn pri" onclick="saveMesh('${stUuid}')">この格子で決める</button>
@@ -12158,7 +12174,7 @@ function drawMeshSetup(){
 function tmpMeshStation(){
   return {
     mesh_corners: (window._meshCorners||[]).filter(Boolean),
-    mesh_row_m: strVal('#mesh_gap'), mesh_cols: strVal('#mesh_cols'),
+    mesh_row_m: strVal('#mesh_gap'), mesh_col_m: strVal('#mesh_colm'),
   };
 }
 /* 何マスになるかを、決める前に見せる */
@@ -12172,9 +12188,10 @@ function showMeshPlan(){
   if(!c){ box.textContent = '四隅を4つとも押さえると、マスの数が出ます。'; drawMeshSetup(); return; }
   const g = meshPlan(tmp);
   if(!g){ box.textContent = `縦 ${fmtDist(meshLength(tmp))}／横 ${fmtDist(meshWidth(tmp))}。`
-    + '縦の間隔と横の分割数を入れてください。'; drawMeshSetup(); return; }
+    + '縦の間隔と横の間隔を入れてください。'; drawMeshSetup(); return; }
   box.textContent = `縦 ${fmtDist(g.length)}（${g.rows}行）× 横 ${fmtDist(g.width)}（${g.cols}列）`
     + ` ＝ ${g.n}マス`
+    + `（1マス およそ 縦${(g.length/g.rows).toFixed(1)}m × 横${(g.width/g.cols).toFixed(1)}m）`
     + (g.n > MESH_MAX_CELLS ? `　※${MESH_MAX_CELLS}マスを超えるので決められません` : '');
   drawMeshSetup();
 }
@@ -12193,10 +12210,10 @@ function saveMesh(stUuid){
   const c = meshCorners(tmp);
   if(!c){ toast('四隅を4つとも押さえてください', 5000); return; }
   const err = rangeCheck([['縦の間隔', strVal('#mesh_gap'), 0.1, 1000],
-                          ['横の分割数', strVal('#mesh_cols'), 1, 200]]);
+                          ['横の間隔', strVal('#mesh_colm'), 0.1, 1000]]);
   if(err){ toast(err, 6000); return; }
   const g = meshPlan(tmp);
-  if(!g){ toast('縦の間隔と横の分割数を入れてください', 5000); return; }
+  if(!g){ toast('縦の間隔と横の間隔を入れてください', 5000); return; }
   if(g.n > MESH_MAX_CELLS){
     toast(`${g.n}マスは多すぎます（${MESH_MAX_CELLS}マスまで）。`
       + '間隔を広げるか、範囲を分けてください', 8000);
@@ -12205,7 +12222,8 @@ function saveMesh(stUuid){
   const before = meshGridSig(st);
   st.mesh_corners = c;
   st.mesh_row_m   = numOf(strVal('#mesh_gap'));
-  st.mesh_cols    = countOf(strVal('#mesh_cols'));
+  st.mesh_col_m   = numOf(strVal('#mesh_colm'));
+  delete st.mesh_cols;                    // 前の「分割数」は、間隔の持ち方に置き換える
   delete st.mesh_rows;                    // 間隔から数え直す
   // 中身が変わったときだけ版を新しくする。
   // 版が変われば、前の格子で入れたマスは一覧にも集計にも混ざらない
@@ -12213,7 +12231,7 @@ function saveMesh(stUuid){
   if(!DB.upsert(DB.key.st, st)) return;
   // 次に作るときの初期値として覚えておく（この端末だけ）
   prefSet('mesh_row_m', st.mesh_row_m);
-  prefSet('mesh_cols', st.mesh_cols);
+  prefSet('mesh_col_m', st.mesh_col_m);
   toast(`${g.rows}行 × ${g.cols}列 ＝ ${g.n}マスにしました`);
   goTo('mesh', stUuid);
 }
