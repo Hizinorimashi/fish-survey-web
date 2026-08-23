@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v94';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v95';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1151,6 +1151,28 @@ const SPECIES_ALIAS = {
 };
 const SPECIES_STAMP = {n:101, sha:"d7be0336f474"};
 /* <<<FS_SPECIES_AUTO_END>>> */
+
+/* 手直し：親魚と稚魚を分けて記録できるようにする（2026-08-23 の実機の声）。
+   サクラマス＝親魚、ヤマメ＝稚魚（川に残る型）。サケ＝親魚、サケ稚魚＝稚魚。
+   種リストを作り直しても消えないよう、自動生成の区画の外に置く。
+   新しいID（FW050J・FW044J）は、データベース側の種マスタにも
+   あとで足す（tasks/todo.md に宿題） */
+(function(){
+  const 直す = (id, ja)=>{ const x = SPECIES.find(s=>s.id===id); if(x) x.ja = ja; };
+  const 後に足す = (id, rec)=>{
+    if(SPECIES.some(s=>s.id===rec.id)) return;
+    const i = SPECIES.findIndex(s=>s.id===id);
+    const 元 = SPECIES[i];
+    SPECIES.splice(i+1, 0, Object.assign({ord: 元 ? 元.ord : 999}, rec));
+  };
+  直す('FW050', 'サクラマス');
+  後に足す('FW050', {id:'FW050J', ja:'ヤマメ', fam:'サケ科'});
+  後に足す('FW044', {id:'FW044J', ja:'サケ稚魚', fam:'サケ科'});
+  SPECIES_ALIAS['ヤマメ'] = 'FW050J';           // これまでは FW050（親と同じ）だった
+  SPECIES_ALIAS['サクラマス稚魚'] = 'FW050J';
+  SPECIES_ALIAS['サクラマス（ヤマメ）'] = 'FW050';
+  SPECIES_ALIAS['サケの稚魚'] = 'FW044J';
+})();
 
 function speciesById(id){ return SPECIES.find(s=>s.id===id) || null; }
 /* 検索。正式な和名・科名に加えて、旧名や現場の呼び名（別名）でも見つかるようにする。
