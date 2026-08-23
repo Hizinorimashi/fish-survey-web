@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v109';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v110';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -9215,7 +9215,7 @@ function mergeBackup(remoteData, remoteTombs){
           delete tombs[u];               // 記録が生きるので、墓標を下げる
         }else{
           数.墓標で除外++;
-          控え.push(勝ち);               // 消す分は控えに残す
+          控え.push({k, rec: 勝ち});     // どの入れ物かの札を付けて控える
           return;
         }
       }
@@ -9236,12 +9236,48 @@ function mergeBackup(remoteData, remoteTombs){
     cloudPrune(写し);
     CLOUD_KEYS.forEach(k=>{
       const 残る = new Set(写し[k].map(x=>x.uuid));
-      box[k].forEach(x=>{ if(!残る.has(x.uuid)) 控え.push(x); });
+      box[k].forEach(x=>{ if(!残る.has(x.uuid)) 控え.push({k, rec: x}); });
     });
   }
   const 外した = cloudPrune(box);
   const merged = Object.keys(tombs).map(u=>({uuid:u, at:tombs[u]}));
   return {box, 数, 外した, tombs: merged, 控え};
+}
+/* 読み合わせた控え（data＋墓標）を、そのまま使える形に整える。
+   ・墓標より古い記録は除く（除いた分は札付きで返す）
+   ・記録の方が新しければ墓標を下げる
+   ・親を失った行も除いて札付きで返す
+   「戻す」で墓標を効かせないと、別の端末で消した記録が復活し、
+   次の合成でまた消える＝結果が揺れる（監査74回目 Major） */
+function normalizeDataset(ds){
+  const 時 = x => String((x && (x.updated_at || x.created_at)) || '');
+  const tombs = Object.create(null);
+  (ds.tombstones||[]).forEach(t=>{
+    if(!t || !safeId(t.uuid)) return;
+    const at = (typeof t.at === 'string') ? t.at : '';
+    if(tombs[t.uuid] === undefined || at > tombs[t.uuid]) tombs[t.uuid] = at;
+  });
+  const data = {}, 控え = [];
+  for(const k of CLOUD_KEYS){
+    data[k] = ((ds.data && ds.data[k]) || []).filter(x=>{
+      if(!x || !x.uuid) return false;
+      if(tombs[x.uuid] === undefined) return true;
+      if(!tombs[x.uuid] || 時(x) > tombs[x.uuid]){ delete tombs[x.uuid]; return true; }
+      控え.push({k, rec: x});
+      return false;
+    });
+  }
+  {
+    const 写し = {};
+    CLOUD_KEYS.forEach(k=>{ 写し[k] = data[k].map(x=>Object.assign({}, x)); });
+    cloudPrune(写し);
+    CLOUD_KEYS.forEach(k=>{
+      const 残る = new Set(写し[k].map(x=>x.uuid));
+      data[k].forEach(x=>{ if(!残る.has(x.uuid)) 控え.push({k, rec: x}); });
+    });
+  }
+  cloudPrune(data);
+  return {data, tombstones: Object.keys(tombs).map(u=>({uuid:u, at:tombs[u]})), 控え};
 }
 async function cloudMerge(){
   if(!writeAllowed()){
@@ -9365,12 +9401,18 @@ async function cloudRestore(){
     if(全部.読めない){
       toast('読めない控えが ' + 全部.読めない + 'ファイルありました（飛ばして続けます）', 8000);
     }
-    const 中 = {data: 全部.合わせ.data, tombstones: 全部.合わせ.tombstones};
+    const 中 = normalizeDataset(全部.合わせ);
     const いま = CLOUD_KEYS.reduce((a,k)=>a + DB.load(DB.key[k]).length, 0);
     const 控え = CLOUD_KEYS.reduce((a,k)=>a + (中.data[k]||[]).length, 0);
     if(!confirm(`ドライブの控え（${全部.読めた}ファイルを読み合わせ／${控え}件）で、`
       + `いまの記録（${いま}件）を置き換えます。\n`
+      + (中.控え.length ? `消した印などで除く分 ${中.控え.length}件は端末に控えます。\n` : '')
       + 'いまの記録は消えます。よろしいですか？')) return;
+    if(中.控え.length && !repairBackupPush({種類:'戻すときに除いた行', 中身:中.控え})){
+      toast('除く分の控えを取れなかったため、やめました。'
+        + '端末の空き容量をご確認ください', 10000);
+      return;
+    }
     if(cloudApply(中.data, 中.tombstones)){
       let 写真 = {戻した:0, 足りない:0}, 写真の失敗 = '';
       try{ 写真 = await cloudRestorePhotos(token, folder); }
@@ -9984,9 +10026,78 @@ function repairBackupPush(記録たち){
   try{
     const a = JSON.parse(localStorage.getItem('fs_repair_backup')||'[]');
     a.push({at: nowISO(), 記録: 記録たち});
-    localStorage.setItem('fs_repair_backup', JSON.stringify(a.slice(-5)));
+    // 勝手に古い分を捨てない（監査74回目 Major）。人が「データ点検」から
+    // 書き出す・戻す・消すを選ぶ
+    localStorage.setItem('fs_repair_backup', JSON.stringify(a));
     return true;
   }catch(e){ return false; }
+}
+function repairBackupList(){
+  try{ return JSON.parse(localStorage.getItem('fs_repair_backup')||'[]') || []; }
+  catch(e){ return []; }
+}
+/* 控えをJSONファイルに書き出す（保険として手元へ） */
+function repairBackupExport(){
+  const a = repairBackupList();
+  if(!a.length){ toast('控えはありません'); return; }
+  download('fish_survey_控え_' + dateValue().replace(/-/g,'') + '.json',
+    JSON.stringify({app:'fish_survey_repair_backup', saved_at: nowISO(), 控え: a}),
+    'application/json');
+  toast('控えを書き出しました（' + a.length + '回分）');
+}
+/* 札付きの行を、ごみ箱（消した状態）として端末へ戻す。
+   親がいない行はクラウドへは出ないままだが、手元で中身を確かめられる */
+function repairBackupRestore(){
+  if(!writeAllowed()){
+    toast('このタブでは戻せません。記録を入れているタブでお試しください', 7000);
+    return;
+  }
+  const a = repairBackupList();
+  let 戻した = 0, 札なし = 0;
+  const 箱 = {};
+  try{ CLOUD_KEYS.forEach(k=>{ 箱[k] = DB.loadRaw(DB.key[k]); }); }
+  catch(e){ toast('記録を読み取れないため、やめました', 8000); return; }
+  const ある = {};
+  CLOUD_KEYS.forEach(k=>{
+    ある[k] = new Set(箱[k].map(x=>x && x.uuid).filter(Boolean));
+  });
+  const t = nowISO();
+  a.forEach(entry=>{
+    const 中身 = entry && entry.記録 && entry.記録.中身;
+    if(!Array.isArray(中身)) return;    // 丸ごとの控えは「書き出し」でだけ扱う
+    中身.forEach(row=>{
+      if(!row || !row.k || !row.rec || !CLOUD_KEYS.includes(row.k)){ 札なし++; return; }
+      const rec = row.rec;
+      if(!rec || !rec.uuid || ある[row.k].has(rec.uuid)) return;
+      const 写 = Object.assign({}, rec);
+      写.deleted_at = 写.deleted_at || t;   // ごみ箱として戻す（生き返らせない）
+      箱[row.k].push(写);
+      ある[row.k].add(rec.uuid);
+      戻した++;
+    });
+  });
+  if(!戻した){
+    toast(札なし ? '戻せる形の控えがありません（古い形の控えは「書き出し」で取り出せます）'
+                : '戻すものはありません', 8000);
+    return;
+  }
+  for(const k of CLOUD_KEYS){
+    if(!DB.save(DB.key[k], 箱[k])){
+      toast('書き込めませんでした（端末の空き容量をご確認ください）', 9000);
+      return;
+    }
+  }
+  toast('控えの ' + 戻した + '件を、ごみ箱として戻しました。'
+    + 'ごみ箱から中身を確かめられます', 9000);
+  render();
+}
+function repairBackupClear(){
+  const a = repairBackupList();
+  if(!a.length){ toast('控えはありません'); return; }
+  if(!confirm('端末に控えている ' + a.length + '回分を消します。\n'
+    + '先に「書き出し」で保険を取ることをおすすめします。よろしいですか？')) return;
+  try{ localStorage.setItem('fs_repair_backup', '[]'); toast('消しました'); render(); }
+  catch(e){ toast('消せませんでした', 6000); }
 }
 function repairRun(){
   if(!writeAllowed()){
@@ -10036,14 +10147,14 @@ function repairRun(){
       let この鍵で直した = 0;
       a.forEach(x=>{
         if(!x || typeof x !== 'object' || !x.uuid){
-          if(x !== null && x !== undefined){ 控え.push(x); この鍵で直した++; }
+          if(x !== null && x !== undefined){ 控え.push({k, rec: x}); この鍵で直した++; }
           return;
         }
         const 既 = byId[x.uuid];
         if(既 === undefined){ byId[x.uuid] = out.length; out.push(x); return; }
         // 新しい方を残す
-        if(時(x) > 時(out[既])){ 控え.push(out[既]); out[既] = x; }
-        else 控え.push(x);
+        if(時(x) > 時(out[既])){ 控え.push({k, rec: out[既]}); out[既] = x; }
+        else 控え.push({k, rec: x});
         この鍵で直した++;
       });
       直した += この鍵で直した;
@@ -10125,6 +10236,25 @@ SCREENS.check = ()=>{
           ${esc(Object.keys(迷子).map(k=>(名[k]||k)+' '+迷子[k]+'件').join('・'))}<br>
           （書き出しには入りません。ごみ箱の「完全に消す」の消し残りなどです）</div>` : ''}
       <div id="checkPhotos" class="card"><div class="dim small">写真を確かめています…</div></div>
+      ${(()=>{
+        const a = repairBackupList();
+        if(!a.length) return '';
+        const 行数 = a.reduce((n,e)=>{
+          const 中 = e && e.記録 && e.記録.中身;
+          return n + (Array.isArray(中) ? 中.length : 0);
+        }, 0);
+        return `<div class="card">
+          <h3 style="margin-top:0">除いた記録の控え</h3>
+          <div class="dim small">合成・修復・戻すときに除いた分です（${a.length}回分・
+            行 ${行数}件）。ごみ箱として戻して中身を確かめるか、
+            JSONで書き出して保険にできます。</div>
+          <div class="btn2">
+            <button class="btn" onclick="repairBackupRestore()">ごみ箱として戻す</button>
+            <button class="btn" onclick="repairBackupExport()">JSONで書き出す</button>
+          </div>
+          <button class="btn ng" onclick="repairBackupClear()">控えを消す</button>
+        </div>`;
+      })()}
       ${(()=>{
         const sc = repairScan();
         if(!sc.何かある) return '';
