@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v93';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v94';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -7822,6 +7822,13 @@ ${(opt && opt.head === false) ? '' : `      <div class="card">
 }
 /* 種を選ぶのも、尾数を入れるのも、地図の下でする（2026-08-20 の実機の声） */
 let FISH_PICK = '';        // 種選びを開いている記録のID
+/* 詳しい欄（確からしさ・1尾ずつ・写真）を開いている魚の記録。
+   種が多いと、全部ひらいたままでは長すぎて打ちにくい（2026-08-23 の実機の声） */
+let FISH_CATCH_OPEN = '';
+function fishCatchToggle(u){
+  FISH_CATCH_OPEN = FISH_CATCH_OPEN === u ? '' : u;
+  render();
+}
 function fishPickOpen(stUuid){
   FISH_PICK = (FISH_PICK === stUuid) ? '' : stUuid;
   // 画面ごと作り直すと、見ていた場所から離れてしまう。ここだけ出し入れする
@@ -9237,25 +9244,34 @@ SCREENS.fishMap = (arg)=>{
               保存されるのは正式な種です。</div>
             <div id="fishSplist"></div>
           </div>
-          ${cs.length ? cs.map(c=>{
+          ${cs.length ? `<div class="dim small" style="margin-top:8px">
+            数えただけの尾数は、そのまま打てます。
+            確からしさ・1尾ずつ・写真は「ひらく」から。</div>` + cs.map(c=>{
             const n = DB.individualsOf(c.uuid).length;
-            return `<div class="card" style="margin-top:8px">
-              <div class="row">
-                <div class="grow">
-                  <div style="font-weight:700">${esc(c.species_name||c.species_id||'（種なし）')}</div>
-                  <div class="dim small">合わせて ${catchTotal(c)}尾${n?`（測った ${n}尾）`:''}</div>
+            const 開いている = FISH_CATCH_OPEN === c.uuid;
+            const 確 = c.identification_confidence || '確実';
+            // 1種＝1行にたたむ。種が多いと、全部ひらいたままでは長すぎる
+            //（2026-08-23 の実機の声）
+            return `<div class="card" style="margin-top:6px;padding:8px 10px">
+              <div class="row" style="align-items:center">
+                <div class="grow" style="min-width:0">
+                  <div style="font-weight:700;overflow:hidden;text-overflow:ellipsis;
+                    white-space:nowrap">${esc(c.species_name||c.species_id||'（種なし）')}</div>
+                  <div class="dim small">計 ${catchTotal(c)}尾${n?`・測った ${n}`:''}${
+                    確!=='確実' ? `・${esc(確)}` : ''}</div>
                 </div>
-                <button class="btn sm ng" style="width:auto;margin:0"
-                  onclick="fishDelCatch('${c.uuid}')">消す</button>
+                <input id="fc_${c.uuid}" inputmode="numeric"
+                  style="width:64px;margin:0;text-align:right" value="${esc(
+                  c.count_unmeasured!==undefined?c.count_unmeasured:'')}"
+                  onchange="fishSaveCount('${c.uuid}')" placeholder="尾数">
+                <button class="btn sm" style="width:auto;margin:0"
+                  onclick="fishCatchToggle('${c.uuid}')">${開いている?'とじる':'ひらく'}</button>
               </div>
-              <label>数えただけの尾数（測らない分）</label>
-              <input id="fc_${c.uuid}" inputmode="numeric" value="${esc(
-                c.count_unmeasured!==undefined?c.count_unmeasured:'')}"
-                onchange="fishSaveCount('${c.uuid}')" placeholder="例）30">
               <div class="dim small" id="fc_saved_${c.uuid}"></div>
+              ${開いている ? `
               <label>同定の確からしさ</label>
               <div class="seg">${OPT.confidence.map(o=>`<button type="button"
-                class="${(c.identification_confidence||'確実')===o?'on':''}"
+                class="${確===o?'on':''}"
                 onclick="fishSetConf('${c.uuid}','${esc(o)}')">${esc(o)}</button>`).join('')}</div>
               <div class="btn2">
                 <button class="btn sm ok"
@@ -9264,6 +9280,7 @@ SCREENS.fishMap = (arg)=>{
                 <button class="btn sm" onclick="nav('catchEdit',{uuid:'${c.uuid}'})"
                   >写真・備考</button>
               </div>
+              <button class="btn sm ng" onclick="fishDelCatch('${c.uuid}')">この種を消す</button>` : ''}
             </div>`;
           }).join('')
             : '<div class="dim small">まだありません。「魚を足す」から入れてください。</div>'}`;
