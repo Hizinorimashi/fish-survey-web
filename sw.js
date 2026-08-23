@@ -1,4 +1,4 @@
-const CACHE = 'fish-survey-v51';   // fish_survey.html の APP_VERSION と番号を揃える
+const CACHE = 'fish-survey-v90';   // fish_survey.html の APP_VERSION と番号を揃える
 // これが揃わないとアプリが成立しないもの。install時に全部そろわなければ失敗させ、
 // 中途半端なキャッシュのまま有効にしない
 const CORE = [
@@ -165,6 +165,13 @@ async function networkFirst(request){
     }
     const cached = await cache.match(request);
     if (cached) return cached;
+    // 通信が切れずに応答だけ止まったとき、いつまでも待たない。
+    // 「/」や index.html は控えに無いので、本体をそのまま返して立ち上げる
+    //（監査67回目 Minor）
+    if (request.mode === 'navigate'){
+      const 本体 = await cache.match('./fish_survey.html');
+      if (本体) return 本体;
+    }
     return await netP;
   }catch(e){
     const cached = await cache.match(request);

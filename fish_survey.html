@@ -131,7 +131,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v51';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v90';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -294,7 +294,15 @@ function releaseLock(){
   const o = lockRead();
   if(o && o.id===TAB_ID){ try{ localStorage.removeItem(LOCK_KEY); }catch(e){} }
 }
-window.addEventListener('pagehide', releaseLock);
+function flushAllForms(){
+  // 使用権を手放す前に、打ちかけを書いてしまう（監査47・51回目 Critical）
+  try{ if(typeof spotInfoFlush==='function') spotInfoFlush(); }catch(e){}
+  try{ if(typeof envFlush==='function') envFlush(); }catch(e){}
+}
+window.addEventListener('pagehide', ()=>{ flushAllForms(); releaseLock(); });
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState === 'hidden') flushAllForms();
+});
 /* 戻るボタンなどで表に戻ってきたら取り直す */
 window.addEventListener('pageshow', e=>{ if(e.persisted){ window.WRITE_OK=false; claimLock(); } });
 
@@ -1204,6 +1212,41 @@ function isDetail(sv){ return !!sv && sv.detail_level==='詳細'; }
 
 /* 何を調べる調査か。古い記録は種別を持たないので「魚」とみなす */
 function surveyKind(sv){ return (sv && sv.survey_kind) === '物理環境' ? '物理環境' : '魚'; }
+/* その記録が何のものか。1つの調査に魚と物理環境が同居するようになったので、
+   調査ぜんぶの種類ではなく、記録ごとに決める（監査33回目 Major）。
+   ・env_method を持つ → 物理環境（測点・ライン・メッシュ）
+   ・unit_kind を持つ → 魚（E・P/F・P）
+   ・is_spot → 地点（目印）
+   ・どれでもない → 前のやり方の箇所。調査の種類に従う */
+/* その記録が何のものか。
+   env_method（環境の取り方）は、前のやり方で作った箇所にも付く。
+   それだけで見分けると、魚の箇所が物理環境として扱われ、
+   一覧からも集計からも消える（監査44回目 Critical）。
+   これから作るものには record_kind を書き込み、そちらを先に見る。
+   前の版のものは、印から見分けられる順に見る */
+function stationKind(sv, st){
+  if(!st) return surveyKind(sv);
+  if(unitKindOf(st)) return '魚';           // 地図の単位（E・P/F・P）
+  if(st.is_spot) return '地点';             // 「新しい調査」で置いた目印
+  if(st.record_kind === 'env') return '物理環境';
+  if(st.record_kind === 'fish') return '魚';
+  if(isMesh(st)) return '物理環境';
+  /* ここから先は前の版のもの。番号では見分けられない
+     （地図で打った記録にも、保存の直前に番号が振られる。監査45回目 Critical）。
+     見分けるのは「どちらの画面が作ったか」の跡:
+     ・地図で作った記録だけが持つもの … 地点との紐づけ・つなげた元
+     ・前のやり方の入力画面だけが書くもの … 調査方法・写真の欄
+     どちらの跡も無いときは、物理環境として扱う（地図から手が届く方に寄せる） */
+  if(st.env_method){
+    if(isEnvSurvey(sv)) return '物理環境';
+    if(st.spot_uuid || st.chained_from) return '物理環境';
+    if(st.survey_method !== undefined || st.photos !== undefined) return '魚';
+    return '物理環境';
+  }
+  return surveyKind(sv);
+}
+/* 物理環境の記録か（調査が分かるときは stationKind を使う） */
+function isEnvRecord(sv, st){ return stationKind(sv, st) === '物理環境'; }
 function isEnvSurvey(sv){ return surveyKind(sv) === '物理環境'; }
 /* 物理環境の取り方。箇所ごとに持つ。未設定は「点」（いままでの取り方） */
 function envMethod(st){
@@ -1310,20 +1353,30 @@ function surveyTotal(sv){ return DB.catchesOfSurvey(sv.uuid).reduce((a,c)=>a+cat
 /* 記録はいちばん小さい単位にだけ入るので、単位ごとの記録をそのまま足せば
    二重に数えない。大きい単位の集計（unitTotals）はここでは使わない */
 function surveyTally(svUuid){
+  const sv = DB.getAlive(DB.key.sv, svUuid) || {};
   const all = DB.stationsOf(svUuid);
+  // 物理環境の記録（測点・ライン）は、魚の集計に混ぜない（監査32回目 Major）。
+  // ただし前の版で魚の単位に「環境の取り方」が付いた分は、魚として数える
+  // 描きかけの囲いは、まだ数えない（監査62回目 Major）
+  const 対象 = all.filter(st=>!isMesh(st) && unitReady(st)
+    && (st.is_spot || stationKind(sv, st) === '魚'));
   // 中に小さい単位があるもの（E1・P/F1 など）は、集計を出すだけの入れ物。
-  // 一覧に並べると 0種0尾 の行になって、記録の抜けと見分けがつかない
+  // ただし、子を作る前にその親へ直接入れた記録は数え漏らさない
   const 親 = {};
-  all.forEach(st=>{ if(st.parent_uuid) 親[st.parent_uuid] = true; });
-  const sts = all.filter(st=>!親[st.uuid])
-    .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
+  対象.forEach(st=>{ if(st.parent_uuid) 親[st.parent_uuid] = true; });
+  const sts = 対象.slice().sort((a,b)=>(a.station_no||0)-(b.station_no||0));
 
   const sp = {};        // 種 → {name, 尾, 場所}
-  const 場所 = [];
+  const 場所 = [], 場所索引 = {};
   let 尾合計 = 0, 記録あり = 0;
   sts.forEach(st=>{
     const cs = DB.catchesOf(st.uuid);
     const 名 = st.name || '（名前なし）';
+    // 内訳も地点でまとめる。まとめる鍵はIDにする
+    // （地点の P1 と、地図のポイント P1 は別ものなので、名前では足さない）
+    const 鍵 = st.is_spot ? st.uuid : (st.spot_uuid || st.uuid);
+    const 親地点 = st.is_spot ? st : (st.spot_uuid ? DB.liveStation(st.spot_uuid) : null);
+    const 内訳名 = 親地点 ? (親地点.name || (st.name||'')) : (st.name || '（名前なし）');
     const 種 = {};
     let n = 0;
     cs.forEach(c=>{
@@ -1334,11 +1387,30 @@ function surveyTally(svUuid){
       n += t; 尾合計 += t;
       const e = sp[key] || (sp[key] = {name: c.species_name || c.species_id || key, 尾:0, 場所:{}});
       e.尾 += t;
-      e.場所[名] = (e.場所[名] || 0) + t;
+      const w = e.場所[鍵] || (e.場所[鍵] = {name:内訳名, 尾:0});
+      w.尾 += t;
     });
     const 種数 = Object.keys(種).length;
     if(種数) 記録あり++;
-    場所.push({name:名, 種:種数, 尾:n, 印: UNIT_MARK[unitKindOf(st)] || ''});
+    // 場所は「地点」でまとめる。地点の地図で作った E・P/F・P を別々に並べると、
+    // 「地点ごとの種数・尾数」にならない（監査35回目 Major）。
+    // 地点に属さない記録（調査から直接開いた地図の分・前のやり方の箇所）は、
+    // それ自身を1つの場所として並べる
+    const 場所鍵 = st.is_spot ? st.uuid : (st.spot_uuid || st.uuid);
+    if(!(種数 || !親[st.uuid])) return;   // 記録の無い親は並べない
+    const 既 = 場所索引[場所鍵];
+    if(既){
+      既.尾 += n;
+      Object.keys(種).forEach(k=>{ 既.種集[k] = true; });
+      既.種 = Object.keys(既.種集).length;
+      return;
+    }
+    const 地点 = st.is_spot ? st : (st.spot_uuid ? DB.liveStation(st.spot_uuid) : null);
+    const 見出し = 地点 ? (地点.name || 名) : 名;
+    const 行 = {name: 見出し, 種: 種数, 尾: n, 種集: Object.assign({}, 種),
+                印: 地点 ? '' : (UNIT_MARK[unitKindOf(st)] || '')};
+    場所索引[場所鍵] = 行;
+    場所.push(行);
   });
   const 種一覧 = Object.keys(sp).map(k=>({id:k, name:sp[k].name, 尾:sp[k].尾, 場所:sp[k].場所}))
     // 多い順。同じ尾数なら名前順（並びが日によって変わらないように）
@@ -1358,7 +1430,8 @@ function surveyTallyHtml(svUuid){
   const 種表 = t.種.length ? `
     <table><thead><tr><th>魚種</th><th class="num">尾数</th></tr></thead><tbody>
     ${t.種.map(s=>{
-      const 内訳 = Object.keys(s.場所).map(k=>`${esc(k)} ${s.場所[k]}`).join('　');
+      const 内訳 = Object.keys(s.場所)
+        .map(k=>`${esc(s.場所[k].name)} ${s.場所[k].尾}`).join('　');
       return `<tr><td>${esc(s.name)}<div class="dim small">${内訳}</div></td>
         <td class="num" style="vertical-align:top">${s.尾}</td></tr>`;
     }).join('')}
@@ -1374,9 +1447,8 @@ function surveyTallyHtml(svUuid){
       <td class="num">${p.種 || '—'}</td>
       <td class="num">${p.尾 || '—'}</td></tr>`).join('')}
     </tbody></table>
-    ${t.記録あり < t.場所.length
-      ? `<div class="dim small">${t.場所.length - t.記録あり}か所は、まだ魚の記録がありません。</div>`
-      : ''}`;
+    ${(()=>{ const 無 = t.場所.filter(x=>!x.種).length;
+      return 無 ? `<div class="dim small">${無}か所は、まだ魚の記録がありません。</div>` : ''; })()}`;
 
   return `<h3 style="margin-top:0">種ごとの尾数（多い順）</h3>
     <div class="dim small">名前の下は、どの場所で何尾とれたかです。</div>
@@ -1791,7 +1863,9 @@ function habitatLong(short){
 
 /* 画面は m・m/s、中は cm・cm/s。出し入れのときだけ直す。
    中を cm のままにしておくのは、魚の調査と書き出しがすでに cm で通っているため */
-function mToCm(v){ const n = numOf(v); return n==='' ? '' : n*100; }
+/* m を cm に。0.55 が 55.00000000000001 にならないようにする。
+   端数のまま記録に入ると、書き出しにもそのまま出る（監査65回目のテストで判明） */
+function mToCm(v){ const n = numOf(v); return n==='' ? '' : Math.round(n*100*1000)/1000; }
 function cmToMDisp(v){
   const n = numOf(v);
   if(n==='') return '';
@@ -1837,8 +1911,10 @@ function envColorOf(st, range){
   return null;             // 「なし」なら、これまでどおり種類で色を変える
 }
 /* 色の幅を決めるための、いちばん小さい値と大きい値 */
+/* 色分けの幅は、いま地図に出している記録から作る。
+   調査ぜんぶから作ると、別の地点の極端な値で色が偏る（監査39回目 Minor） */
 function envColorRange(svUuid){
-  const list = DB.stationsOf(svUuid).filter(x=>!isMesh(x));
+  const list = mapStations(svUuid, 'env');
   const v = nums(list.map(x=>x.velocity_rep_cms));
   const d = nums(list.map(x=>x.depth_rep_cm));
   return {vLo: v.length?Math.min.apply(null,v):0, vHi: v.length?Math.max.apply(null,v):0,
@@ -1914,7 +1990,7 @@ function envFitAll(svUuid){
 }
 function envAllPoints(svUuid){
   const pts = [];
-  DB.stationsOf(svUuid).filter(x=>!isMesh(x)).forEach(st=>{
+  mapStations(svUuid, 'env').forEach(st=>{
     if(envKindOf(st)==='L'){
       const a = linePt(st,'start'), b = linePt(st,'end');
       if(a) pts.push(a);
@@ -1956,11 +2032,29 @@ function nextStationNo(svUuid, all){
   if(max >= Number.MAX_SAFE_INTEGER) return null;
   return max + 1;
 }
-/* P1 / L1 の採番。種類ごとに数える */
+/* 地点（P1・P2…）の採番。地点だけを数える。
+   全部の記録から数えると、地点P1の中に記録を作っただけで
+   次の地点が P5 になる（監査41回目 Major）。
+   消したものも数えて、番号は使い回さない */
+function nextSpotNo(svUuid){
+  // 番号は作ったときに決めて覚える（spot_no）。名前から数えると、
+  // P1 を別の名前に変えたあとに置いた地点が、また P1 になる（監査68回目 Minor）。
+  // 前の版のものは、名前から読み取る
+  const used = DB.load(DB.key.st)
+    .filter(st=>st.survey_uuid===svUuid && st.is_spot)
+    .map(st=>{
+      if(+st.spot_no > 0) return +st.spot_no;
+      const m = String(st.name||'').match(/^P(\d+)$/); return m ? +m[1] : 0;
+    });
+  return (used.length ? Math.max.apply(null, used) : 0) + 1;
+}
+/* P1 / L1 の採番。種類ごとに数える。
+   地点（目印）と魚の単位は、別の系列なので数に入れない */
 function envAutoName(svUuid, kind){
   // 消したものも数える。消した番号を使い回すと、
   // 先に書き出したCSVの P2 と、あとから作った P2 が別物になる
   const used = DB.load(DB.key.st).filter(st=>st.survey_uuid===svUuid)
+    .filter(st=>!st.is_spot && !unitKindOf(st) && st.env_method)
     .filter(st=>envKindOf(st)===kind)
     .map(st=>{
       const m = String(st.name||'').match(new RegExp('^'+kind+'(\\d+)$'));
@@ -2119,7 +2213,10 @@ function envAdvance(added, lineUuid){
 /* LE でつなぐ相手を決める。
    末尾を機械的に閉じると、L1 を選んでいるのに L2 が閉じる（監査 Major） */
 function envLineTarget(svUuid){
-  const 未完 = st => st && isLine(st) && linePt(st,'start') && !linePt(st,'end');
+  // 地点から開いているときは、その地点で作ったラインだけをつなぎ先にする。
+  // 限らないと、P2で押した「ラインの終わり」が P1 のラインを閉じる（監査34回目 Critical）
+  const 未完 = st => st && isLine(st) && linePt(st,'start') && !linePt(st,'end')
+    && ofSpot(st, MAP_SPOT);
   // 1) いま選んでいる記録。人が選んだものを、いちばん先に見る。
   //    自動で始まったラインを優先すると、古いラインを選んでも別のほうが閉じる
   //    （2026-08-17 の監査 Critical）
@@ -2136,7 +2233,18 @@ function envLineTarget(svUuid){
 }
 
 /* いまの種類で1件足す。時刻はここで自動的に刻む */
-function envAddAt(svUuid, lat, lon, acc){
+/* 相手（どのラインに足すか）は、現在地を待ちはじめる前に決めて渡せる。
+   待っている間に人が別のラインを選ぶと、返ってきた座標が
+   そちらへ書かれてしまう（監査47回目 Critical） */
+function envAddAt(svUuid, lat, lon, acc, targetUuid){
+  // 「地点に属さない以前の記録」を見ているだけの画面では、新しく作らせない。
+  // 作ると、どの地点にも属さない記録がまた増える（監査52回目 Major）
+  if(MAP_LOOSE){
+    toast('ここは、地点に属さない以前の記録を見る画面です。'
+      + '新しく作るときは、地点を選んでから開いてください', 8000);
+    return null;
+  }
+
   const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return null;
   envFlush();            // いま打っている分を、置く前に書いてしまう
   if(!writeAllowed()){
@@ -2149,11 +2257,23 @@ function envAddAt(svUuid, lat, lon, acc){
   const now = timeValue();
 
   if(k === 'V'){
-    return envAddBend(svUuid, la, lo, acc);
+    return envAddBend(svUuid, la, lo, acc, targetUuid);
   }
   if(k === 'LE'){
     // 開始だけのラインにつなぐ。無ければ足さない（勝手に線を作らない）
-    const st = envLineTarget(svUuid);
+    let st;
+    if(targetUuid){
+      // 待つ前に決めた相手。まだ「終わっていないライン」のままかを見る
+      const t = DB.getAlive(DB.key.st, targetUuid);
+      st = (t && t.survey_uuid===svUuid && isLine(t)
+            && linePt(t,'start') && !linePt(t,'end')) ? t : null;
+      if(!st){
+        toast('現在地を取っている間に、つなぐ相手のラインが変わったので置いていません', 8000);
+        return null;
+      }
+    }else{
+      st = envLineTarget(svUuid);
+    }
     if(!st){
       const 未完 = DB.stationsOf(svUuid).filter(x=>isLine(x)
         && linePt(x,'start') && !linePt(x,'end'));
@@ -2167,7 +2287,7 @@ function envAddAt(svUuid, lat, lon, acc){
     const 前のended = st.ended_at || '';
     st.line_end_lat = la; st.line_end_lon = lo;
     st.line_end_acc = (acc===undefined || acc===null) ? '' : Math.round(acc);
-    if(!st.survey_time_end) st.survey_time_end = now;
+    if(!st.survey_time_end) st.survey_time_end = autoTime(sv);
     st.ended_at = st.ended_at || nowISO();
 
     // つなげる：閉じた場所を、次のラインの始まりにする。
@@ -2182,9 +2302,16 @@ function envAddAt(svUuid, lat, lon, acc){
       uuid: uuid(), survey_uuid: svUuid,
       station_no: 0,          // すぐ下で、いま読んだ一覧から決め直す
       started_at: nowISO(), env_points: [],
-      survey_time_start: now,
+      survey_time_start: autoTime(sv),
       survey_type: sv.survey_type_default || '目視',
+      record_kind: 'env',     // 物理環境の記録。前のやり方の箇所と混ぜない
       env_method: 'ライン', name: envAutoName(svUuid, 'L'),
+      // どの地点で作ったか・いつの記録かは、元のラインから引き継ぐ。
+      // あとから別に書くと、そちらだけ失敗して紐づかないことがある（監査34回目 Critical）
+      spot_uuid: st.spot_uuid || MAP_SPOT || '',
+      // 日付だけは引き継がない。1日目のラインを2日目に閉じてつないだとき、
+      // 新しいラインまで1日目の記録になってしまう（監査46回目 Major）
+      survey_date: recDay(sv),
       line_direction: st.line_direction || '上流→下流',
       line_start_lat: la, line_start_lon: lo,
       line_start_acc: (acc===undefined || acc===null) ? '' : Math.round(acc),
@@ -2227,8 +2354,11 @@ function envAddAt(svUuid, lat, lon, acc){
   const rec = {
     uuid: uuid(), survey_uuid: svUuid,
     station_no: 0,
+    spot_uuid: MAP_SPOT || '',      // どの地点の地図で作ったか（書き出しの地点情報に使う）
+    record_kind: 'env',             // 物理環境の記録。前のやり方の箇所と混ぜない
+    survey_date: recDay(sv),
     started_at: nowISO(), env_points: [],
-    survey_time_start: now,
+    survey_time_start: autoTime(sv),
     survey_type: sv.survey_type_default || '目視',
   };
   if(k === 'LS'){
@@ -2243,7 +2373,7 @@ function envAddAt(svUuid, lat, lon, acc){
     rec.latitude = la; rec.longitude = lo;
     rec.gps_accuracy = (acc===undefined || acc===null) ? '' : Math.round(acc);
     rec.position_source = (acc===undefined || acc===null) ? '地図' : 'GPS';
-    rec.survey_time_end = now;      // 点は幅を持たない
+    rec.survey_time_end = rec.survey_time_start;   // 点は幅を持たない
     rec.ended_at = nowISO();
   }
   const no2 = nextStationNo(svUuid);
@@ -2366,11 +2496,27 @@ function unitInside(st, pts){
    段を見ないと、P/F が E の親になったり、輪ができたりする
    （2026-08-20 の監査 Major） */
 const UNIT_RANK = {E:1, PF:2, P:3};
+/* 単位の日。日付の欄が無い前の版のものは、調査の初日として扱う */
+function unitDay(st){
+  if(!st) return '';
+  if(st.survey_date) return String(st.survey_date).slice(0,10);
+  const sv = DB.getAlive(DB.key.sv, st.survey_uuid);
+  return sv ? stationDate(st, sv) : '';
+}
 function unitParentOf(st, list){
   const 自分の段 = UNIT_RANK[unitKindOf(st)] || 9;
   let 親 = '', 広さ = Infinity;
   (list||[]).forEach(o=>{
     if(!o || o.uuid===st.uuid || !isUnitPoly(o)) return;
+    if(polyDrawing(o)) return;      // 描きかけの囲いは、まだ親にしない
+    // 別の地点で描いた囲いは親にしない。地図の上で重なっていても別ものなので、
+    // 親子にすると集計が混ざる（監査34回目 Critical）
+    if((o.spot_uuid||'') !== (st.spot_uuid||'')) return;
+    // 別の日に置いた単位も親にしない。同じ場所に2日目の単位を置くと、
+    // 1日目の囲いの子になって、集計が日をまたいで混ざる（監査49回目 Major）。
+    // 前の版の単位は日付の欄を持たない。生のまま比べると、同じ日なのに
+    // 親子にならない（監査50回目 Major）。調査の初日として揃えて比べる
+    if(unitDay(o) !== unitDay(st)) return;
     if((UNIT_RANK[unitKindOf(o)] || 9) >= 自分の段) return;   // 同じ段・下の段は親にしない
     const pts = polyPts(o);
     if(pts.length < 3) return;
@@ -2427,20 +2573,113 @@ function unitTotals(u, list, snap){
   みんな.forEach(st=>{
     const cs = snap ? snap.ca.filter(c=>c.station_uuid===st.uuid) : DB.catchesOf(st.uuid);
     cs.forEach(c=>{
-      尾 += catchTotal(c, snap);
-      if(c.species_id) 種.add(c.species_id);
+      const n = catchTotal(c, snap);
+      尾 += n;
+      // 0尾（いなかった記録）は種数に入れない。種IDが無く種名だけのものは数える
+      //（監査48回目 Major）
+      if(n > 0 && (c.species_id || c.species_name)) 種.add(c.species_id || c.species_name);
     });
   });
   return {尾, 種: 種.size, 単位: みんな.length};
 }
 /* 親子を、いまの囲いの形から付け直す。形を変えるたびに呼ぶ */
+/* その単位に、自分の記録が入っているか。
+   「記録はいちばん小さい単位にだけ入れる」の見張りに使う */
+/* その地点に、実際の記録が入っているか。
+   魚・漁具だけでなく、前の版で地点へ直接入れた環境の値や測点・写真も見る。
+   見落とすと、箇所CSVには出るのに調査CSVでは0の行になる（監査39回目 Major） */
+/* 地点そのものに直接入った記録があるか（地点情報・メモは数えない）。
+   前の版で地点へ直に入れた分を拾うためのもの */
+function spotOwnRecords(st){
+  if(!st) return false;
+  if(DB.catchesOf(st.uuid).length) return true;
+  if(gearCount(st)) return true;
+  if(st.env_method) return true;
+  if(envPoints(st).length) return true;
+  if((st.photos||[]).length) return true;
+  if(envHasOwn(st)) return true;
+  if(numOf(st.effort_seconds)!=='' || numOf(st.effort_passes)!=='') return true;
+  if(numOf(st.width_m)!=='' || numOf(st.length_m_manual)!=='') return true;
+  if(numOf(st.area_m2_manual)!=='') return true;
+  return false;
+}
+function spotHasData(st){
+  if(!st) return false;
+  // 地点情報（区間名・地点名・河川形態A・天気・メモ）だけ入れた地点も、
+  // 書き出しの対象にする。外すと、その地点の値が調査ぜんぶの値に化ける
+  //（監査40回目 Major）
+  if(st.section_name || st.site_name || st.river_morphology_a || st.weather) return true;
+  if(DB.catchesOf(st.uuid).length) return true;
+  if(gearCount(st)) return true;
+  if(st.env_method) return true;
+  if(envPoints(st).length) return true;
+  if((st.photos||[]).length) return true;
+  if(envHasOwn(st)) return true;
+  if(numOf(st.effort_seconds)!=='' || numOf(st.effort_passes)!=='') return true;
+  if(numOf(st.width_m)!=='' || numOf(st.length_m_manual)!=='') return true;
+  if(numOf(st.area_m2_manual)!=='') return true;
+  if(st.memo) return true;
+  return false;
+}
+/* その記録に、川の環境の値が入っているか。入っていれば、その名前を返す。
+   画面から入れられるものを1か所で見る。ばらばらに書くと、
+   数え漏らした項目だけ手が届かなくなる（監査49回目 Major） */
+function envHasOwn(st){
+  if(!st) return '';
+  if(numOf(st.depth_rep_cm)!=='' || numOf(st.velocity_rep_cms)!=='') return '水深・流速';
+  if(st.habitat_type || st.substrate1 || st.gravel_condition) return '川底と流れ';
+  if(numOf(st.water_temp)!=='' || numOf(st.flow_rate)!=='') return '水温・流量';
+  // 空の配列でも「あり」になっていた。一度保存しただけで、
+  // その単位に子を作れなくなる（監査62回目 Major）
+  if(coverList(st,'left').length || coverList(st,'right').length) return '岸のカバー';
+  if(numOf(st.cover_left_length_m)!=='' || numOf(st.cover_right_length_m)!=='') return '岸のカバー';
+  const pct = st.substrate_pct;
+  if(pct && typeof pct === 'object' && Object.keys(pct).some(k=>numOf(pct[k])!=='')) {
+    return '河床材の割合';
+  }
+  if(envPoints(st).length) return '測点';
+  return '';
+}
+function unitHasOwn(st){
+  if(!st) return '';
+  if(DB.catchesOf(st.uuid).length) return '魚の記録';
+  if(gearCount(st)) return '漁具';
+  // 0秒は「押してすぐ止めた」だけ。これで子を作れなくなると、消す手が無い
+  //（監査49回目 Major）
+  if(st.effort_started_at || +st.effort_seconds > 0) return '通電';
+  if(numOf(st.length_m_manual)!=='' || numOf(st.area_m2_manual)!=='') return '距離・面積';
+  // 親の画面から入れられるものは、ぜんぶ見る。見落とすと、
+  // 親に入れたまま子を作れてしまい、親の入力欄が隠れて手が届かなくなる
+  //（監査48回目 Major）
+  if(numOf(st.effort_passes)!=='' || numOf(st.width_m)!=='') return '流した回数・川幅';
+  const e = envHasOwn(st); if(e) return e;
+  if((st.photos||[]).length) return '写真';
+  if(st.memo) return 'メモ';
+  return '';
+}
+/* 親になろうとしている単位に、自分の記録が入っていないか。
+   入ったまま子を作ると、集計では親と子を両方足すのに、
+   努力量や距離は片方しか数えず、数が食い違う（監査35回目 Major） */
+function unitParentBlocked(st, list){
+  const 親id = unitParentOf(st, list);
+  if(!親id) return '';
+  const 親 = (list||[]).filter(x=>x && x.uuid===親id)[0];
+  const 何 = unitHasOwn(親);
+  if(!何) return '';
+  return `${親.name} に${何}が入っています。`
+    + '中に小さい単位を作ると、数が合わなくなります。'
+    + `先に ${親.name} の${何}を、中の単位へ移すか消してください`;
+}
 function unitRelink(svUuid){
   let all;
   try{ all = DB.loadRaw(DB.key.st); }catch(e){ return false; }
   const この調査 = all.filter(x=>x && !x.deleted_at && x.survey_uuid===svUuid && unitKindOf(x));
+  // 描きかけの囲いは、親にも子にもしない。付けると、閉じる前から
+  // 親が「子のいる入れ物」に見えて、箇所数が減る（監査63回目 Major）
+  const 対象 = この調査.filter(unitReady);
   let 変わった = false;
   この調査.forEach(st=>{
-    const 親 = unitParentOf(st, この調査);
+    const 親 = unitReady(st) ? unitParentOf(st, 対象) : '';
     if((st.parent_uuid||'') !== 親){ st.parent_uuid = 親; 変わった = true; }
   });
   if(!変わった) return true;
@@ -2549,7 +2788,18 @@ function trackTarget(){
   const cand = DB.surveys().filter(sv=>
     sv.status==='調査中' && isLiveNow(sv) && !isDetail(sv));
   if(cand.length!==1) return null;         // 0件でも2件以上でも、当て推量しない
-  const sts = DB.stationsOf(cand[0].uuid).filter(x=>!x.ended_at);
+  const all = DB.stationsOf(cand[0].uuid);
+  // まず「いま通電している単位」。人がボタンを押して始めたものなので、
+  // どこを歩いているかがはっきりしている
+  // 点（P）は置いた時点で「終わり」の印が付く。印で外すと、
+  // Pで通電しているのに道すじが捨てられる（監査70回目 Major）
+  const 通電中 = all.filter(x=>x.effort_started_at && !x.is_spot);
+  if(通電中.length===1) return {sv:cand[0], st:通電中[0]};
+  if(通電中.length>1) return null;
+  // 地点（目印）は、終わりの印を持たないまま並ぶ。数に入れると、
+  // 地点を2つ置いただけで行き先が決まらなくなり、道すじが黙って捨てられる
+  //（監査67回目 Major）
+  const sts = all.filter(x=>!x.ended_at && !x.is_spot);
   if(sts.length!==1) return null;
   return {sv:cand[0], st:sts[0]};
 }
@@ -2580,12 +2830,25 @@ function trackTick(fix){
    ============================================================ */
 function draftAll(){ try{ return JSON.parse(localStorage.getItem('fs_draft_edit')||'{}')||{}; }
   catch(e){ return {}; } }
+/* 書きかけを残せたかを返す。
+   黙って握りつぶすと、「打った内容は残してあります」と出しながら
+   何も残っていない、ということが起きる（監査33回目 Critical） */
 function draftSave(key, obj){
   const a=draftAll();
   if(obj===null) delete a[key]; else a[key]=obj;
-  try{ localStorage.setItem('fs_draft_edit', JSON.stringify(a)); }catch(e){}
+  try{ localStorage.setItem('fs_draft_edit', JSON.stringify(a)); return true; }
+  catch(e){ return false; }
 }
+/* 控え（localStorage）にあるものだけを返す。
+   画面の中に持っているだけの分（DRAFT_HOLD）はここに混ぜない。
+   混ぜると「どこにも控えられていない」ことを手がかりにしている
+   写真の救出が働かなくなる（2026-08-20 の決めごと） */
 function draftGet(key){ return draftAll()[key] || null; }
+/* 入力欄へ戻すときだけ使う。控えが無ければ、画面の中の分を使う */
+/* 入力欄へ戻すときだけ使う。
+   画面の中に持っている分のほうが新しいので、そちらを先に見る。
+   控えを先に見ると、古い控えが残っているときに最新の入力が消える（監査36回目 Critical） */
+function draftForForm(key){ return draftHeld(key) || draftGet(key); }
 /* その記録の書きかけを、まとめて消す。
    消し忘れると、書きかけが写真を指したままになり、
    その写真が片付かないまま溜まる（2026-08-18 の13回目の監査 Major） */
@@ -2612,13 +2875,19 @@ function draftClearFor(kind, u){
 }
 function draftClear(key){
   // 書きかけを捨てるときは、その中の写真の「付ける先」の印も外す。
-  // 残すと、捨てたはずの写真が開き直しで戻ってくる
+  // 残すと、捨てたはずの写真が開き直しで戻ってくる。
+  // 画面の中に持っている分（DRAFT_HOLD）も、消す前に見る（監査39回目 Critical）
   try{
-    const d = draftGet(key);
-    if(d && d.photos && d.photos.length && typeof photoOwnerDone==='function'){
-      photoOwnerDone(d.photos);
-    }
+    // 保存された書きかけと、画面の中に持っている分の両方を見る。
+    // どちらか一方だけだと、片方にしか無い写真の印が残る（監査47回目 Minor）
+    const ids = {};
+    [draftGet(key), draftHeld(key)].forEach(d=>{
+      ((d && d.photos) || []).forEach(pp=>{ if(pp && pp.id) ids[pp.id] = pp; });
+    });
+    const l = Object.keys(ids).map(k=>ids[k]);
+    if(l.length && typeof photoOwnerDone==='function') photoOwnerDone(l);
   }catch(e){}
+  delete DRAFT_HOLD[key];
   draftSave(key, null);
 }
 
@@ -2676,7 +2945,7 @@ function applyEffort(o){
   applySels(o);
   Object.keys(o).forEach(k=>{
     const m = /^__gear(\d+)$/.exec(k);
-    if(m) applySegRaw('gear'+m[1], o[k]);
+    if(m){ applySegRaw('gear'+m[1], o[k]); gearOtherSync(m[1]); }
   });
 }
 /* 川の環境の入力欄 */
@@ -2699,12 +2968,23 @@ function siteSels(){ return ['#si_river','#si_name','#si_lat','#si_lon','#si_r',
 function collectSite(){ return collectSels(siteSels()); }
 
 function draftUnbind(){ DRAFT_KEY=null; DRAFT_GET=null; DRAFT_BASE=null; }
+/* 端末の空き容量が尽きると、localStorage の書きかけにも書けない。
+   そのときは画面が開いている間だけ、ここに持つ。
+   持たないと、画面を作り直した瞬間に打った内容が消える（監査35回目 Critical） */
+let DRAFT_HOLD = {};
+function draftHeld(key){ return DRAFT_HOLD[key] || null; }
 function draftTouch(){
   if(!DRAFT_KEY || !DRAFT_GET) return;
+  // 見ているだけのタブから触ると、記録を入れているタブの書きかけを
+  // 上書き・削除してしまう（監査34回目 Critical）
+  if(!ownsLock()) return;
   let d; try{ d=DRAFT_GET(); }catch(e){ return; }
   // 開いたときのまま（＝何も触っていない）なら、書きかけを残さない
-  if(DRAFT_BASE!==null && JSON.stringify(d)===DRAFT_BASE) draftClear(DRAFT_KEY);
-  else draftSave(DRAFT_KEY, d);
+  if(DRAFT_BASE!==null && JSON.stringify(d)===DRAFT_BASE){
+    draftClear(DRAFT_KEY); delete DRAFT_HOLD[DRAFT_KEY]; return;
+  }
+  if(draftSave(DRAFT_KEY, d)) delete DRAFT_HOLD[DRAFT_KEY];
+  else DRAFT_HOLD[DRAFT_KEY] = d;      // 書けなくても、画面の中には持つ
 }
 // バブル段階で受ける。先回りで受けると、onchange で季節を入れ直す前の
 // 古い値を控えてしまう（2026-08-16 の再監査 Major）
@@ -2753,16 +3033,20 @@ function screenGen(){ return SCREEN_SEQ; }
 function screenStale(gen){ return gen !== SCREEN_SEQ; }
 const SCREENS = {};
 
-function nav(name, arg){ STACK.push({name,arg}); render(); }
-function goBack(){ if(STACK.length>1){ STACK.pop(); render(); } }
+/* 画面を移った回数。描き直し（render）では増えない。
+   「別の画面へ行って15秒以内に戻ってきた」を見分けるのに使う（監査54回目 Minor） */
+let NAV_SEQ = 0;
+function nav(name, arg){ NAV_SEQ++; STACK.push({name,arg}); render(); }
+function goBack(){ if(STACK.length>1){ NAV_SEQ++; STACK.pop(); render(); } }
 /* 履歴を丸ごと捨てる。起動時とホームへ戻すときだけに使う。
    保存のあとにこれを使うと、前の画面へ戻れなくなる（2026-08-16 の監査 Major） */
-function reset(name,arg){ STACK=[{name:name||'home',arg:arg||null}]; render(); }
+function reset(name,arg){ NAV_SEQ++; STACK=[{name:name||'home',arg:arg||null}]; render(); }
 
 /* 保存のあとの行き先。履歴を捨てず、親までの道すじを組み直す。
    例) goTo('station', stUuid) → home > survey > station
    こうすると「戻る」で調査ハブ、もう一度でホームへ戻れる */
 function goTo(name, arg){
+  NAV_SEQ++;
   STACK = buildChain(name, arg);
   render();
 }
@@ -2775,6 +3059,12 @@ function buildChain(name, arg){
     const st = DB.liveStation(arg);
     // 消された箇所なら、そこへは連れて行かない。ホームへ帰す
     return st ? [home, {name:'survey', arg:st.survey_uuid}, {name:'station', arg:arg}]
+              : [home];
+  }
+  if(name==='spot'){
+    const st = DB.liveStation(arg);
+    // 地点で戻ると調査ハブを飛ばしてホームへ行っていた（監査49回目 Major）
+    return st ? [home, {name:'survey', arg:st.survey_uuid}, {name:'spot', arg:arg}]
               : [home];
   }
   // 地図の画面。地点から開いたときは、ホーム > 調査 > 地点 > 地図 と組む
@@ -2802,6 +3092,7 @@ function buildChain(name, arg){
 }
 /* いまの画面を別の画面に置き換える（積み上げない） */
 function navReplace(name, arg){
+  NAV_SEQ++;
   if(!STACK.length) STACK=[{name:'home',arg:null}];
   STACK[STACK.length-1] = {name, arg};
   render();
@@ -2830,7 +3121,6 @@ function render(){
   try{ if(typeof envFlush==='function') envFlush(); }catch(e){}
   // 「新しい調査」の▼地点情報も同じ。画面を作り直す前に、打った分を書く
   try{ if(typeof spotInfoSave==='function') spotInfoSave(); }catch(e){}
-  MAP_SPOT = '';      // 地図を開いている地点は、画面ごとに立て直す
   // 同じ画面を作り直すときのために、見ていた位置を控える。
   // 押すたびに先頭へ戻ると、下のほうの入力が打てない（2026-08-20 の実機の声）
   const 前の画面 = SCREEN_AT;
@@ -2845,7 +3135,8 @@ function render(){
   revokePhotoUrls();          // 前の画面で開いた写真を、いつまでも抱えない
   if(EFFORT_TIMER){ clearInterval(EFFORT_TIMER); EFFORT_TIMER=null; }
   if(ENV_GPS_TIMER){ clearInterval(ENV_GPS_TIMER); ENV_GPS_TIMER=null; }
-  destroyMaps();
+  destroyMaps();      // 先に、見ていた場所を地点ごとの控えへ書く
+  MAP_SPOT = '';      // そのあとで、地図を開いている地点を立て直す
   const cur = STACK[STACK.length-1];
   const scr = SCREENS[cur.name] || SCREENS.home;
   let v;
@@ -2966,13 +3257,19 @@ function pathLength(path){
 }
 /* 位置を1回だけ取る。決め方（GPS/地図/手入力）は呼び出し側が書く。
    ここで position_source を書き換えない（上書きすると、地図で置いた位置がGPS扱いになる） */
-function getFixOnce(cb){
+/* opt.keep を立てると、待っている間に画面を描き直しても返す。
+   描き直しの回数で切ると、待つ間に地図をタップしたり記録を選び直しただけで
+   取ったばかりの現在地を捨ててしまう（監査53回目 Major）。
+   置いてよいかは、呼ぶ側が fixGuard() で確かめる */
+function getFixOnce(cb, opt){
   if(!navigator.geolocation){ cb(null); return; }
+  const 描き直しでも = !!(opt && opt.keep);
   const g = screenGen();
+  const 古い = ()=>!描き直しでも && screenStale(g);
   navigator.geolocation.getCurrentPosition(p=>{
-    if(screenStale(g)) return;
+    if(古い()) return;
     cb({lat:p.coords.latitude, lon:p.coords.longitude, acc:p.coords.accuracy});
-  }, ()=>{ if(!screenStale(g)) cb(null); },
+  }, ()=>{ if(!古い()) cb(null); },
      {enableHighAccuracy:true, maximumAge:3000, timeout:15000});
 }
 
@@ -3733,6 +4030,17 @@ function photoOwnerAlive(u, svu){
 }
 /* 記録に付いた写真からは、付け先の印を外す。
    外さないと、あとで写真を外しても実体が残り続ける */
+/* 控えで丸ごと置き換えたあと、写真の「付ける先」の印をぜんぶ外す。
+   置き換え前の印が残っていると、開いた画面に前の写真が出てきて、
+   別の記録に付いてしまう（監査70回目 Major）。
+   いま記録に付いている写真の実体は消さない（片付けは PhotoDB.gc に任せる） */
+function photoOwnerResetAll(){
+  if(!ownsLock()) return Promise.resolve(false);
+  return Promise.resolve().then(()=>PhotoDB.all()).then(recs=>{
+    const 印つき = (recs||[]).filter(r=>r && r.id && r.owner).map(r=>({id:r.id}));
+    return photoOwnerDone(印つき);
+  }).catch(()=>false);
+}
 function photoOwnerDone(list){
   // 見ているだけのタブでは、印を外さない。
   // 外すと、記録を入れているタブがまだ保存していない写真の守りを解いてしまう
@@ -4212,6 +4520,31 @@ const FS_HABITAT_KEY = ['環境区分','河川形態B','水温','水深','流速
    魚類データベース app/pages/4_資料管理.py の _EVENT_KEY と同じ並び */
 const FS_EVENT_KEY = ['業務番号','業務名','河川名','地点名','区間名',
   '調査日','季節','天気','緯度','経度','河川形態A'];
+/* いまの取り込み側（魚類データベース app/database.py の get_event_by_key）が
+   「同じ調査」とみなすのは、この6項目だけ。こちらの11項目より狭い。
+   そのため、こちらで別の調査として出した行が、取り込むと1つに合流し、
+   地点情報や魚が別の調査のものになる（監査69回目 Critical）。
+   本当の直しは取り込み側を11項目にそろえること（Phase 5）。
+   それまでは、合流してしまう組み合わせを書き出す前に知らせる */
+const FS_EVENT_KEY_DB = ['業務番号','河川名','地点名','調査日','緯度','経度'];
+/* 取り込み側で合流してしまう組み合わせを探す。無ければ空の配列 */
+function eventMergeWarn(rows){
+  const 表 = {};
+  (rows||[]).forEach(r=>{
+    const 狭い = FS_EVENT_KEY_DB.map(c=>String(r[c]==null?'':r[c]))
+      .join(String.fromCharCode(1));
+    const 広い = FS_EVENT_KEY.map(c=>String(r[c]==null?'':r[c]))
+      .join(String.fromCharCode(1));
+    (表[狭い] || (表[狭い] = new Set())).add(広い);
+  });
+  const out = [];
+  Object.keys(表).forEach(k=>{
+    if(表[k].size <= 1) return;
+    const 見本 = k.split(String.fromCharCode(1));
+    out.push(`${見本[1]||''} ${見本[2]||''} ${見本[3]||''}（${表[k].size}件が1つに）`);
+  });
+  return out;
+}
 
 /* データベース取り込み用の行を組み立てる。
    1行 = 1種の結果。落とすものは黙って落とさず、理由と件数を返す */
@@ -4249,15 +4582,22 @@ function buildDbRows(sv){
     return {rows:[], excluded:[], warnings:[], blocked:[e.message]};
   }
 
-  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid)
+  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid && unitReady(x))
     .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
-  const lat = fixCoord(sv.latitude), lon = fixCoord(sv.longitude);
+  // 代表点が空でも、地点が置いてあれば取り直す（前回M6の直しを入口でも効かせる）
+  const pos = surveyPos(sv);
+  const lat = fixCoord(pos.lat), lon = fixCoord(pos.lon);
   if(lat==='' || lon===''){
     blocked.push('調査の位置（緯度経度）が入っていません');
   }
   stations.forEach(st=>{
-    // 開始・終了時刻が空だと、取り込み側が別々の箇所を1つにまとめてしまう
-    if(!st.survey_time_start){
+    // 開始・終了時刻が空だと、取り込み側が別々の箇所を1つにまとめてしまう。
+    // ただし見るのは「実際に31列CSVの行になる箇所」だけ。
+    // 地点の目印や物理環境の記録まで見ると、魚は入っているのに
+    // 書き出せない、ということが起きる（監査50回目 Critical）
+    const 行になる = snap.ca.some(c=>c.station_uuid===st.uuid
+      && c.species_id && catchTotal(c, snap) > 0 && !badCount(c, snap));
+    if(行になる && !st.survey_time_start){
       blocked.push(`${st.name||'箇所'}：開始時刻が入っていません`);
     }
     snap.ca.filter(c=>c.station_uuid===st.uuid)
@@ -4291,6 +4631,9 @@ function buildDbRows(sv){
       }else{
         warnings.push(msg);
       }
+      // 魚があったことを覚えておく。覚えないと、魚なしの箇所を先に見たあと
+      // 魚ありが2つ続いても、ぶつかりを見逃す（監査34回目 Major）
+      if(hasFish) seen[k].hasFish = true;
     }else{
       seen[k] = {name:st.name, hasFish};
     }
@@ -4300,21 +4643,154 @@ function buildDbRows(sv){
 }
 /* 地点情報（区間名・地点名・河川形態A）は、地点に入っていればそれを使い、
    空なら調査ぜんぶの値を使う。地点ごとに入れられるようにしたのは 2026-08-20 */
+/* この調査の代表点。空のままだと31列CSVを書き出せない。
+   地点の保存はできたのに調査の更新だけ失敗した（容量不足など）ときのために、
+   使うときに最初の地点から取り直す（監査32回目 Major） */
+/* 31列CSVを出せる調査か。
+   「何を調べますか」の欄を消したので、前に作った物理環境の調査でも
+   地点から魚の地図に入って魚を記録できる。調査の種類ではなく、
+   実際に魚の記録があるかで決める（監査33回目 Critical） */
+function hasFishRecords(svUuid){
+  return DB.stationsOf(svUuid).some(st=>DB.catchesOf(st.uuid)
+    .some(c=>c.species_id && catchTotal(c) > 0));
+}
+function canExportDbCsv(sv){
+  return !!sv && hasFishRecords(sv.uuid);
+}
+/* 現在地を待っている間に、画面や地点が変わっていないか確かめる。
+   変わっていたら置かない。置くと、閉じた画面から記録が増えたり、
+   P1で押した操作が P2 のものになる（監査33回目 Major）。
+   使い方: const g = fixGuard(svUuid); … getFixOnce(f=>{ if(!g()) return; … }) */
+/* 現在地を待っている最中かどうか。待っている間にもう一度押されると、
+   同じ場所へ二重に置かれる（監査66回目 Major）。
+   取れても取れなくても、終わったら必ず外す */
+let FIX_BUSY = false;
+function fixBusy(){
+  if(FIX_BUSY){
+    toast('いま現在地を取っています。少しお待ちください', 5000);
+    return true;
+  }
+  FIX_BUSY = true;
+  return false;
+}
+function fixDone(){ FIX_BUSY = false; }
+function fixGuard(svUuid){
+  // 見るのは「どの画面のどの記録を開いているか」。
+  // 描き直しの回数（screenGen）で見ると、待っている間に地図をタップしただけで
+  // 弾いてしまい、あとから返った現在地を取りこぼす
+  const at = STACK[STACK.length-1] || {};
+  const 画面 = at.name;
+  let 引数 = ''; try{ 引数 = JSON.stringify(at.arg || ''); }catch(e){}
+  const spot = MAP_SPOT;
+  // 画面を移った回数。別の画面へ行って戻ってくると、名前と引数は同じでも
+  // ここが変わる（監査54回目 Minor）
+  const 移り = NAV_SEQ;
+  // どの日の記録にするか。待つ間に変えられると、別の日の記録になる
+  //（監査54回目 Major）
+  const 日 = svUuid ? recDay(DB.getAlive(DB.key.sv, svUuid)) : '';
+  // 何を足そうとしていたかも控える。待つ間に種類や相手が変わると、
+  // 返ってきた座標が別の操作に使われる（監査34回目 Major）
+  const 何を = [FISH_NEXT.kind, FISH_NEXT.draw, ENV_NEXT.kind, ENV_NEXT.line].join('|');
+  return function(){
+    const now = STACK[STACK.length-1] || {};
+    let a2 = ''; try{ a2 = JSON.stringify(now.arg || ''); }catch(e){}
+    if(now.name !== 画面 || a2 !== 引数){
+      toast('現在地を取っている間に別の画面へ移ったので、置いていません', 7000);
+      return false;
+    }
+    if(NAV_SEQ !== 移り){
+      toast('現在地を取っている間に画面を移ったので、置いていません', 7000);
+      return false;
+    }
+    if(MAP_SPOT !== spot){
+      toast('現在地を取っている間に地点が変わったので、置いていません', 7000);
+      return false;
+    }
+    if(svUuid && recDay(DB.getAlive(DB.key.sv, svUuid)) !== 日){
+      toast('現在地を取っている間に記録する日が変わったので、置いていません', 7000);
+      return false;
+    }
+    if([FISH_NEXT.kind, FISH_NEXT.draw, ENV_NEXT.kind, ENV_NEXT.line].join('|') !== 何を){
+      toast('現在地を取っている間に、つぎに足すものが変わったので置いていません', 7000);
+      return false;
+    }
+    if(!writeAllowed()){
+      toast('このタブでは置けません。記録を入れているタブでお試しください', 6000);
+      return false;
+    }
+    return true;
+  };
+}
+/* 調査の代表の位置を、地点から決め直す。
+   代表は「いちばん番号の小さい、生きている地点」に決め打ちする。
+   消した順・戻した順で代表が変わると、書き出しの調査の見分けまで揺れる
+   （監査66回目 Major）。手入力やGPSで決めた位置は触らない */
+function spotPosFix(svUuid){
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return true;
+  if(sv.position_source && sv.position_source !== '地点') return true;
+  const 地点 = spotList(svUuid).filter(x=>x.is_spot)
+    .slice().sort((a,b)=>(a.station_no||0)-(b.station_no||0));
+  const 先頭 = 地点.map(stationPt).filter(Boolean)[0];
+  const 新lat = 先頭 ? +(+先頭[0]).toFixed(6) : '';
+  const 新lon = 先頭 ? +(+先頭[1]).toFixed(6) : '';
+  const 新src = 先頭 ? '地点' : '';
+  if(fixCoord(sv.latitude) === fixCoord(新lat)
+     && fixCoord(sv.longitude) === fixCoord(新lon)
+     && (sv.position_source||'') === 新src) return true;
+  sv.latitude = 新lat; sv.longitude = 新lon; sv.position_source = 新src;
+  if(!DB.upsert(DB.key.sv, sv)) return false;
+  // 画面に隠してある値もそろえる（監査60回目 Major）
+  applyVals({'#f_lat': fixCoord(sv.latitude), '#f_lon': fixCoord(sv.longitude)});
+  const el = $('#posInfo');
+  if(el) el.textContent = sv.position_source ? ('決め方：' + sv.position_source) : '';
+  if(typeof surveyDrawPos === 'function'){
+    try{ surveyDrawPos(sv.latitude, sv.longitude); }catch(e){}
+  }
+  return true;
+}
+function surveyPos(sv){
+  if(!sv) return {lat:'', lon:''};
+  if(numOf(sv.latitude)!=='' && numOf(sv.longitude)!=='') {
+    return {lat: sv.latitude, lon: sv.longitude};
+  }
+  const sp = spotList(sv.uuid).map(stationPt).filter(Boolean)[0];
+  return sp ? {lat: sp[0], lon: sp[1]} : {lat:'', lon:''};
+}
 function spotInfoOf(sv, st){
   const s = st || {};
+  // 地図で作った記録は、自分では地点情報を持たない。
+  // どの地点の地図で作ったか（spot_uuid）をたどって、その地点の値を使う
+  // 指している地点が消えていたら（liveStation が null）、調査ぜんぶの値を使う。
+  // 別の調査の地点を指していたら使わない
+  let sp = {};
+  if(s.spot_uuid && s.spot_uuid !== s.uuid){
+    const t = DB.liveStation(s.spot_uuid);
+    if(t && t.survey_uuid === sv.uuid) sp = t;
+  }
+  // 地点にぶら下がっている記録は、地点の値を先に見る。
+  // 記録自身の古い値を先に見ると、地点で入れ直した天気・区間名が
+  // 書き出しに出てこない（監査36回目 Major）
+  const 地点あり = !!sp.uuid;
+  const pick = k => 地点あり ? (sp[k] || sv[k] || '') : (s[k] || sv[k] || '');
   return {
-    section: s.section_name       || sv.section_name       || '',
-    site:    s.site_name          || sv.site_name          || '',
-    formA:   s.river_morphology_a || sv.river_morphology_a || '',
-    weather: s.weather             || sv.weather             || '',
+    section: pick('section_name'),
+    site:    pick('site_name'),
+    formA:   pick('river_morphology_a'),
+    weather: pick('weather'),
+    memo:    pick('memo'),
+    spot:    (sp.name || (s.is_spot ? (s.name||'') : '')),
+    // 消えた地点や別の調査の地点を指していたら、地点IDも空にする。
+    // 残すと、書き出しの地点IDが存在しない地点を指す（監査37回目 Major）
+    spotId:  (sp.uuid || (s.is_spot ? s.uuid : '')),
   };
 }
 /* CSVの1行を組み立てる。c が null なら魚の欄は空のまま（箇所の鍵を調べるときに使う） */
 function dbRowOf(sv, st, c, inds){
   const ls = c ? catchLengths(c, inds) : [];
   const si = spotInfoOf(sv, st);
+  const pos = surveyPos(sv);
   return {
-    '緯度': fixCoord(sv.latitude), '経度': fixCoord(sv.longitude),
+    '緯度': fixCoord(pos.lat), '経度': fixCoord(pos.lon),
     // 何日かにわたる調査では、その箇所の日付を使う。
     // 取り込み側は調査日で調査を分けるので、日ごとに別の調査として入る
     '調査日': stationDate(st, sv), '季節':sv.season||'', '天気':si.weather,
@@ -4341,7 +4817,7 @@ function dbRowOf(sv, st, c, inds){
 /* 1尾ずつの記録（1行＝1尾） */
 function buildIndRows(sv, snap){
   const rows = [];
-  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid)
+  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid && unitReady(x))
     .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
   stations.forEach(st=>{
     snap.ca.filter(c=>c.station_uuid===st.uuid).forEach(c=>{
@@ -4373,7 +4849,8 @@ function buildPointRows(sv, snap){
   snap.st.filter(x=>x.survey_uuid===sv.uuid)
     .sort((a,b)=>(a.station_no||0)-(b.station_no||0))
     .forEach(st=>{
-      envPoints(st).forEach((pt,i)=>{
+      const pts = envPoints(st);
+      pts.forEach((pt,i)=>{
         rows.push({
           '調査日': stationDate(st, sv), '河川名':sv.river_name||'',
           '地点名':spotInfoOf(sv, st).site,
@@ -4385,13 +4862,29 @@ function buildPointRows(sv, snap){
           '調査ID':sv.uuid, '箇所ID':st.uuid,
         });
       });
+      // 地図で打った測点（P1・P2…）は、それ自体が1つの測点。
+      // 中の env_points だけを見ていたので、測点CSVが空になっていた
+      //（監査70回目 Major）。二重にならないよう、中に無いときだけ出す
+      if(!pts.length && stationKind(sv, st)==='物理環境'
+         && envMethod(st)==='点' && !isMesh(st)){
+        rows.push({
+          '調査日': stationDate(st, sv), '河川名':sv.river_name||'',
+          '地点名':spotInfoOf(sv, st).site,
+          '箇所':st.name||'', '測点番号': 1,
+          '水深cm': numOf(st.depth_rep_cm), '流速cms': numOf(st.velocity_rep_cms),
+          '河床材料': st.substrate1||'', '備考': st.memo||'',
+          '緯度': fixCoord(st.latitude), '経度': fixCoord(st.longitude),
+          'GPS精度m': numOf(st.gps_accuracy), '位置の決め方': st.position_source||'',
+          '調査ID':sv.uuid, '箇所ID':st.uuid,
+        });
+      }
     });
   return rows;
 }
 
 /* 箇所ごと（1行＝1箇所） */
 function buildStationRows(sv, snap){
-  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid)
+  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid && unitReady(x))
     .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
   return stations.map(st=>{
     const len = stationLengths(st), area = stationAreas(st);
@@ -4402,8 +4895,11 @@ function buildStationRows(sv, snap){
     const L = coverList(st,'left'), R = coverList(st,'right');
     const cs = snap.ca.filter(c=>c.station_uuid===st.uuid);
     const n = cs.reduce((a,c)=>a+catchTotal(c, snap), 0);
+    // その行の秒数は、ここで1回だけ決める。通電の最中は呼ぶたびに増えるので、
+    // 別々に呼ぶと、出した秒数で計算し直した値と食い違う（監査63回目 Major）
+    const 秒 = Math.round(stationEffortRaw(st));
     const cp = {
-      per100s: effortSeconds(st)>0 ? n/effortSeconds(st)*100 : '',
+      per100s: 秒>0 ? n/秒*100 : '',
       per100m2: (area.used!=='' && area.used>0) ? n/area.used*100 : '',
     };
     const si = spotInfoOf(sv, st);
@@ -4413,7 +4909,10 @@ function buildStationRows(sv, snap){
       '天気': si.weather,
       '調査者':sv.investigator||'', '何回目調査':sv.survey_round||'',
       '箇所':st.name||'', '記録のしかた':sv.detail_level||'一般',
-      '調べたもの': surveyKind(sv), '環境の取り方': envMethod(st),
+      '調べたもの': exportKind(sv, st),
+      // 「環境の取り方」は物理環境の記録だけ。地点や魚の単位に既定の「点」を
+      // 出すと、地点が測点のように読める（監査43回目 Major）
+      '環境の取り方': stationKind(sv, st)==='物理環境' ? envMethod(st) : '',
       '向き': isLine(st) ? (st.line_direction||'') : '',
       '始点緯度': fixCoord(st.line_start_lat), '始点経度': fixCoord(st.line_start_lon),
       '始点GPS精度m': numOf(st.line_start_acc),
@@ -4466,7 +4965,8 @@ function buildStationRows(sv, snap){
       '右岸カバー長m': numOf(st.cover_right_length_m), '右岸カバーあり': coverPresent(st,'right'),
       '河床材料':st.substrate1||'', '次に多い河床材料':st.substrate2||'',
       '礫の状況':st.gravel_condition||'',
-      '通電秒数': Math.round(effortSeconds(st)),
+      // 箇所CSVは、入っている値をそのまま出す（集計の二重数え防止とは分ける）
+      '通電秒数': 秒,
       '通電回数': numOf(st.effort_passes),
       '川幅m': numOf(st.width_m),
       '距離_軌跡m': round1(len.track), '距離_直線m': round1(len.straight),
@@ -4475,59 +4975,233 @@ function buildStationRows(sv, snap){
       '面積_使う値m2': round1(area.used),
       '種数': speciesCount(cs, snap), '尾数': n,
       '100秒あたり尾数': round1(cp.per100s), '100m2あたり尾数': round1(cp.per100m2),
-      'メモ':st.memo||'', '調査ID':sv.uuid, '箇所ID':st.uuid,
+      // その箇所そのものに打ったメモを先に出す。
+      // 地点のメモで上書きすると、単位に入れたメモが黙って落ちる（監査48回目 Major）
+      'メモ': (st.memo || si.memo), '地点': si.spot, '調査ID':sv.uuid, '箇所ID':st.uuid,
     };
   });
+}
+
+/* 努力量（箇所数・通電）を数える単位。
+   1つの調査に、地点の目印・地図の単位（親と子）・物理環境の記録・メッシュが同居する。
+   そのまま足すと、同じ現場の労力を何度も数える（監査32回目 Major）。
+   数えるのは「記録を入れる、いちばん小さい単位」だけ:
+     ・メッシュの範囲は除く（別のCSVに出す）
+     ・中に小さい単位がある親は除く（子で数える）
+     ・地点の目印は除く。ただし、その調査に地図の単位も物理環境の記録も
+       無いときだけ、地点そのものを数える（前のやり方で地点に直接入れた場合） */
+/* 地点（目印）は通電を持たない決まり。
+   ただし前の版で地点へ直接入った秒数は、消さずに書き出す。
+   集計で二重に数えないよう、その地点の地図で作った記録が
+   1つも無いときだけ数える（監査56回目 Critical） */
+function spotEffort(st){
+  if(!st || !st.is_spot) return effortSeconds(st);
+  return spotFishChildren(st) ? 0 : effortSeconds(st);
+}
+/* 書き出しの「調べたもの」。箇所CSVと調査CSVで同じ見方をする（監査60回目 Major） */
+function exportKind(sv, st){
+  return spotCountsAsFish(st) ? '魚' : stationKind(sv, st);
+}
+/* 前の版で地点へ直に入れた魚・漁具・通電があり、まだ魚の単位を作っていない地点。
+   この地点は、集計でも書き出しでも「魚」として扱う（監査59回目 Major） */
+function spotCountsAsFish(st){
+  if(!st || !st.is_spot) return false;
+  // 子の単位があるかは見ない。見ると、新しい単位を1つ作っただけで
+  // その地点の直接の魚が「地点」と書き出される（監査61回目 Major）
+  return !!(DB.catchesOf(st.uuid).length || gearCount(st) || +st.effort_seconds > 0);
+}
+/* 労力（通電・箇所数・距離・面積）を、この地点の分として数えるか。
+   魚の単位を作ったら、そちらで数えるので地点側は数えない */
+function spotEffortCounts(st){
+  return spotCountsAsFish(st) && !spotFishChildren(st);
+}
+/* その地点の地図で作った「魚の単位」があるか。
+   物理環境の測点やラインは、通電とは別のものなので数に入れない。
+   入れると、測点を1つ置いただけで地点の通電が集計から消える（監査58回目 Major） */
+function spotFishChildren(st){
+  if(!st) return 0;
+  return DB.stationsOf(st.survey_uuid)
+    .filter(x=>x.uuid!==st.uuid && x.spot_uuid===st.uuid && unitKindOf(x) && unitReady(x)).length;
+}
+/* 書き出しに「そのまま出す」ための値。集計とは分ける */
+function stationEffortRaw(st){ return effortSeconds(st); }
+function effortStations(stations, all){
+  const 生き = (stations||[]).filter(st=>!isMesh(st) && unitReady(st));
+  // 種類は env_method だけでは決まらない（前の版で魚の単位にも付いた）。
+  // stationKind に合わせないと、その単位の通電・距離・面積が漏れる（監査44回目 Major）
+  const sv0 = DB.getAlive(DB.key.sv, (生き[0]||{}).survey_uuid) || null;
+  const 種 = (st)=>stationKind(sv0, st);
+  // 親子は調査ぜんぶから見る。その日・その地点の分だけで見ると、
+  // 別の日に子を作った親を「子のない単位」と取り違える（監査36回目 Major）
+  const 親 = {};
+  (all || stations || []).filter(unitReady)
+    .forEach(st=>{ if(st && st.parent_uuid) 親[st.parent_uuid] = true; });
+  // 子を作る前に親へ直接入れた記録があれば、その親も数える。
+  // 除くと、魚は集計に出るのに通電・箇所数だけ消える（監査34回目 Major）。
+  // これから先は unitParentBlocked が新しく作らせないので、
+  // 残るのは前の版で作った分だけ
+  const 葉 = 生き.filter(st=>!親[st.uuid] || !!unitHasOwn(st));
+  // 上から順に、あるものを使う
+  // 前の版で地点へ直に入れた魚・漁具・通電は、魚の側に数える。
+  // 物理環境の測点を1つ置いただけで、その地点の通電・箇所数が
+  // 集計から落ちていた（監査58回目 Major）
+  const 旧地点 = 葉.filter(spotEffortCounts);
+  const 魚 = 葉.filter(st=>種(st)==='魚').concat(旧地点);
+  if(魚.length) return 魚;
+  const 環境 = 葉.filter(st=>種(st)==='物理環境');
+  if(環境.length) return 環境;
+  return 葉;                       // 地点しか無い調査
 }
 
 /* 調査ぜんぶ（1行） */
 /* 調査CSVは、日ごとに1行にする。
    31列CSVは箇所の日付で調査が分かれるので、期間全体を1行にまとめると
    件数も日別の集計も食い違う（2026-08-17 の監査 Major） */
+/* 調査CSVは「日ごと」に1行だった。
+   地点ごとに 地点名・区間名・天気・河川形態A を持てるようにしたので、
+   同じ日でも地点が違えば、取り込み側は別の調査として扱う。
+   31列CSVのまとまり方と食い違わないよう、日付＋地点で1行にする（監査33回目 Major） */
 function buildSurveyRow(sv, snap){
-  const all = snap.st.filter(x=>x.survey_uuid===sv.uuid);
-  // 実際に箇所がある日だけ出す。箇所が1つも無ければ、はじめの日で1行
-  const days = Array.from(new Set(all.map(st=>stationDate(st, sv)))).sort();
-  const list = days.length ? days : [String(sv.survey_date||'').slice(0,10)];
-  return list.map(day=>surveyRowOfDay(sv, snap, day, all));
+  // 描きかけの囲いは、書き出しに混ぜない（監査62回目 Major）
+  const all = snap.st.filter(x=>x.survey_uuid===sv.uuid && unitReady(x));
+  const 組 = {};
+  // 地点の目印そのものは、記録を持っていなければ数えない。
+  // 数えると「箇所数1・尾数0」の架空の行ができ、31列CSVと食い違う（監査38回目 Major）
+  // 目印だけの地点は、その地点の記録があれば単独の行にしない。
+  // 出すと、置いた日の「0件の行」と、記録した日の行に分かれる（監査44回目 Major）。
+  // 地点情報は spotInfoOf で子の行へ渡る
+  const 子あり = {};
+  all.forEach(st=>{ if(st.spot_uuid) 子あり[st.spot_uuid] = true; });
+  const 対象all = all.filter(st=>{
+    if(!st.is_spot) return true;
+    if(spotOwnRecords(st)) return true;
+    if(子あり[st.uuid]) return false;
+    return spotHasData(st);
+  });
+  対象all.forEach(st=>{
+    const day = stationDate(st, sv);
+    const spot = spotInfoOf(sv, st).spotId || '';
+    // まとめる鍵は、31列CSVが「同じ調査」とみなすのと同じものを使う。
+    // 日付＋地点で分けると、同じ鍵に潰れる別地点や、同じ地点なのに
+    // 鍵が違う記録があったときに、2つのCSVの調査の数が食い違う（監査34回目 Major）
+    const src = dbRowOf(sv, st, null, snap);
+    const k = FS_EVENT_KEY.map(c=>String(src[c]==null?'':src[c]))
+      .join(String.fromCharCode(1));
+    const g = 組[k] || (組[k] = {day, spot, spots:{}, memos:{}, sts:[], 空:false});
+    g.sts.push(st);
+    const si = spotInfoOf(sv, st);
+    if(spot){
+      g.spots[spot] = si.spot || spot;
+      if(si.memo) g.memos[spot] = si.memo;
+    }else{
+      // 地点に属さない前のやり方の箇所。同じ組に混ざると、
+      // その分まで地点のものとして書き出されてしまう（監査47回目 Major）
+      g.空 = true;
+      if(st.memo) g.memos['st:'+st.uuid] = st.memo;
+      g.spots['st:'+st.uuid] = st.name || '';
+    }
+  });
+  const keys = Object.keys(組).sort();
+  if(!keys.length){
+    snap.__rowCount = 1;
+    // メモは空文字を渡さない。渡すと「地点の値が無ければ調査の値」が働かず、
+    // 調査に書いたメモが書き出しから落ちる（監査55回目 Major）
+    return [surveyRowOfDay(sv, snap, String(sv.survey_date||'').slice(0,10), [], '', '',
+                           undefined)];
+
+  }
+  snap.__rowCount = keys.length;
+  return keys.map(k=>{
+    const g = 組[k];
+    const ids = Object.keys(g.spots);
+    const 地点ids = ids.filter(i=>i.indexOf('st:') !== 0);
+    // 同じ「1つの調査」に地点が複数まとまることがある。
+    // どれか1つに寄せると、ほかの地点の分がその地点のものとして出る（監査38回目 Major）。
+    // 地点に属さない箇所が混ざっているときも、地点IDは出さない（監査47回目 Major）
+    const 地点ID = (地点ids.length === 1 && !g.空) ? 地点ids[0] : '';
+    // 地点に属さない箇所が混ざっているときは、その箇所の名前も出す。
+    // 地点の名前だけ出すと、混ざった分まで その地点のものに見える（監査48回目 Major）
+    const 名前ids = g.空 ? ids : 地点ids;
+    const 地点名 = 名前ids.length
+      ? 名前ids.map(i=>g.spots[i]).filter(Boolean).sort().join('・') : '';
+    // 地点ごと・箇所ごとのメモを落とさない。1つならそのまま、
+    // 複数なら「P1: …／St.1: …」（監査43回目 Major・監査47回目 Major）
+    const 持つ = ids.filter(i=>g.memos[i]).sort();
+    const メモ = 持つ.length === 0 ? undefined
+      : (持つ.length === 1 && ids.length === 1) ? g.memos[持つ[0]]
+      : 持つ.map(i=>`${g.spots[i] || ''}: ${g.memos[i]}`)
+          .sort().join(String.fromCharCode(65295));
+    return surveyRowOfDay(sv, snap, g.day, g.sts, 地点ID, 地点名, メモ);
+  });
 }
-function surveyRowOfDay(sv, snap, day, all){
-  const stations = all.filter(st=>stationDate(st, sv)===day);
+function surveyRowOfDay(sv, snap, day, stations, spotId, spotName, spotMemo){
   const ids = new Set(stations.map(x=>x.uuid));
   const cs = snap.ca.filter(c=>ids.has(c.station_uuid));
   const n = cs.reduce((a,c)=>a+catchTotal(c, snap), 0);
   const measured = cs.reduce((a,c)=>a+indsOf(snap, c.uuid).length, 0);
   // 距離・面積はその日の箇所だけを足す
-  const dayLen = stations.map(st=>stationLengths(st).used).filter(v=>v!=='' && isFinite(v));
-  const dayArea = stations.map(st=>stationAreas(st).used).filter(v=>v!=='' && isFinite(v));
-  const oneDay = surveyDays(sv).length <= 1;
-  const len = oneDay ? surveyLengths(sv)
-    : {auto: dayLen.length ? dayLen.reduce((a,b)=>a+b,0) : '', manual:'', used:''};
-  const area = oneDay ? surveyAreas(sv)
-    : {auto: dayArea.length ? dayArea.reduce((a,b)=>a+b,0) : '', manual:'', used:''};
-  if(!oneDay){ len.used = len.auto; area.used = area.auto; }
+  // 親子の両方から足すと二重になる。努力量と同じ集合から出す（監査35回目 Major）
+  const 対象 = effortStations(stations, snap.st.filter(x=>x.survey_uuid===sv.uuid));
+  const dayLen = 対象.map(st=>stationLengths(st).used).filter(v=>v!=='' && isFinite(v));
+  const dayArea = 対象.map(st=>stationAreas(st).used).filter(v=>v!=='' && isFinite(v));
+  // 行を日付＋地点で分けたので、調査ぜんぶの合計を各行に繰り返すと
+  // 足したときに何倍にもなる。その組の箇所だけから出す（監査34回目 Major）。
+  // 手入力の合計は、行が1つのときだけ使う
+  const 一行 = (snap.__rowCount || 0) <= 1;
+  const len = {auto: dayLen.length ? dayLen.reduce((a,b)=>a+b,0) : '', manual:'', used:''};
+  const area = {auto: dayArea.length ? dayArea.reduce((a,b)=>a+b,0) : '', manual:'', used:''};
+  len.used = len.auto; area.used = area.auto;
+  if(一行){
+    // 手で入れた値があるときだけ、そちらを使う。
+    // 「調査ぜんぶの合計」で置き換えると、親子や別系統を二重に数える（監査37回目 Major）
+    const L = surveyLengths(sv), A = surveyAreas(sv);
+    len.manual = L.manual; area.manual = A.manual;
+    if(L.manual!=='' ) len.used = L.manual;
+    if(A.manual!=='' ) area.used = A.manual;
+  }
+  // その組（日付＋地点）を代表する記録から、地点情報を取る
+  const 代表 = stations[0] || null;
+  const si = spotInfoOf(sv, 代表);
   return {
     '調査日': day||'', '終了日':sv.survey_date_end||'',
     '日数': surveyDays(sv).length,
-    '季節':sv.season||'', '天気':sv.weather||'',
-    '河川名':sv.river_name||'', '地点名':sv.site_name||'', '区間名':sv.section_name||'',
-    '河川形態A':sv.river_morphology_a||'',
-    '調べたもの': surveyKind(sv), '記録のしかた':sv.detail_level||'一般',
-    '環境の取り方': isEnvSurvey(sv) ? (sv.env_method_default||'点') : '',
-    '緯度': fixCoord(sv.latitude), '経度': fixCoord(sv.longitude),
+    '季節':sv.season||'', '天気': si.weather,
+    '河川名':sv.river_name||'', '地点名': si.site, '区間名': si.section,
+    '河川形態A': si.formA, '地点': (spotName === undefined ? si.spot : spotName),
+    // 1つの調査に魚と物理環境が同居するので、その組の中身から決める
+    '調べたもの': (()=>{
+      const k = {};
+      stations.forEach(st=>{
+        // 前の版で地点へ直に入れた魚は、書き出しでも「魚」と出す。
+        // 出さないと、尾数と通電がある行が「物理環境」になる（監査59回目 Major）
+        k[exportKind(sv, st)] = true;
+      });
+      delete k['地点'];
+      const l = Object.keys(k);
+      return l.length ? l.join('・') : surveyKind(sv);
+    })(),
+    '記録のしかた':sv.detail_level||'一般',
+    '環境の取り方': (()=>{
+      const m = {};
+      stations.forEach(st=>{
+        if(stationKind(sv, st)==='物理環境' && st.env_method) m[st.env_method] = true; });
+      return Object.keys(m).join('・');
+    })(),
+    '緯度': fixCoord(surveyPos(sv).lat), '経度': fixCoord(surveyPos(sv).lon),
     'GPS精度m': numOf(sv.gps_accuracy), '位置の決め方':sv.position_source||'',
     '調査者':sv.investigator||'', '何回目調査':sv.survey_round||'',
     '業務番号':sv.project_number||'', '業務名':sv.project_name||'',
-    '箇所数': stations.length,
+    '箇所数': 対象.length,
     '種数': speciesCount(cs, snap),
     '尾数': n, '測った尾数': measured,
-    '通電秒数_合計': Math.round(stations.reduce((a,st)=>a+effortSeconds(st), 0)),
+    '通電秒数_合計': Math.round(対象.reduce((a,st)=>a+spotEffort(st), 0)),
     '距離_合計m': round1(len.auto), '距離_手入力m': len.manual, '距離_使う値m': round1(len.used),
     '面積_合計m2': round1(area.auto), '面積_手入力m2': area.manual,
     '面積_使う値m2': round1(area.used),
     '開始': sv.started_at ? fmtTime(sv.started_at) : '',
     '終了': sv.finished_at ? fmtTime(sv.finished_at) : '',
-    'メモ':sv.memo||'', '調査ID':sv.uuid,
+    'メモ': (spotMemo === undefined ? si.memo : spotMemo),
+    '調査ID':sv.uuid, '地点ID': spotId||'',
   };
 }
 /* 数の範囲を見る。おかしいものがあれば、その説明を返す。無ければ空文字。
@@ -4595,7 +5269,7 @@ const FS_STATION_COLS = ['調査日','河川名','地点名','区間名','河川
   '距離_軌跡m','距離_直線m','距離_手入力m','距離_使う値m',
   '面積_計算m2','面積_手入力m2','面積_使う値m2',
   '種数','尾数','100秒あたり尾数','100m2あたり尾数',
-  'メモ','調査ID','箇所ID'];
+  'メモ','地点','調査ID','箇所ID'];
 
 /* 採捕記録。1行＝1漁具。
    データベースには漁具を入れる表がまだ無い（Phase 5 で決める）。
@@ -4604,12 +5278,13 @@ const FS_GEAR_COLS = ['調査日','河川名','地点名','箇所','漁具の番
   '数','規格','使った分','回数','備考','調査ID','箇所ID'];
 
 function buildGearRows(sv, snap){
-  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid)
+  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid && unitReady(x))
     .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
   const rows = [];
   stations.forEach(st=>{
-    gearsOf(st).forEach((g,i)=>{
-      if(!g || !g.gear) return;
+    // 空の行を飛ばしたあとに番号を振る。元の並びの番号を使うと、
+    // 1件しかないのに「2」と出る（監査49回目 Minor）
+    gearsOf(st).filter(g=>g && g.gear).forEach((g,i)=>{
       rows.push({
         '調査日': stationDate(st, sv), '河川名':sv.river_name||'',
         '地点名': spotInfoOf(sv, st).site, '箇所':st.name||'',
@@ -4663,13 +5338,13 @@ function buildMeshRows(sv, snap){
                        || (a['行']-b['行']) || (a['列']-b['列']));
 }
 
-const FS_SURVEY_COLS = ['調査日','終了日','日数','季節','天気','河川名','地点名','区間名','河川形態A',
+const FS_SURVEY_COLS = ['調査日','終了日','日数','季節','天気','河川名','地点名','区間名','河川形態A','地点',
   '調べたもの','記録のしかた','環境の取り方',
   '緯度','経度','GPS精度m','位置の決め方','調査者','何回目調査','業務番号','業務名',
   '箇所数','種数','尾数','測った尾数',
   '通電秒数_合計','距離_合計m','距離_手入力m','距離_使う値m',
   '面積_合計m2','面積_手入力m2','面積_使う値m2',
-  '開始','終了','メモ','調査ID'];
+  '開始','終了','メモ','調査ID','地点ID'];
 
 /* 書き出しでデータベースの31列CSVに乗らない項目。書き出し画面に必ず出す */
 const NOT_IN_DB_CSV = ['通電秒数','漁具ごとの数・規格・時間','調査面積','調査距離','左右岸のカバー',
@@ -4747,15 +5422,32 @@ SCREENS.home = ()=>{
    → 地点のチップ → ▼地点情報。ほかの設定は「▼くわしい設定」にたたむ
    ============================================================ */
 /* この調査に置いた調査地点。囲い（E・P/F）とメッシュは、地点として数えない */
+/* 「新しい調査」の地図で置いた調査地点。
+   物理環境の記録（測点・ライン）は置いたときに env_method が必ず入るので混ざらない。
+   前のやり方で作った箇所（印も単位も env_method も無いもの）は、
+   地点の地図を開けないので oldStations() のほうへ分ける（監査39回目 Critical） */
 function spotList(svUuid){
-  // 物理環境の記録（測点・ライン）は、置いたときに env_method が必ず入る。
-  // それを地点の並びに混ぜると、測点を1つ置くたびに地点が増えてしまう（2026-08-21）
-  return DB.stationsOf(svUuid)
-    .filter(x=>!isMesh(x) && !unitKindOf(x) && !x.env_method);
+  const sv = DB.getAlive(DB.key.sv, svUuid) || {};
+  const l = DB.stationsOf(svUuid)
+    .filter(x=>!isMesh(x) && !unitKindOf(x) && stationKind(sv, x) !== '物理環境');
+  const 印あり = l.filter(x=>x.is_spot);
+  return 印あり.length ? 印あり : l;
 }
+/* 前のやり方で作った箇所。地点の印が付いていないもの。
+   地点を1つでも置いた調査では、地点の並びから外れるので、別枠で出す */
+function oldStations(svUuid){
+  const sv = DB.getAlive(DB.key.sv, svUuid) || {};
+  const l = DB.stationsOf(svUuid)
+    .filter(x=>!isMesh(x) && !unitKindOf(x) && stationKind(sv, x) !== '物理環境');
+  return l.some(x=>x.is_spot) ? l.filter(x=>!x.is_spot) : [];
+}
+/* 「新しい調査」の画面で扱う地点。印のあるものだけ。
+   ここで前のやり方の箇所まで拾うと、地図の印を押しただけで
+   その箇所が地点として扱われる（監査42回目 Major） */
+function editSpots(svUuid){ return spotList(svUuid).filter(x=>x.is_spot); }
 /* いま選んでいる地点。消えていたら先頭に戻す */
 function spotCur(svUuid, list){
-  const l = list || spotList(svUuid);
+  const l = list || editSpots(svUuid);
   const u = SPOTS_SEL[svUuid];
   const hit = u ? l.filter(x=>x.uuid===u)[0] : null;
   return hit || l[0] || null;
@@ -4771,11 +5463,22 @@ function spotChipsHtml(list, sel){
   return `<div class="seg">` + list.map(st=>`<button type="button"
     class="${sel && st.uuid===sel.uuid ? 'on' : ''}"
     onclick="spotSelect('${st.uuid}')">${esc(st.name||'')}
-    <span class="fsub">${DB.catchesOf(st.uuid).length}種</span></button>`).join('') + `</div>`;
+    <span class="fsub">${(()=>{ const t = spotTotals(st.uuid);
+      return t.尾 ? `${t.種}種 ${t.尾}尾` : '—'; })()}</span></button>`).join('') + `</div>`;
 }
 /* ▼地点情報。選んでいる地点の 区間名・地点名・河川形態A を入れる。
    空のままなら、調査ぜんぶの値（▼くわしい設定）を使う */
+/* 保存も控えもできなかった打ちかけの、最後の逃げ道（この画面が開いている間だけ）。
+   端末の空き容量が尽きると localStorage にも書けないので、
+   ここに持たないと画面を作り直した瞬間に消える（監査34回目 Critical） */
+let SPOT_HOLD = {};
 function spotInfoHtml(sel, sv){
+  // 保存できなかった打ちかけがあれば、そちらを出す（消さない）
+  if(sel){
+    // 画面の中の分のほうが新しい。控えを先に見ると、古い控えで上書きされる
+    const d = SPOT_HOLD[sel.uuid] || draftGet('spotinfo:'+sel.uuid);
+    if(d) sel = Object.assign({}, sel, d);
+  }
   if(!sel) return foldHtml('svspot', '地点情報', '', `
     <div class="dim small">まだ地点がありません。地図をタップして置いてください。<br>
       置いた地点ごとに、区間名・地点名・河川形態Aを入れられます。</div>`, true);
@@ -4783,10 +5486,12 @@ function spotInfoHtml(sel, sv){
   return foldHtml('svspot', '地点情報', `<span class="fsub">${esc(sel.name||'')}</span>`, `
     <label>区間名</label>
     <input id="sp_section" value="${esc(sel.section_name||'')}"
-      placeholder="${esc(sv.section_name || '例）1・2・施工区域')}" onchange="spotInfoSave()">
+      placeholder="${esc(sv.section_name || '例）1・2・施工区域')}"
+      oninput="spotInfoTouch()" onchange="spotInfoSave()">
     <label>地点名</label>
     <input id="sp_site" value="${esc(sel.site_name||'')}"
-      placeholder="${esc(sv.site_name || '例）○○橋下流')}" onchange="spotInfoSave()">
+      placeholder="${esc(sv.site_name || '例）○○橋下流')}"
+      oninput="spotInfoTouch()" onchange="spotInfoSave()">
     <label>河川形態A（セグメント）</label>
     <div onclick="setTimeout(spotInfoSave,0)">
       ${segHtml('spotFormA', OPT.formA, sel.river_morphology_a||'', true)}</div>
@@ -4794,7 +5499,8 @@ function spotInfoHtml(sel, sv){
     <div onclick="setTimeout(spotInfoSave,0)">
       ${segHtml('spotWeather', OPT.weather, sel.weather||'', true)}</div>
     <label>メモ</label>
-    <textarea id="sp_memo" onchange="spotInfoSave()">${esc(sel.memo||'')}</textarea>
+    <textarea id="sp_memo" oninput="spotInfoTouch()"
+      onchange="spotInfoSave()">${esc(sel.memo||'')}</textarea>
     <div class="dim small">この地点の位置は、置いたときに自動で記録されています
       （${esc(fixCoord(sel.latitude)||'—')}, ${esc(fixCoord(sel.longitude)||'—')}）。
       空のままの欄は、調査ぜんぶの値を使います${A ? `（河川形態A：${esc(A)}）` : ''}。</div>
@@ -4804,26 +5510,74 @@ function spotInfoHtml(sel, sv){
   `, true);
 }
 /* 地点情報を、選んでいる地点へ書く。打つたびに保存する（保存ボタンを押さなくても残る） */
+/* 地点情報を保存できたかを返す。
+   保存できなかったときは、打った内容を書きかけとして残す。
+   残さずに画面を作り直すと、区間名・天気・メモが黙って消える（監査32回目 Critical） */
+/* いま画面に打たれている地点情報を読む。読めないときは null */
+function spotInfoVals(){
+  if(!SPOT_SV || !$('#sp_section')) return null;
+  const sel = spotCur(SPOT_SV); if(!sel) return null;
+  return {uuid: sel.uuid, v: {
+    section_name: strVal('#sp_section'), site_name: strVal('#sp_site'),
+    river_morphology_a: segVal('spotFormA'), weather: segVal('spotWeather'),
+    memo: strVal('#sp_memo')}};
+}
+/* 打っているそばから控える。
+   欄から指を離す前にアプリが閉じられると、onchange が来ないまま
+   打った内容がどこにも残らなかった（監査47回目 Critical）。
+   本保存はすこし待ってからまとめて行う（一文字ごとに全部を書き直さない） */
+let SPOT_TYPE_T = null;
+function spotInfoTouch(){
+  if(!writeAllowed()) return;
+  const cur = spotInfoVals(); if(!cur) return;
+  SPOT_HOLD[cur.uuid] = cur.v;                 // 画面には必ず持ち続ける
+  try{ draftSave('spotinfo:'+cur.uuid, cur.v); }catch(e){}
+  if(SPOT_TYPE_T) clearTimeout(SPOT_TYPE_T);
+  SPOT_TYPE_T = setTimeout(()=>{ SPOT_TYPE_T = null; spotInfoSave(); }, 900);
+}
+/* 閉じる・裏へ回るときは、待たずに書いてしまう */
+function spotInfoDrop(uu){
+  if(SPOT_TYPE_T){ clearTimeout(SPOT_TYPE_T); SPOT_TYPE_T = null; }
+  try{ draftClear('spotinfo:'+uu); }catch(e){}
+  delete SPOT_HOLD[uu];
+}
+function spotInfoFlush(){
+  if(SPOT_TYPE_T){ clearTimeout(SPOT_TYPE_T); SPOT_TYPE_T = null; }
+  try{ spotInfoSave(); }catch(e){}
+}
 function spotInfoSave(){
-  if(!SPOT_SV || !$('#sp_section')) return;      // 画面に出ていないときは触らない
-  const sel = spotCur(SPOT_SV); if(!sel) return;
-  const st = DB.liveStation(sel.uuid); if(!st) return;
-  const sec = strVal('#sp_section'), site = strVal('#sp_site'), a = segVal('spotFormA');
-  const w = segVal('spotWeather'), memo = strVal('#sp_memo');
-  if((st.section_name||'')===sec && (st.site_name||'')===site
-     && (st.river_morphology_a||'')===a && (st.weather||'')===w
-     && (st.memo||'')===memo) return;
-  st.section_name       = sec;
-  st.site_name          = site;
-  st.river_morphology_a = a;
-  st.weather            = w;
-  st.memo               = memo;
+  if(SPOT_TYPE_T){ clearTimeout(SPOT_TYPE_T); SPOT_TYPE_T = null; }
+  if(!SPOT_SV || !$('#sp_section')) return true;   // 画面に出ていないときは触らない
+  // 見ているだけのタブでは、書きかけの置き場（全タブ共通）にも触らない。
+  // 触ると、記録を入れているタブの書きかけを消してしまう
+  if(!writeAllowed()) return true;
+  const sel = spotCur(SPOT_SV); if(!sel) return true;
+  const st = DB.liveStation(sel.uuid); if(!st) return true;
+  const v = {section_name: strVal('#sp_section'), site_name: strVal('#sp_site'),
+             river_morphology_a: segVal('spotFormA'), weather: segVal('spotWeather'),
+             memo: strVal('#sp_memo')};
+  const 同じ = Object.keys(v).every(k => (st[k]||'') === v[k]);
+  if(同じ){ draftClear('spotinfo:'+sel.uuid); return true; }
+  Object.keys(v).forEach(k=>{ st[k] = v[k]; });
   if(!DB.upsert(DB.key.st, st)){
-    toast('地点情報を保存できませんでした（端末の空き容量をご確認ください）', 8000);
+    const 残せた = draftSave('spotinfo:'+sel.uuid, v);
+    SPOT_HOLD[sel.uuid] = v;      // 控えも取れなくても、画面には持ち続ける
+    toast(残せた
+      ? '地点情報を保存できませんでした（端末の空き容量をご確認ください）。'
+        + '打った内容は残してあります'
+      : '地点情報を保存できず、控えも取れませんでした。'
+        + '打った内容はこのまま画面に残します。'
+        + 'いらない写真や記録を消してから、もう一度お試しください', 10000);
+    return false;
   }
+  draftClear('spotinfo:'+sel.uuid);
+  delete SPOT_HOLD[sel.uuid];
+  return true;
 }
 function spotSelect(uu){
-  spotInfoSave();                 // 選び替える前に、打った分を先に書く
+  const st = DB.liveStation(uu);
+  if(!st || !st.is_spot) return;  // 印の無い箇所は、地点として扱わない
+  if(!spotInfoSave()) return;     // 選び替える前に、打った分を先に書く。書けなければ動かさない
   if(SPOT_SV) SPOTS_SEL[SPOT_SV] = uu;
   spotRefresh();
 }
@@ -4832,41 +5586,83 @@ function spotSelect(uu){
 function spotRefresh(){
   const svUuid = SPOT_SV; if(!svUuid) return;
   const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
-  const list = spotList(svUuid);
+  const list = editSpots(svUuid);
   const sel  = spotCur(svUuid, list);
   const a = $('#f_spotList'); if(a) a.innerHTML = spotCardHtml(list, sel);
   const b = $('#f_spotInfo'); if(b) b.innerHTML = spotInfoHtml(sel, sv);
   spotsDrawAll(svUuid, sel ? sel.uuid : '');
 }
-function spotOpen(uu){ spotInfoSave(); nav('spot', uu); }
+function spotOpen(uu){ if(spotInfoSave()) nav('spot', uu); }
 function spotRemove(uu){
-  const st = DB.liveStation(uu); if(!st) return;
+  const st = DB.liveStation(uu); if(!st || !st.is_spot) return;
   const n = DB.catchesOf(uu).length;
+  // この地点の地図で作った記録があるうちは消させない。
+  // 消すと、その記録は残るのに地点から開く道が無くなり、手が届かなくなる
+  //（監査38回目 Major）。文字をつなぐ + を落として実行時エラーになっていたのも直す
+  //（監査38回目 Critical）
+  const 連れ = spotStations(uu).filter(x=>x.uuid!==uu);
+  if(連れ.length){
+    const 名 = 連れ.slice(0,5).map(x=>x.name).join('・') + (連れ.length>5 ? ' ほか' : '');
+    toast(`${st.name||'この地点'}の地図で作った記録が ${連れ.length}件あります`
+      + `（${名}）。先にそれらを消すか、別の地点へ移してから、`
+      + 'この地点を削除してください', 10000);
+    return;
+  }
   if(!confirm(`${st.name||'この地点'}を削除します。`
     + `${n>0?`記録${n}件も一緒に見えなくなります。`:''}よろしいですか？（ごみ箱に入ります）`)) return;
+  if(!flushBeforeDelete(uu)){
+    toast('打ちかけを保存できないので、消しませんでした。'
+      + '足りないところを直すか、端末の空き容量をご確認ください', 9000);
+    return;
+  }
   if(!DB.softDelete(DB.key.st, uu)) return;
+  // 代表の位置は、そのつど決め直す（監査66回目 Major）
+  if(!spotPosFix(st.survey_uuid)){
+    DB.restore(DB.key.st, uu);      // 半端な形を残さない
+    toast('調査の位置を直せなかったので、削除をやめました', 8000);
+    return;
+  }
   draftClearFor('箇所', uu);
+  spotInfoDrop(uu);         // 地点情報の打ちかけも片付ける（監査48回目 Minor）
   if(SPOT_SV) delete SPOTS_SEL[SPOT_SV];
   toast('削除しました');
   spotRefresh();
 }
 /* 地図で調査地点を置く。置いたら、それを選んだ状態にする */
+/* 画面の調査日と、保存されている調査日が食い違っていないか。
+   食い違ったまま地点を置くと、古い日付の地点ができ、
+   そのあと保存すると「期間の外」と断られる（監査69回目 Major） */
+function svDateDirty(sv){
+  if(!sv || !$('#f_date')) return false;
+  // いま開いているのが、その調査の設定画面のときだけ見る。
+  // 別の調査の画面が開いているのに比べると、置けなくなってしまう
+  const at = STACK[STACK.length-1] || {};
+  if(at.name !== 'surveyEdit' || at.arg !== sv.uuid) return false;
+  const d1 = strVal('#f_date'), d2 = strVal('#f_date2');
+  // 開始日を消した場合も「変えた」とみなす。見逃すと、画面は空なのに
+  // 保存済みの古い日付で地点ができる（監査70回目 Major）
+  return d1 !== String(sv.survey_date||'').slice(0,10)
+      || d2 !== String(sv.survey_date_end||'');
+}
 function svSpotAdd(svUuid, lat, lon, acc){
+  const sv0 = DB.getAlive(DB.key.sv, svUuid);
+  if(svDateDirty(sv0)){
+    toast('調査日を変えています。先に下の「保存する」を押してから、'
+      + '地点を置いてください', 9000);
+    return null;
+  }
+  if(!spotInfoSave()) return null;   // 選んでいる地点の打ちかけを、先に書く
   const u = spotsAdd(svUuid, lat, lon, acc);
   if(!u) return null;
   SPOTS_SEL[svUuid] = u;
   // この調査の代表点がまだ空なら、はじめに置いた地点の位置を入れる。
   // 空のままだと、書き出しも取り込みも位置なしになる
-  const sv = DB.getAlive(DB.key.sv, svUuid);
-  if(sv && numOf(sv.latitude)===''){
-    sv.latitude  = +(+lat).toFixed(6);
-    sv.longitude = +(+lon).toFixed(6);
-    sv.position_source = sv.position_source || '地点';
-    if(DB.upsert(DB.key.sv, sv)){
-      applyVals({'#f_lat': fixCoord(sv.latitude), '#f_lon': fixCoord(sv.longitude)});
-      const el=$('#posInfo'); if(el) el.textContent = '決め方：地点';
-      surveyDrawPos(sv.latitude, sv.longitude);
-    }
+  // 代表の位置を直せなかったら、置いた地点も戻す（半端な形を残さない）
+  if(!spotPosFix(svUuid)){
+    DB.softDelete(DB.key.st, u);
+    toast('調査の位置を直せなかったので、地点を置けませんでした。'
+      + '端末の空き容量をご確認ください', 9000);
+    return null;
   }
   spotRefresh();
   return u;
@@ -4890,7 +5686,10 @@ SCREENS.surveyEdit = (svUuid)=>{
   const pnm = g('project_name')   || (isNew ? (p.project_name||'')   : '');
   const inv = g('investigator')   || (isNew ? (p.investigator||'')   : '');
   const rnd = g('survey_round')   || (isNew ? (p.survey_round||'')   : '');
-  const spots = isNew ? [] : spotList(svUuid);
+  // 設定画面の地点の並びは、印のあるものだけ。
+  // 前のやり方の箇所を混ぜると、地点として出るのに押すと地点なしの地図が開く
+  //（監査41回目 Major）
+  const spots = isNew ? [] : editSpots(svUuid);
   const sel   = isNew ? null : spotCur(svUuid, spots);
   return {
     title: isNew ? '新しい調査' : '調査の設定',
@@ -4921,10 +5720,12 @@ SCREENS.surveyEdit = (svUuid)=>{
           onchange="surveyRiverChanged()">
         <label>登録した地点から選ぶ</label>
         <div id="f_siteList">${sitePickHtml(g('river_name'), g('site_uuid'))}</div>
-        <div class="dim small" id="f_siteMsg">選ぶと、名前と位置がまとめて入ります。</div>
+        <div class="dim small" id="f_siteMsg">選ぶと、その場所へ地図が移ります。
+          地点名も位置も、地図をタップして置いた調査地点から決まります。</div>
         <button class="btn sm" onclick="nav('siteEdit',{river:strVal('#f_river')})">地点を登録する</button>
       </div>
 
+      ${isNew ? '' : recDayBarHtml(sv)}
       ${baseMapButtonsHtml()}
       <div id="svmap" class="map"
         style="height:${envMapBig()?'80vh':'50vh'};min-height:260px"></div>
@@ -4971,20 +5772,57 @@ SCREENS.surveyEdit = (svUuid)=>{
     onMount(){
       startGps();
       SPOT_SV = svUuid || '';
+      // 位置の決め方は、この画面で選んだときだけ変える。
+      // 前の画面の選択が残ると、別の調査を保存したときに書き換わる（監査39回目 Major）
+      window._posSource = null; window._posAcc = null;
+      // 代表点が空のまま残っていたら、最初の地点から取り直して書き戻す
+      if(svUuid && numOf(sv.latitude)===''){
+        const pos = surveyPos(sv);
+        if(pos.lat!=='' ){
+          const rec = DB.getAlive(DB.key.sv, svUuid);
+          if(rec){
+            rec.latitude = pos.lat; rec.longitude = pos.lon;
+            rec.position_source = rec.position_source || '地点';
+            if(DB.upsert(DB.key.sv, rec)) applyVals({'#f_lat':pos.lat, '#f_lon':pos.lon});
+          }
+        }
+      }
       window._siteUuid = g('site_uuid') || '';
+      // 保存されている地点名。登録地点を選んで外したときに、ここへ戻す
+      //（外したのに、選んだ地点の名前が残って保存されていた。監査52回目 Critical）
+      window._siteNameSaved = g('site_name') || '';
       onSurveyDate();
       const key = 'survey:'+(svUuid||'new');
       const base = collectSurvey();     // 書きかけを戻す前の姿を控える
-      const d = draftGet(key);
+      const d = draftForForm(key);
       if(d){
-        applyVals({'#f_date':d.survey_date, '#f_date2':d.survey_date_end,
-          '#f_river':d.river_name, '#f_site':d.site_name,
-          '#f_lat':d.latitude, '#f_lon':d.longitude,
+        // 画面に出ていない欄（地点名・緯度・経度）は、前の版の書きかけから戻さない。
+        // 戻すと、設定を開いて保存しただけで、いまの値が古い書きかけに
+        // 黙って書き換わる（監査37回目 Critical）。
+        // 新しく作るときも、緯度経度は戻さない。戻すと「もう位置がある」と
+        // みなされ、最初に置いた地点が代表点にならない（監査42回目 Major）。
+        // 古い書きかけの座標は、地図をそのあたりで開くのにだけ使う
+        applyVals(Object.assign({
+          '#f_date':d.survey_date, '#f_date2':d.survey_date_end,
+          '#f_river':d.river_name,
           '#f_pno':d.project_number, '#f_pname':d.project_name, '#f_inv':d.investigator,
-          '#f_round':d.survey_round});
+          '#f_round':d.survey_round,
+        }));
+        // 地点名の欄は画面に出していない（地点ごとの地点情報へ移した）。
+        // 前の版の書きかけから戻すと、河川を変えても古い地点名が
+        // 黙って新しい調査に入る（監査68回目 Major）
+        if(isNew && numOf(d.latitude)!=='' && numOf(d.longitude)!==''){
+          window._draftCenter = [numOf(d.latitude), numOf(d.longitude)];
+        }
         applySeg('season', d.season);
         applySeg('envm', d.env_method_default);
-        if(d.site_uuid) window._siteUuid = d.site_uuid;
+        if(d.site_uuid){
+          // 消された地点や、別の河川の地点は戻さない（監査48回目 Major）。
+          // 地点名の欄は触らない。どの登録地点を選んだかだけを戻す
+          const si0 = DB.getAlive(DB.key.si, d.site_uuid);
+          const riv = strVal('#f_river');
+          if(si0 && (!riv || si0.river_name === riv)) window._siteUuid = d.site_uuid;
+        }
         toast('書きかけを戻しました');
       }
       draftBind(key, collectSurvey, base);
@@ -4994,7 +5832,10 @@ SCREENS.surveyEdit = (svUuid)=>{
       const river = strVal('#f_river');
       const la = numVal('#f_lat'), lo = numVal('#f_lon');
       const v = SPOTS_VIEW[svUuid||''];
-      const c = v ? [v.lat, v.lon] : ((la!=='' && lo!=='') ? [la, lo] : [43.06, 141.35]);
+      const 書きかけの中心 = window._draftCenter; window._draftCenter = null;
+      const c = v ? [v.lat, v.lon]
+        : ((la!=='' && lo!=='') ? [la, lo]
+        : (書きかけの中心 || [43.06, 141.35]));
       MAPS.main.map = makeMap('svmap', c, v ? v.zoom : ((la!=='') ? 15 : 8),
         v ? v.bearing : 0);
       const map = MAPS.main.map;
@@ -5014,15 +5855,19 @@ SCREENS.surveyEdit = (svUuid)=>{
         ], 'bottomleft');
         addMapIconBar(map, [
           {icon:'addHere', title:'いまいる場所に調査地点を置く', tap:()=>{
+            if(fixBusy()) return;      // 待っている間の二度押しで、二重に置かない
             toast('現在地を取っています…');
+            const 確かめ = fixGuard(svUuid);
             getFixOnce(f=>{
+              fixDone();
+              if(!確かめ()) return;
               if(!f){ toast('現在地を取れませんでした。地図をタップしても置けます', 6000); return; }
               if(f.acc > GPS_MAX_ACC){
                 toast(`いまの位置は ±${Math.round(f.acc)}m と粗いので置いていません`, 8000);
                 return;
               }
               svSpotAdd(svUuid, f.lat, f.lon, f.acc);
-            });
+            }, {keep:true});     // 置いてよいかは 確かめ() が見る
           }},
         ], 'bottomright');
       }
@@ -5110,6 +5955,7 @@ function surveyDrawSites(){
 }
 /* 河川名が変わったら、地図をその川へ */
 function surveyRiverChanged(){
+  siteCheck();          // 河川が変わったら、そぐわない登録地点は外す
   draftTouch();
   const name = strVal('#f_river');
   // 画面ごと作り直すと、せっかく合わせた地図が元に戻ってしまう。
@@ -5121,15 +5967,35 @@ function surveyRiverChanged(){
   if(map && name) fitRiver(map, name, '#f_mapMsg');
 }
 /* 登録した地点を使う */
+/* 登録した地点を選ぶ。
+   することは「地図をそこへ移す」だけ。
+   隠れている地点名・緯度経度を書き換えると、そのあとに置いた
+   最初の調査地点の位置が代表点にならず、書き出しの座標が
+   実際に置いた場所と食い違う（監査40回目 Major） */
+/* 選んでいる登録地点が、いまの河川のものでなければ外す。
+   残すと、別の河川の地点IDと地点名を持った調査になる（監査48回目 Major） */
+function siteCheck(){
+  const uu = window._siteUuid; if(!uu) return;
+  const si = DB.getAlive(DB.key.si, uu);
+  const river = strVal('#f_river');
+  if(si && (!river || si.river_name === river)) return;
+  // 外すのは「どの登録地点を選んだか」だけ。
+  // 地点名の欄は、選んでも外しても触らない（監査51・52・57回目）
+  window._siteUuid = '';
+  const msg=$('#f_siteMsg');
+  if(msg) msg.textContent = '河川を変えたので、選んでいた登録地点を外しました。';
+}
 function useSite(uu){
   const si = DB.getAlive(DB.key.si, uu); if(!si) return;
   window._siteUuid = uu;
-  applyVals({'#f_river': si.river_name, '#f_site': si.name,
-             '#f_lat': fixCoord(si.latitude), '#f_lon': fixCoord(si.longitude)});
-  window._posSource = '登録地点'; window._posAcc = '';
-  const el=$('#posInfo'); if(el) el.textContent = '決め方：登録地点';
-  const msg=$('#f_siteMsg'); if(msg) msg.textContent = `「${si.name}」の名前と位置を入れました。`;
-  surveyDrawPos(+si.latitude, +si.longitude);
+  // 地点名の欄は、もう画面に出していない（地点ごとの地点情報へ移した）。
+  // ここで入れると、いままでの地点名を黙って別の名前に変えてしまう
+  //（監査57回目 Major）。緯度経度も入れない（監査40回目 Major）。
+  // ここでするのは、河川名をそろえて地図をその場所へ動かすことだけ
+  applyVals({'#f_river': si.river_name});
+  const msg=$('#f_siteMsg');
+  if(msg) msg.textContent = `地図を「${si.name}」の場所へ移しました。`
+    + '位置も地点名も、地図をタップして置いた調査地点から決まります。';
   const map = MAPS.main.map;
   if(map) try{ map.setView([+si.latitude, +si.longitude], 15); }catch(e){}
   draftTouch();
@@ -5154,7 +6020,8 @@ function onSurveyDate(){
   draftTouch();      // 入れ直した季節も控える
 }
 function saveSurvey(svUuid){
-  spotInfoSave();     // ▼地点情報に打ちかけがあれば、先に書く
+  // ▼地点情報に打ちかけがあれば、先に書く。書けなければ「保存しました」と出さない
+  if(!spotInfoSave()) return;
   const rec = svUuid ? (DB.get(DB.key.sv, svUuid)||{uuid:svUuid}) : {uuid:uuid(), status:'未開始'};
   const f = collectSurvey();
   // 一般と詳細では、箇所（地点）の意味も見せ方もCSVも変わる。
@@ -5200,7 +6067,13 @@ function saveSurvey(svUuid){
   if(rerr){ toast(rerr, 6000); return; }
   rec.season             = f.season;
   rec.river_name         = f.river_name;
-  rec.site_name          = f.site_name;
+  // 地点名の欄は、もう画面に出していない（地点ごとの地点情報へ移した）。
+  // すでにある調査では、いままでの値をそのまま残す（監査57回目 Major）。
+  // 新しく作るときだけ、選んだ登録地点の名前を写す
+  if(!svUuid){
+    const siN = f.site_uuid ? DB.getAlive(DB.key.si, f.site_uuid) : null;
+    rec.site_name = (siN && siN.name) || f.site_name || '';
+  }
   // 天気・区間名・河川形態A・調査区分・メモは、地点ごとに入れる形にしたので
   // 調査の設定から欄を外した。取れないときは、いまの値をそのまま残す（2026-08-21）
   if(f.weather !== undefined)            rec.weather            = f.weather;
@@ -5224,9 +6097,18 @@ function saveSurvey(svUuid){
     ? (f.survey_kind === '物理環境' ? '物理環境' : '魚')
     : (rec.survey_kind || '魚');
   rec.env_method_default = f.env_method_default || '点';
-  // 物理環境の調査に「詳細」は無い。詳細は魚を点ごとに記録するための形
-  if(rec.survey_kind === '物理環境') rec.detail_level = '一般';
-  if(f.site_uuid) rec.site_uuid = f.site_uuid;
+  // 物理環境の調査に「詳細」は無い。詳細は魚を点ごとに記録するための形。
+  // ただし画面から取れないときは触らない。触ると、前に作った「詳細」の調査が
+  // 開いて保存しただけで一般に変わってしまう（監査34回目 Critical）
+  if(rec.survey_kind === '物理環境' && (f.detail_level || !svUuid)) rec.detail_level = '一般';
+  // 登録地点は、この画面にある項目。空なら消す。
+  // 残すと「新しい河川＋前の河川の地点ID」という食い違いになる（監査49回目 Major）
+  const si2 = f.site_uuid ? DB.getAlive(DB.key.si, f.site_uuid) : null;
+  if(si2 && (!rec.river_name || si2.river_name === rec.river_name)){
+    rec.site_uuid = f.site_uuid;
+  }else{
+    delete rec.site_uuid;
+  }
   if(!rec.river_name && !rec.site_name){ toast('河川名か地点名のどちらかは入れてください'); return; }
   const ok = DB.upsert(DB.key.sv, rec);
   if(!ok) return;                       // 保存できていないので画面も動かさない
@@ -5256,6 +6138,10 @@ function deleteSurvey(u){
    一度でも「地図で記録する」を使った調査だけ、つぎからは地図で開く。
    前からある調査を勝手に変えない（2026-08-19） */
 function fishMapEntry(sv){
+  // 地点を置いた調査では、地図へ直行しない。
+  // 直行させると、そこで作った単位が地点に紐づかず、
+  // 地点別の集計・書き出しから外れた別系統の記録が増える（監査40回目 Major）
+  if(sv && spotList(sv.uuid).some(x=>x.is_spot)) return false;
   return !!(sv && !isEnvSurvey(sv) && sv.entry === 'map');
 }
 function fishUseMap(svUuid, on){
@@ -5269,7 +6155,10 @@ function fishUseMap(svUuid, on){
 }
 SCREENS.survey = (svUuid)=>{
   const sv0 = DB.getAlive(DB.key.sv, svUuid);
-  if(isEnvSurvey(sv0) && !isMesh({env_method: sv0.env_method_default})){
+  // 地点を置いてある調査は、種類にかかわらず調査ハブ（地点の並び）へ。
+  // 地点が無い前の版の物理環境の調査だけ、これまでどおり地図へ直行する
+  if(isEnvSurvey(sv0) && !spotList(svUuid).length
+     && !isMesh({env_method: sv0.env_method_default})){
     return SCREENS.envMap(svUuid);
   }
   if(fishMapEntry(sv0)) return SCREENS.fishMap(svUuid);
@@ -5281,7 +6170,14 @@ SCREENS.surveyHub = (svUuid)=>{
   const 単位あり = DB.stationsOf(svUuid).some(x=>unitKindOf(x));
   // 一覧に並べるのは地点だけ。物理環境の測点や、地図の単位（E・P/F・P）は
   // それぞれの地図の画面で見る（混ぜると、測点を置くたびに箇所が増えて見える）
-  const stations = isEnvSurvey(sv) ? DB.stationsOf(svUuid) : spotList(svUuid);
+  // 地点を置いてある調査は、種類にかかわらず地点の並びで開く。
+  // 前に作った物理環境の調査でも、地点 → 魚類／物理環境 の道を使えるように
+  //（監査36回目 Major）
+  const 地点たち = spotList(svUuid);
+  const 前のやり方 = oldStations(svUuid);
+  const 地点あり = 地点たち.some(x=>x.is_spot);
+  const stations = 地点たち.length ? 地点たち
+    : (isEnvSurvey(sv) ? DB.stationsOf(svUuid) : 地点たち);
   // 「記録中」は、いま現場にいるときだけの言い方。
   // あとから書き起こしているときに「記録中」と出ると、何かが動いている誤解になる。
   // 詳細（点を打つ形）では、点に「途中」という状態が無いので使わない
@@ -5289,13 +6185,16 @@ SCREENS.surveyHub = (svUuid)=>{
     ? stations.find(s=>!s.ended_at) : null;
   const W = stWord(sv);
   const svLen = surveyLengths(sv), svArea = surveyAreas(sv);
-  const svSec = stations.reduce((a,st)=>a+effortSeconds(st), 0);
+  const svSec = effortStations(DB.stationsOf(svUuid))
+    .reduce((a,st)=>a+spotEffort(st), 0);
   const nSp = new Set(DB.catchesOfSurvey(svUuid).map(c=>c.species_id).filter(Boolean)).size;
-  const envOnly = isEnvSurvey(sv);
+  // 「何を調べますか」は設定から消した。前に作った調査の種類で入口を閉じるのは、
+  // 地点も魚の単位も無い、前の版のままの調査だけにする（監査39回目 Major）
+  const envOnly = isEnvSurvey(sv) && !地点あり && !単位あり;
   const stCards = stations.map(st=>{
     const n = stationTotal(st);
     const sp = DB.catchesOf(st.uuid).length;
-    return `<div class="card tap" onclick="nav('${envOnly?'station':'spot'}','${st.uuid}')">
+    return `<div class="card tap" onclick="nav('${st.is_spot?'spot':'station'}','${st.uuid}')">
       <div class="row">
         <div class="grow">
           <div style="font-weight:700">${esc(st.name)}　<span class="dim small">${esc(st.habitat_type||'区分なし')}</span></div>
@@ -5317,22 +6216,37 @@ SCREENS.surveyHub = (svUuid)=>{
     sub:[{text:surveyPeriodText(sv)}, {text:sv.status||'未開始', cls: sv.status==='調査中'?'ok':''},
          envOnly ? {text:'物理環境'} : {text:`${nSp}種 ${surveyTotal(sv)}尾`}],
     html:`
-      ${running
-        ? `<button class="btn pri" onclick="nav('station','${running.uuid}')">記録中の ${esc(running.name)} を開く</button>`
-        : `<button class="btn pri" onclick="newStation('${svUuid}')">${W}を追加する</button>`}
-      ${envOnly ? '' : `<button class="btn"
+      ${地点あり ? `<button class="btn pri"
+        onclick="nav('surveyEdit','${svUuid}')">地図で地点を置く（調査の設定へ）</button>`
+        : (running
+          ? `<button class="btn pri" onclick="nav('station','${running.uuid}')">記録中の ${esc(running.name)} を開く</button>`
+          : `<button class="btn pri" onclick="newStation('${svUuid}')">${W}を追加する</button>`)}
+      ${地点あり || envOnly ? '' : `<button class="btn"
         onclick="nav('surveyEdit','${svUuid}')">地図で地点を置く（調査の設定へ）</button>`}
-      ${envOnly ? '' : `<button class="btn ${単位あり?'ok':''}"
-        onclick="if(fishUseMap('${svUuid}', true)) navReplace('fishMap','${svUuid}')"
+      ${地点あり || envOnly ? '' : `<button class="btn ${単位あり?'ok':''}"
+        onclick="if(fishUseMap('${svUuid}', true)) nav('fishMap','${svUuid}')"
         >地図で記録する${単位あり ? '（つづきから）' : '（調査範囲・瀬淵・ポイント）'}</button>`}
+      ${地点あり && 単位あり && DB.stationsOf(svUuid).some(x=>unitKindOf(x) && !x.spot_uuid)
+        ? `<button class="btn"
+            onclick="nav('fishMap',{survey:'${svUuid}',loose:1})"
+            >地点に属さない以前の記録を見る（魚の地図）</button>` : ''}
+      ${地点あり && DB.stationsOf(svUuid).some(x=>!x.spot_uuid && !x.is_spot
+          && !isMesh(x) && stationKind(sv, x)==='物理環境')
+        ? `<button class="btn"
+            onclick="nav('envMap',{survey:'${svUuid}',loose:1})"
+            >地点に属さない以前の記録を見る（物理環境の地図）</button>` : ''}
 
       <div class="card">
         <div class="row">
           <div class="grow">
             <div class="dim small">いま現場にいるとき</div>
-            <div>${sv.status==='調査中'
-              ? 'GPSで歩いた道すじを記録しています'
-              : '「はじめる」を押すと、時刻が自動で入り、道すじを記録します'}</div>
+            <div>${sv.status!=='調査中'
+              ? '「はじめる」を押すと、時刻が自動で入り、道すじを記録します'
+              : ((()=>{ const t = trackTarget();
+                  return t && t.sv.uuid === svUuid
+                    ? `GPSで歩いた道すじを ${esc(t.st.name||'')} に記録しています`
+                    : '道すじの行き先が決まらないので、いまは記録していません。'
+                      + '記録したい単位で「通電」をはじめてください'; })())}</div>
           </div>
           ${sv.status==='調査中'
             ? `<button class="btn" style="width:auto;margin:0" onclick="endSurvey('${svUuid}')">終える</button>`
@@ -5354,8 +6268,29 @@ SCREENS.surveyHub = (svUuid)=>{
         <div class="dim small">箇所ごとの「使う値」を足したものです。</div>
       </div>`}
 
-      <h3>${isDetail(sv) ? '地点（打った点）' : '箇所（瀬淵ごと）'}</h3>
+      <h3>${地点あり ? '地点' : (isDetail(sv) ? '地点（打った点）' : '箇所（瀬淵ごと）')}</h3>
       ${stations.length ? stCards : `<div class="card dim">まだ${W}がありません。</div>`}
+
+      ${前のやり方.length ? foldHtml('oldst', '前のやり方で作った記録',
+        `<span class="fsub">${前のやり方.length}件</span>`, `
+        <div class="dim small">地図を使わずに作った${esc(W)}です。
+          地点の地図は開けませんが、入力欄からは直せます。</div>
+        ${前のやり方.map(st=>`<button class="btn" onclick="nav('station','${st.uuid}')">
+          ${esc(st.name||'')}
+          <span class="fsub">${DB.catchesOf(st.uuid).length}種 ${stationTotal(st)}尾</span>
+          </button>`).join('')}
+        ${(()=>{
+          // ここで開くのは「前のやり方の記録」だけ。
+          // 地点の running を開くと、地点が旧い入力欄で開き、
+          // 魚や環境を地点へ直接足せてしまう（監査58回目 Major）
+          const 旧running = (isLiveNow(sv) && !isDetail(sv))
+            ? 前のやり方.find(st=>!st.ended_at) : null;
+          return 旧running ? `<button class="btn ok" onclick="nav('station','${旧running.uuid}')">
+            記録中の ${esc(旧running.name)} を開く</button>` : '';
+        })()}
+        ${地点あり ? `<div class="dim small">新しく作るときは、上の地点から
+          「魚類調査」「物理環境調査」の地図を開いてください。</div>`
+          : `<button class="btn" onclick="newStation('${svUuid}')">${esc(W)}を追加する</button>`}`) : ''}
 
       ${envOnly ? '' : foldHtml('hubtally', '集計（全体の）',
         `<span class="fsub">${esc(surveyTallyShort(svUuid))}</span>`,
@@ -5430,6 +6365,10 @@ SCREENS.stationEdit = (arg)=>{
       <div class="card">
         <label>名前</label>
         <input id="s_name" value="${esc(st.name || ((isDetail(sv)?'P.':'St.')+no))}">
+        ${st.is_spot ? `<div class="dim small">これは<b>調査地点</b>です。
+          ここで直せるのは名前・日付・時刻だけ。区間名・地点名・河川形態A・天気・メモは
+          「新しい調査」の地点情報から、川の環境や魚は地点の画面から地図で記録してください。
+          </div>` : `
         <label>環境区分（瀬淵）</label>
         ${segHtml('habitat', OPT.habitat, g('habitat_type'), true)}
         <label>調査区分</label>
@@ -5442,9 +6381,9 @@ SCREENS.stationEdit = (arg)=>{
           : '漁具ごとの数や時間まで残すなら、'
             + `<b>${esc(stWordOf(st))}の「採捕記録」</b>から入れてください。`}</div>
         <label>水温（℃）</label>
-        <input id="s_wt" inputmode="decimal" value="${esc(g('water_temp'))}">
+        <input id="s_wt" inputmode="decimal" value="${esc(g('water_temp'))}">`}
       </div>
-      ${!isDetail(sv) ? '' : `<div class="card">
+      ${(!isDetail(sv) || st.is_spot) ? '' : `<div class="card">
         <h3 style="margin-top:0">この地点の位置</h3>
         <div class="row">
           <div class="grow"><label>緯度</label>
@@ -5501,7 +6440,7 @@ SCREENS.stationEdit = (arg)=>{
         <div class="warnbox">開始の時刻は必ず入れてください。
           空だと、取り込み側が別々の瀬淵を1つの箇所にまとめてしまいます。</div>
       </div>
-      <div class="card">
+      ${st.is_spot ? '' : `<div class="card">
         <h3 style="margin-top:0">環境の取り方</h3>
         <div onclick="setTimeout(onStationMethod,0)">
           ${segHtml('envm2', OPT.envMethod, envMethod(isNew ? {env_method:defMethod} : st))}</div>
@@ -5560,9 +6499,9 @@ SCREENS.stationEdit = (arg)=>{
         <div class="dim small" id="s_lineGps"></div>
         <label>流量（分かるときだけ・m³/s）</label>
         <input id="s_flow" inputmode="decimal" value="${esc(g('flow_rate'))}">
-      </div>
+      </div>`}
 
-      <div class="card">
+      ${st.is_spot ? '' : `<div class="card">
         <h3>川底と流れ（分かる範囲で）</h3>
         <label>河床材料（いちばん多いもの）</label>
         ${segHtml('sub1', OPT.substrate, g('substrate1'), true)}
@@ -5573,13 +6512,16 @@ SCREENS.stationEdit = (arg)=>{
           箇所の画面の「川の環境を記録する」から入れます。</div>
         <label>メモ</label>
         <textarea id="s_memo">${esc(g('memo'))}</textarea>
-      </div>
-      ${photoPanelHtml('その場所のようす。上流向き・下流向きの景観など。')}
+      </div>`}
+      ${(st.is_spot && !(st.photos||[]).length) ? ''
+        : photoPanelHtml('その場所のようす。上流向き・下流向きの景観など。')}
       <button class="btn pri" onclick="saveStation('${svUuid}','${arg.uuid||''}')">
         ${isNew ? (isLiveNow(sv) ? `この${stWord(sv)}をはじめる` : `この${stWord(sv)}を追加する`)
                 : '保存する'}</button>
       ${isNew ? `<input type="hidden" id="s_no" value="${no}">` : ''}
-      ${isNew?'':`<button class="btn ng" onclick="deleteStation('${arg.uuid}')">この${stWord(sv)}を削除する</button>`}
+      ${isNew?'':`<button class="btn ng" onclick="${st.is_spot
+        ? `spotRemove('${arg.uuid}')` : `deleteStation('${arg.uuid}')`}"
+        >この${st.is_spot ? '地点' : stWord(sv)}を削除する</button>`}
     `,
     onMount(){
       if(isDetail(sv)){
@@ -5606,7 +6548,7 @@ SCREENS.stationEdit = (arg)=>{
       const key = 'station:'+(arg.uuid || ('new:'+svUuid));
       SCREENS._photos = ((st && st.photos)||[]).slice();   // 先にこの箇所の写真に入れ替える
       const base = collectStation();    // 書きかけを戻す前の姿を控える
-      const d = draftGet(key);
+      const d = draftForForm(key);
       if(d){
         applyVals({'#s_name':d.name, '#s_wt':d.water_temp,
           '#s_memo':d.memo, '#s_lat':d.latitude, '#s_lon':d.longitude,
@@ -5763,6 +6705,13 @@ function saveStation(svUuid, stUuid, opt){
   // 調査日が今日でないときは入れない（あとから書き起こしている最中なので、
   // 今の時刻を入れると実際の調査時刻と食い違う）
   if(isNew && !rec.survey_time_start && isLiveNow(sv)) rec.survey_time_start = timeValue();
+  // 地点（目印）に「環境の取り方」を書くと、物理環境の記録として扱われ、
+  // 地点の並びからも地図からも消える。子の記録だけが残って手が届かなくなる
+  //（監査40回目 Critical）。地点では、この画面から環境まわりを書き戻さない
+  // 地点（目印）と、魚の単位（E・P/F・P）には環境の取り方を書き戻さない。
+  // 書くと、同じ記録が魚の単位でありながら物理環境の記録にもなり、
+  // 書き出しで二重に扱われる（監査41回目 Major）
+  if(!rec.is_spot && !unitKindOf(rec)){
   rec.env_method        = (f.env_method==='ライン' || f.env_method==='メッシュ')
                             ? f.env_method : '点';
   if(rec.env_method==='ライン'){
@@ -5775,9 +6724,16 @@ function saveStation(svUuid, stUuid, opt){
     rec.line_end_acc    = numOf(f.line_end_acc);
     rec.flow_rate       = numOf(f.flow_rate);
   }
-  rec.habitat_type      = f.habitat_type;
-  rec.survey_type       = f.survey_type || '採取';
-  rec.survey_method     = f.survey_method;
+  }
+  // 地点（目印）には、川の環境の値も書き戻さない。
+  // 書けてしまうと、地図で入れた記録と二重になる（監査42回目 Major）
+  if(!rec.is_spot) rec.habitat_type = f.habitat_type;
+  // 地点では、調査区分・調査方法の欄も出していない。
+  // 出していない欄を書き戻さない（監査49回目 Critical）
+  if(!rec.is_spot){
+    rec.survey_type     = f.survey_type || '採取';
+    rec.survey_method   = f.survey_method;
+  }
   const serr = rangeCheck([['水温', f.water_temp, -5, 45],
     ['代表の水深', f.depth_rep_cm, 0, 2000], ['代表の流速', f.velocity_rep_cms, 0, 1000],
     ['緯度', f.latitude, 20, 50], ['経度', f.longitude, 120, 155],
@@ -5785,12 +6741,26 @@ function saveStation(svUuid, stUuid, opt){
     ['始点の緯度', f.line_start_lat, 20, 50], ['始点の経度', f.line_start_lon, 120, 155],
     ['終点の緯度', f.line_end_lat, 20, 50], ['終点の経度', f.line_end_lon, 120, 155]]);
   if(serr){ toast(serr, 6000); return; }
-  rec.water_temp        = numOf(f.water_temp);
-  rec.substrate1        = f.substrate1;
-  rec.gravel_condition  = f.gravel_condition;
-  rec.memo              = f.memo;
-  rec.photos            = (SCREENS._photos||[]).slice();
-  if(isDetail(sv)){
+  if(!rec.is_spot){
+    rec.water_temp      = numOf(f.water_temp);
+    rec.substrate1      = f.substrate1;
+    rec.gravel_condition= f.gravel_condition;
+  }
+  // 地点には水深・流速も入れない。入ると、地図で入れた測点と二重系統になる
+  //（監査43回目 Major）
+  // 地点のメモは「地点情報」の欄だけで直す。2か所から書けると、
+  // 古い打ちかけが新しいメモを上書きする（監査44回目 Major）
+  if(!rec.is_spot) rec.memo = f.memo;
+  // 地点には新しく写真を付けない。ただし前の版で付いた写真は、
+  // 画面に出している間だけ、消したり並べ替えたりできる（監査50回目 Major）
+  if(!rec.is_spot || (rec.photos||[]).length){
+    rec.photos = (SCREENS._photos||[]).slice();
+  }
+  // 地点（目印）では、この先をまるごと通さない。
+  // 緯度経度の欄を画面から消したのに書き戻していたため、
+  // 「この地点の設定」を保存するだけで地点の位置が消え、
+  // 勝手に終わった扱いにもなっていた（監査44回目 Critical）
+  if(isDetail(sv) && !rec.is_spot){
     // 点は打った時点で1つの記録。区間のように「はじめて終える」ものではない
     rec.ended_at = rec.ended_at || nowISO();
     // 時刻の幅を持たないので、終わりは始まりと同じにする。
@@ -5815,8 +6785,10 @@ function saveStation(svUuid, stUuid, opt){
       }
     }
   }
-  window._stPosSource=null; window._stPosAcc=null;
   const ok = DB.upsert(DB.key.st, rec);
+  // 一時値は、保存できてから消す。先に消すと、保存に失敗して
+  // やり直したときに位置の決め方と精度が落ちる（監査70回目 Minor）
+  if(ok){ window._stPosSource=null; window._stPosAcc=null; }
   if(ok) photoOwnerDone(rec.photos);       // 付いたので、印は外す
   if(!ok) return;                       // 保存できていないので書きかけを消さない
   draftClear('station:'+(stUuid || ('new:'+svUuid)));
@@ -5827,6 +6799,9 @@ function saveStation(svUuid, stUuid, opt){
   if(isNew) goTo('station', rec.uuid); else goBack();
 }
 function deleteStation(u){
+  // 地点は、この道からは消さない。子の記録が取り残される（監査56回目 Critical）
+  const st0 = DB.liveStation(u);
+  if(st0 && st0.is_spot){ spotRemove(u); return; }
   const st = DB.get(DB.key.st, u);
   const n = DB.catchesOf(u).length;
   const W = stWordOf(st);
@@ -5865,6 +6840,7 @@ SCREENS.station = (stUuid)=>{
          (sv && isLiveNow(sv) && !isDetail(sv) && !st.ended_at) ? {text:'記録中', cls:'ok'}
            : (st.ended_at && !isDetail(sv) ? {text:'終了'} : null)].filter(Boolean),
     html:`
+      ${recDayWarnHtml(sv, st)}
       ${isEnvSurvey(sv) ? ''
         : `<button class="btn pri" onclick="nav('speciesPick','${stUuid}')">魚を記録する</button>`}
       ${isLine(st) ? `<div class="card">
@@ -5998,7 +6974,7 @@ SCREENS.station = (stUuid)=>{
       startGps();
       const dkey = 'effort:'+stUuid;
       const dbase = collectEffort();
-      const dd = draftGet(dkey);
+      const dd = draftForForm(dkey);
       if(dd){ applyEffort(dd); toast('採捕記録の書きかけを戻しました'); }
       draftBind(dkey, collectEffort, dbase);
       if(effortRunning(st)){
@@ -6014,15 +6990,53 @@ SCREENS.station = (stUuid)=>{
 };
 
 /* 通電のスタート・ストップ。押した時刻だけを覚え、表示は時計から作る */
+/* 通電のスタート・ストップ。
+   地点（目印）では、時刻と道すじだけを残して通電の秒数は積まない。
+   積むと、地図の単位でも通電を測ったときに同じ労力を二重に数える（監査33回目 Major） */
 function toggleEffort(stUuid){
+  const st0 = DB.liveStation(stUuid); if(!st0) return;
+  // 押すと画面を作り直すので、打っている漁具を先に書く。
+  // ただし、止めるときは漁具の不備で足止めしない。
+  // 止められないあいだ時計が動き続け、通電の時間が水増しされる（監査61回目 Major）
+  const 止める = !!st0.effort_started_at || (st0.is_spot && !st0.ended_at);
+  const 書けた = $('#gearBox') ? saveEffort(stUuid, {quiet:true}) : true;
+  if(!書けた && !止める) return;
+  // 知らせは、保存できてから1回だけ出す。先に出すと、あとの知らせに
+  // 上書きされて、人には普通に保存できたようにしか見えない（監査62回目 Major）
+  const 伝える = (文)=>toast(書けた ? 文
+    : (文 + '。採捕記録は打ちかけのまま残しています。'
+       + '足りないところを直してから、保存してください'), 書けた ? 3000 : 9000);
+  // 漁具を書いたあとに読み直す。先に読んだ中身を書き戻すと、
+  // いま保存したばかりの漁具が消える（監査34回目 Critical）
   const st = DB.liveStation(stUuid); if(!st) return;
+  if(st.is_spot){
+    // 地点は通電を持たない決まりだが、前の版で入った秒数を
+    // 「終える」の副作用で消してはいけない（監査56回目 Critical）。
+    // 押しっぱなしの状態だけ、いまの秒数にして止める
+    // 止めるだけ。effortSeconds() は「いままでの秒数＋押していた分」を返すので、
+    // ここで代入すると、前の版の値が何時間分にも膨らむ（監査57回目 Critical）
+    if(st.effort_started_at) delete st.effort_started_at;
+    if(st.ended_at){
+      delete st.ended_at;
+      if(DB.upsert(DB.key.st, st)){ 伝える('この地点の記録を再開しました'); render(); }
+    }else{
+      st.ended_at = nowISO();
+      // 終わりの時刻を自動で入れるのは、きょうの分を現場で記録しているときだけ。
+      // 過去の日を書き起こしているときに入れると、調査日と時刻が食い違う
+      //（監査53回目 Major）
+      const sv0 = DB.getAlive(DB.key.sv, st.survey_uuid);
+      if(!st.survey_time_end) st.survey_time_end = autoTime(sv0);
+      if(DB.upsert(DB.key.st, st)){ 伝える('この地点を終えました'); render(); }
+    }
+    return;
+  }
   if(effortRunning(st)){
     st.effort_seconds = Math.round(effortSeconds(st));
     delete st.effort_started_at;
-    if(DB.upsert(DB.key.st, st)){ toast(`通電 ${fmtDur(st.effort_seconds)}`); render(); }
+    if(DB.upsert(DB.key.st, st)){ 伝える(`通電 ${fmtDur(st.effort_seconds)}`); render(); }
   }else{
     st.effort_started_at = nowISO();
-    if(DB.upsert(DB.key.st, st)){ toast('通電をはじめました'); render(); }
+    if(DB.upsert(DB.key.st, st)){ 伝える('通電をはじめました'); render(); }
   }
 }
 /* 採捕記録（漁具と労力）を保存する。
@@ -6083,6 +7097,101 @@ let ENV_SEL = null;          // いま選んでいる記録のID
 
 /* 魚の調査の地図。囲い（E・P/F）と点（P）を置く（魚類調査イメージ.pptx） */
 let FISH_NEXT = {kind:'PF', draw:'', survey:''};
+/* 地図の「いま何をしているか」は、調査＋地点ごとに分けて持つ。
+   分けないと、P1で描きかけた囲いや、終わっていないラインが P2 に残り、
+   P2でタップした座標が P1 の記録に足される（監査33回目 Critical）。
+   持ち替えるだけで捨てないので、P1へ戻れば描きかけの続きから再開できる */
+let SEL_SPOT_AT = '';
+const MAP_WORK = {};
+/* 地図へ「入り直した」かどうかは、画面を移った回数で見る。
+   同じ画面のなかの描き直しでは選びかけを保ち、
+   地点へ戻ってから同じ地図を開いたときは選び直しから始める（監査55回目 Major） */
+let SEL_NAV_AT = -1;
+function selResetOnSpotChange(svUuid, spot){
+  const key = mapViewKey(svUuid, spot);
+  const 入り直した = SEL_NAV_AT !== NAV_SEQ;
+  SEL_NAV_AT = NAV_SEQ;
+  if(SEL_SPOT_AT === key && !入り直した) return;
+  if(SEL_SPOT_AT === key && 入り直した){
+    // 同じ地点へ入り直しただけ。描きかけは残し、選んでいる記録だけ手放す
+    FISH_SEL = null; FISH_PICK = ''; ENV_SEL = null;
+    try{ ENV_MOVE = null; }catch(e){}
+    try{ ENV_PICK = null; }catch(e){}
+    return;
+  }
+  // 覚えておくのは「描きかけ」だけ。
+  // 選んでいる記録まで覚えて戻すと、調査を開き直したときに
+  // envUseSurvey/fishUseSurvey の「持ち越さない」を打ち消してしまう
+  if(SEL_SPOT_AT) MAP_WORK[SEL_SPOT_AT] = {draw: FISH_NEXT.draw, line: ENV_NEXT.line};
+  // 調査そのものが変わったら、つぎに足すものも最初に戻す。
+  // 地点だけが変わったなら、選んでいる種類はそのまま使う
+  const 前の調査 = String(SEL_SPOT_AT||'').split('|')[0];
+  const 同じ調査 = !!SEL_SPOT_AT && 前の調査 === svUuid;
+  SEL_SPOT_AT = key;
+  // 「位置を直す」「選んで消す」も持ち越さない。
+  // 持ち越すと、P2の地図タップで P1 の記録が動く（監査39回目 Critical）
+  try{ ENV_MOVE = null; }catch(e){}
+  try{ ENV_PICK = null; }catch(e){}
+  const w = MAP_WORK[key] || {};
+  FISH_NEXT = {kind: 同じ調査 ? FISH_NEXT.kind : 'PF',
+               draw: w.draw || '', survey: svUuid};
+  ENV_NEXT  = {kind: 同じ調査 ? ENV_NEXT.kind : 'P',
+               auto: 同じ調査 ? ENV_NEXT.auto : false,
+               line: w.line || '', survey: svUuid};
+  FISH_SEL = null; FISH_PICK = ''; ENV_SEL = null;
+}
+/* この地点の地図で作った記録か。地点から開いていないときは、調査ぜんぶが対象 */
+function ofSpot(st, spot){
+  if(MAP_LOOSE && !spot) return !!st && !st.spot_uuid;
+  return !spot || (st && st.spot_uuid === spot);
+}
+/* 地図に出す記録を取り出す。
+   地点から開いているときは、その地点で作った分だけ。
+   調査から直接開いたときは、調査ぜんぶ（監査35回目 Major）。
+   kind: 'fish'（E・P/F・P）／'env'（測点・ライン） */
+function mapStations(svUuid, kind, spot){
+  const sp = (spot === undefined) ? MAP_SPOT : spot;
+  const sv = DB.getAlive(DB.key.sv, svUuid);
+  return DB.stationsOf(svUuid).filter(st=>{
+    if(isMesh(st) || st.is_spot) return false;
+    if(!ofSpot(st, sp)) return false;
+    if(kind === 'fish') return !!unitKindOf(st);
+    // 物理環境は「物理環境の記録」だけ。前のやり方の箇所を混ぜると、
+    // そこへ環境の値を書き込めてしまう（監査38回目 Major）
+    return stationKind(sv, st) === '物理環境';
+  });
+}
+/* 地図の画面を開くときに、どの地点で開くかを決める。
+   画面の中身を組み立てる前に呼ぶこと。onMount で決めていたら、
+   一覧を作る時点ではまだ空で、調査ぜんぶが並んでいた（監査36回目 Critical）。
+   消えた地点や別の調査の地点を渡されたら、地点なしとして開く */
+function mapEnterSpot(svUuid, spot, loose){
+  const st = spot ? DB.liveStation(spot) : null;
+  MAP_SPOT = (st && st.is_spot && st.survey_uuid === svUuid) ? spot : '';
+  MAP_LOOSE = !MAP_SPOT && !!loose;
+  return MAP_SPOT;
+}
+/* この地点にぶら下がる記録（地点そのもの＋その地図で作ったもの）。
+   地点画面の集計が、地図で入れた魚を数えていなかった（監査33回目 Major） */
+function spotStations(stUuid){
+  const st = DB.liveStation(stUuid); if(!st) return [];
+  return [st].concat(DB.stationsOf(st.survey_uuid)
+    .filter(x=>x.uuid!==stUuid && x.spot_uuid===stUuid));
+}
+/* この地点の種数・尾数。二重に数えないよう、記録は各単位の自分の分だけ足す */
+function spotTotals(stUuid){
+  const 種 = {};
+  let 尾 = 0;
+  spotStations(stUuid).forEach(x=>{
+    DB.catchesOf(x.uuid).forEach(c=>{
+      const t = catchTotal(c);
+      const k = c.species_id || c.species_name;
+      if(!k || t<=0) return;
+      種[k] = true; 尾 += t;
+    });
+  });
+  return {種: Object.keys(種).length, 尾: 尾};
+}
 function fishUseSurvey(svUuid){
   if(FISH_NEXT.survey === svUuid) return;
   // 別の調査へ移ったら、選んでいたものも外す。
@@ -6101,6 +7210,32 @@ function fishDrawing(){
   const st = DB.liveStation(FISH_NEXT.draw);
   return (st && isUnitPoly(st)) ? st : null;
 }
+/* まだ閉じていない囲いか。記録に残した印で見るので、読み込み直しても分かる。
+   印の無い前の版のものは、閉じたものとして扱う（監査61回目 Critical） */
+function polyDrawing(st){
+  return !!(st && isUnitPoly(st) && st.poly_state === 'drawing');
+}
+/* 消す前に、その記録の打ちかけを書いてしまう。
+   書けないうちに消すと、打った内容がどこにも残らず、
+   ごみ箱から戻しても戻ってこない（監査65回目 Critical）。
+   書けなかったときは false を返し、呼ぶ側は消さない */
+function flushBeforeDelete(stUuid){
+  try{
+    if($('#gearBox') && !saveEffort(stUuid, {quiet:true})) return false;
+    if(typeof ENV_FORM !== 'undefined' && ENV_FORM === stUuid && ENV_DIRTY){
+      if(!envAutoSaveNow(stUuid)) return false;
+    }
+    if(typeof SPOT_SV !== 'undefined' && SPOT_SV && $('#sp_section')){
+      const cur = (typeof spotCur === 'function') ? spotCur(SPOT_SV) : null;
+      if(cur && cur.uuid === stUuid && !spotInfoSave()) return false;
+    }
+  }catch(e){ return false; }   // 保存の途中で転んだら、消さない
+  return true;
+}
+/* 記録として数えてよい単位か。描きかけの囲いは、まだ数えない。
+   数えると、描き始めただけで箇所数が増え、旧地点の通電が集計から消える
+   （監査62回目 Major）。地図に出すのと、続きから描くのは別 */
+function unitReady(st){ return !polyDrawing(st); }
 /* 置く。囲いは角を1つずつ足していく */
 function fishAddAt(svUuid, lat, lon, acc){
   const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return null;
@@ -6108,6 +7243,14 @@ function fishAddAt(svUuid, lat, lon, acc){
     toast('このタブでは追加できません。記録を入れているタブでお試しください', 6000);
     return null;
   }
+  // 「地点に属さない以前の記録」を見ているだけの画面では、新しく作らせない。
+  // 作ると、どの地点にも属さない記録がまた増える（監査52回目 Major）
+  if(MAP_LOOSE){
+    toast('ここは、地点に属さない以前の記録を見る画面です。'
+      + '新しく作るときは、地点を選んでから開いてください', 8000);
+    return null;
+  }
+
   const la = +(+lat).toFixed(6), lo = +(+lon).toFixed(6);
   if(!validPt([la, lo])){ toast('位置がおかしいので追加できません'); return null; }
   const now = timeValue();
@@ -6129,8 +7272,12 @@ function fishAddAt(svUuid, lat, lon, acc){
   if(no===null){ toast('番号が大きすぎて、これ以上置けません', 7000); return null; }
   const rec = {
     uuid: uuid(), survey_uuid: svUuid, station_no: no,
+    // どの地点の地図で作ったかを覚える。地点に入れた天気・区間名などを
+    // 書き出しへ渡すために使う（記録そのものは今までどおり調査にぶら下がる）
+    spot_uuid: MAP_SPOT || '',
+    survey_date: recDay(sv),
     unit_kind: k, name: unitAutoName(svUuid, k, all),
-    started_at: nowISO(), survey_time_start: now,
+    started_at: nowISO(), survey_time_start: autoTime(sv),
     survey_type: sv.survey_type_default || '目視',
     env_points: [],
   };
@@ -6138,9 +7285,18 @@ function fishAddAt(svUuid, lat, lon, acc){
     rec.latitude = la; rec.longitude = lo;
     rec.gps_accuracy = (acc===undefined || acc===null) ? '' : Math.round(acc);
     rec.position_source = (acc===undefined || acc===null) ? '地図' : 'GPS';
-    rec.survey_time_end = now; rec.ended_at = nowISO();
+    rec.survey_time_end = rec.survey_time_start; rec.ended_at = nowISO();
   }else{
     rec.poly = [{lat:la, lon:lo}];
+    // 描きかけであることを、記録そのものに残す。画面の中の変数だけだと、
+    // 読み込み直したときに「閉じた囲い」に見えてしまう（監査61回目 Critical）
+    rec.poly_state = 'drawing';
+  }
+  // 親になる囲いに、その囲い自身の記録が入っていたら置かせない。
+  // 置くと、集計と努力量で数え方が食い違う（監査35回目 Major）
+  if(k === 'P'){
+    const 断り = unitParentBlocked(rec, all.concat([rec]));
+    if(断り){ toast(断り, 10000); return null; }
   }
   if(!DB.upsert(DB.key.st, rec)) return null;
   if(k === 'P'){
@@ -6188,6 +7344,12 @@ function fishClosePoly(svUuid){
   if(!st){ toast('いま描いている囲いがありません'); return false; }
   const 具合 = polyProblem(polyPts(st));
   if(具合){ toast(具合, 8000); return false; }
+  const 断り = unitParentBlocked(st, DB.stationsOf(svUuid).filter(x=>unitKindOf(x)));
+  if(断り){ toast(断り, 10000); return false; }
+  // 閉じたことを記録に残す。残さないと、読み込み直しに耐えられない
+  const st2 = DB.liveStation(st.uuid);
+  if(st2){ delete st2.poly_state; if(!DB.upsert(DB.key.st, st2)){
+    toast('閉じたことを保存できませんでした。もう一度お試しください', 8000); return false; } }
   FISH_NEXT = {kind:FISH_NEXT.kind, draw:'', survey:svUuid};
   unitRelink(svUuid);
   const 中 = unitChildren(st.uuid, DB.stationsOf(svUuid)).length;
@@ -6202,22 +7364,93 @@ function fishCancelPoly(){
   if(!DB.softDelete(DB.key.st, st.uuid)) return false;
   FISH_NEXT = {kind:FISH_NEXT.kind, draw:'', survey:FISH_NEXT.survey};
   if(FISH_SEL === st.uuid) FISH_SEL = null;
+  unitRelink(st.survey_uuid);     // 消えた囲いを親に持ったままにしない
   toast('やめました');
   return true;
 }
 let FISH_SEL = null, FISHLAYER = [], FISH_VIEW = {}, FISH_MAP_SV = '';
 function fishSelect(u){
+  // 選び替える前に、採捕記録の打ちかけを書く（書けなければ動かさない）
+  if($('#gearBox') && FISH_SEL && !saveEffort(FISH_SEL, {quiet:true})) return;
   if(FISH_SEL === u) return;
   FISH_SEL = u;
   render();
+}
+/* 置いた記録の日付。何日かにわたる調査で入れ忘れると、
+   2日目以降の記録が初日に計上される（監査34回目 Major）。
+   今日が調査の期間内なら今日。外なら、はじめの日にそろえる */
+/* 何日かにわたる調査で、いま記録する日。
+   きょうが調査の期間から外れていると、これまでは必ず初日になっていた。
+   過去の調査をあとから書き起こすときに、2日目以降を入れる手が無かった
+   （監査47回目 Major）。画面で選べるようにして、選んだ日を覚えておく */
+let REC_DAY = {sv:'', day:''};
+function recDay(sv){
+  if(sv && REC_DAY.sv === sv.uuid && REC_DAY.day
+     && surveyDays(sv).indexOf(REC_DAY.day) >= 0) return REC_DAY.day;
+  return todayInSurvey(sv);
+}
+/* 記録する日が「きょう」で、いま現場にいるときだけ、時刻を自動で入れる。
+   過去の日を選んで後から書き起こしているのに端末の時刻を入れると、
+   調査日は過去・時刻は入力日、という食い違った記録になる（監査49回目 Major） */
+function autoTime(sv){
+  return (recDay(sv) === dateValue() && isLiveNow(sv)) ? timeValue() : '';
+}
+function recDaySet(svUuid, day){
+  REC_DAY = {sv: svUuid, day: day || ''};
+  const sv = DB.getAlive(DB.key.sv, svUuid);
+  toast(`これから置く記録は ${fmtDate(recDay(sv))} の分になります`, 5000);
+  render();
+}
+/* いま開いている記録の日と、選んでいる「記録する日」が違うときの知らせ。
+   この記録に足したものは、選んだ日ではなく、この記録の日の分になる。
+   足すのを止めはしない（前の日の記録を直せなくなるため）が、
+   黙って別の日に入ってしまわないよう、必ず画面に出す（監査48回目 Major） */
+function recDayWarnHtml(sv, st){
+  if(!sv || !st || surveyDays(sv).length <= 1) return '';
+  const この記録 = stationDate(st, sv);
+  const いま = recDay(sv);
+  if(!この記録 || !いま || この記録 === いま) return '';
+  const 短く = d => String(d).slice(5).replace('-','/');
+  return `<div class="warnbox">これは <b>${esc(短く(この記録))}</b> の記録です
+    （いま選んでいる記録する日：${esc(短く(いま))}）。<br>
+    ここに足したものは <b>${esc(短く(この記録))}</b> の分になります。
+    ${esc(短く(いま))} の分にしたいときは、その日の単位を新しく作ってください。</div>`;
+}
+/* 記録する日の選び手。1日だけの調査では出さない */
+function recDayBarHtml(sv){
+  const days = surveyDays(sv);
+  if(!sv || days.length <= 1) return '';
+  const いま = recDay(sv);
+  const 外 = days.indexOf(dateValue()) < 0;
+  return `<div class="card" style="padding:10px 12px">
+    <label style="margin-top:0">記録する日</label>
+    <div class="seg">${days.map(d=>`<button type="button"
+      class="${d===いま?'on':''}" onclick="recDaySet('${sv.uuid}','${d}')"
+      >${esc(String(d).slice(5).replace('-','/'))}</button>`).join('')}</div>
+    <div class="dim small" style="margin-top:6px">${外
+      ? 'きょうは調査の期間の外です。どの日の記録かを選んでください。'
+      : 'ここで置いた記録は、選んだ日の分になります。'}</div>
+  </div>`;
+}
+function todayInSurvey(sv){
+  const days = surveyDays(sv);
+  const t = dateValue();
+  if(days.indexOf(t) >= 0) return t;
+  return days[0] || String((sv && sv.survey_date) || '').slice(0,10);
 }
 /* 地図の画面は「調査」で開くほか、「地点」からも開ける。
    地点は大まかな目印なので、**地図をその場所で開くためだけ**に使う。
    記録の持ち方（E・P/F・P、ライン・測点）は今までどおり調査にぶら下がる（2026-08-21） */
 function mapArg(arg){
-  if(arg && typeof arg === 'object') return {sv: arg.survey || '', spot: arg.spot || ''};
-  return {sv: arg || '', spot: ''};
+  if(arg && typeof arg === 'object'){
+    return {sv: arg.survey || '', spot: arg.spot || '', record: arg.record || '',
+            loose: !!arg.loose};
+  }
+  return {sv: arg || '', spot: '', record: '', loose: false};
 }
+/* 「地点に属さない以前の記録」だけを見ているか。
+   このときは、その分だけを地図に出し、新しくは作らせない（監査52回目 Major） */
+let MAP_LOOSE = false;
 /* いま地図を開いている地点。調査から開いたときは空。
    覚えた場所を取り違えないよう、1か所だけで持つ */
 let MAP_SPOT = '';
@@ -6235,7 +7468,9 @@ function spotCenter(spot){
 function fromSpotHtml(spot){
   const st = spot ? DB.liveStation(spot) : null;
   if(!st) return '';
-  return `<div class="card tap" style="padding:8px 12px" onclick="goBack()">
+  // goBack() だと、全体地図から開いたときに全体地図へ戻ってしまう。
+  // 帯に書いてあるとおり、地点へ行く（監査48回目 Major）
+  return `<div class="card tap" style="padding:8px 12px" onclick="goTo('spot','${st.uuid}')">
     <span class="chip">${esc(st.name||'地点')}</span>
     <span class="dim small">から開いています。押すと地点へ戻ります</span></div>`;
 }
@@ -6252,7 +7487,7 @@ function fishDrawAll(svUuid){
   const map = MAPS.main.map; if(!map) return;
   try{ FISHLAYER.forEach(x=>map.removeLayer(x)); }catch(e){}
   FISHLAYER = [];
-  const list = DB.stationsOf(svUuid).filter(x=>unitKindOf(x));
+  const list = mapStations(svUuid, 'fish');
   list.forEach(st=>{
     const k = unitKindOf(st);
     const on = st.uuid === FISH_SEL;
@@ -6267,7 +7502,7 @@ function fishDrawAll(svUuid){
     }
     const pts = polyPts(st);
     if(!pts.length) return;
-    const 描き中 = FISH_NEXT.draw === st.uuid;
+    const 描き中 = polyDrawing(st);
     if(pts.length >= 3 && !描き中){
       FISHLAYER.push(L.polygon(pts, {color:col, weight:on?4:3, opacity:.95,
         fillColor:col, fillOpacity:on?.22:.12, bubblingMouseEvents:false})
@@ -6291,7 +7526,7 @@ function fishDrawAll(svUuid){
 }
 function fishAllPoints(svUuid){
   const pts = [];
-  DB.stationsOf(svUuid).filter(x=>unitKindOf(x)).forEach(st=>{
+  mapStations(svUuid, 'fish').forEach(st=>{
     if(unitKindOf(st)==='P'){ const p = stationPt(st); if(p) pts.push(p); }
     else polyPts(st).forEach(v=>pts.push(v));
   });
@@ -6315,7 +7550,7 @@ function envItemFormWire(cur, sv){
   const base = collectEnvItem();
   // 見ているだけのタブでは、書きかけを持たない。
   // 持つと、記録を入れているタブの書きかけを上書きしてしまう（監査 Major）
-  const d = ownsLock() ? draftGet(key) : null;
+  const d = ownsLock() ? draftForForm(key) : null;
   if(d){
     applySels(d);
     applySegRaw('envhab', d.__hab);
@@ -6542,7 +7777,7 @@ function fishSaveCount(caUuid){
     toast('このタブでは入れられません。記録を入れているタブでお試しください', 7000);
     return false;
   }
-  const v = strVal('#fc_'+caUuid);
+  const v = strVal('#fc_'+cssId(caUuid));
   if(v !== '' && countOf(v) === null){
     toast('尾数は0以上の整数で入れてください（空でも構いません）', 6000);
     return false;
@@ -6552,7 +7787,7 @@ function fishSaveCount(caUuid){
     toast('保存できませんでした（端末の空き容量をご確認ください）', 8000);
     return false;
   }
-  const mark = $('#fc_saved_'+caUuid);
+  const mark = $('#fc_saved_'+cssId(caUuid));
   if(mark) mark.textContent = '保存しました（' + timeValue() + '）';
   return true;
 }
@@ -6604,9 +7839,33 @@ function trashName(k, x){
   return x.name || '（名前なし）';
 }
 /* 親をたどる。戻すときは、親も一緒に戻さないと見えないままになる */
+/* 親をさかのぼって、ぜんぶ数える。
+   1段しか見ないと、順に消してから末端だけ戻したときに
+   消えた地点や上の単位を指す記録が残る（監査42回目 Minor） */
+function trashAncestors(k, x, 見た){
+  見た = 見た || {};
+  const out = [];
+  trashParents(k, x).forEach(p=>{
+    const key = p.k + ':' + p.uuid;
+    if(見た[key]) return;
+    見た[key] = true;
+    out.push(p);
+    const t = trashKindOf(p.k);
+    const 親 = t ? DB.get(t.key(), p.uuid) : null;
+    if(親) trashAncestors(p.k, 親, 見た).forEach(q=>out.push(q));
+  });
+  return out;
+}
 function trashParents(k, x){
   const out = [];
   if(k==='st' && x.survey_uuid) out.push({k:'sv', uuid:x.survey_uuid});
+  // その記録を作った地点も、消えていたら一緒に戻す。
+  // 戻さないと、消えた地点を指す記録だけがよみがえり、
+  // 地点の地図にも旧記録の入口にも出ず、画面から手が届かなくなる（監査41回目 Critical）
+  if(k==='st' && x.spot_uuid && x.spot_uuid !== x.uuid){
+    out.push({k:'st', uuid:x.spot_uuid});
+  }
+  if(k==='st' && x.parent_uuid) out.push({k:'st', uuid:x.parent_uuid});
   if(k==='nt' && x.survey_uuid) out.push({k:'sv', uuid:x.survey_uuid});
   if(k==='ca'){
     if(x.station_uuid) out.push({k:'st', uuid:x.station_uuid});
@@ -6624,9 +7883,10 @@ function trashRestore(k, uuid){
   const x = DB.get(t.key(), uuid);
   if(!x){ toast('その記録はもうありません'); return false; }
   const 一緒に = [];
-  trashParents(k, x).forEach(pa=>{
+  // 親だけでなく、その上の親までさかのぼる（監査42回目 Minor）
+  trashAncestors(k, x).forEach(pa=>{
     const p = DB.get(trashKindOf(pa.k).key(), pa.uuid);
-    if(p && p.deleted_at) 一緒に.push(pa);
+    if(p && p.deleted_at && !一緒に.some(q=>q.k===pa.k && q.uuid===pa.uuid)) 一緒に.push(pa);
   });
   // 親から順に戻す。親が戻らないまま子だけ戻すと、見えない記録になる
   // （2026-08-20 の監査 Major）
@@ -6644,6 +7904,31 @@ function trashRestore(k, uuid){
     });
     toast(片付いた
       ? '戻せませんでした（端末の空き容量をご確認ください）。ごみ箱のままです'
+      : '戻せませんでした。しかも途中まで戻ってしまいました。'
+        + '空きを作ってから、ごみ箱をご確認ください', 12000);
+    return false;
+  }
+  // 親子を付け直す。消すときに子の親を外しているので、
+  // 戻しただけでは親子が戻らず、箇所数や距離が二重に数えられる（監査64回目 Major）
+  const 調査たち = {};
+  戻した.forEach(pa=>{
+    if(pa.k !== 'st') return;
+    const r = DB.get(DB.key.st, pa.uuid);
+    if(r && r.survey_uuid) 調査たち[r.survey_uuid] = true;
+  });
+  let 付け直せた = true;
+  Object.keys(調査たち).forEach(su=>{ if(!unitRelink(su)) 付け直せた = false; });
+  // 地点を戻したら、代表の位置も決め直す（監査65・66回目 Major）
+  Object.keys(調査たち).forEach(su=>{ if(!spotPosFix(su)) 付け直せた = false; });
+  if(!付け直せた){
+    let 片付いた = true;
+    戻した.forEach(done=>{
+      try{ if(!DB.softDelete(trashKindOf(done.k).key(), done.uuid)) 片付いた = false; }
+      catch(e){ 片付いた = false; }
+    });
+    toast(片付いた
+      ? '戻せませんでした（親子の付け直しができませんでした）。'
+        + '端末の空き容量をご確認ください。ごみ箱のままです'
       : '戻せませんでした。しかも途中まで戻ってしまいました。'
         + '空きを作ってから、ごみ箱をご確認ください', 12000);
     return false;
@@ -6680,12 +7965,18 @@ function trashPurgeMany(list){
   // 消すものを、ぜんぶ足し合わせる（親子が重なっても1回で済む）
   const 消す = {};
   Object.keys(PURGE_BOX).forEach(kk=>{ 消す[kk] = new Set(); });
+  let 読めた = true;
   (list||[]).forEach(x=>{
     const t = trashTargets(x.k, x.uuid);
+    if(t.読めた === false) 読めた = false;
     Object.keys(PURGE_BOX).forEach(kk=>{
       (t[kk] || new Set()).forEach(id=>消す[kk].add(id));
     });
   });
+  if(!読めた){
+    toast('保存された記録を読み取れないため、消しませんでした', 8000);
+    return false;
+  }
   // 先に全部読む。1つでも読めなければ、何も消さない
   const 元 = {};
   for(const kk of Object.keys(PURGE_BOX)){
@@ -6724,7 +8015,13 @@ function trashPurgeMany(list){
 function trashTargets(k, uuid){
   const out = {sv:new Set(), st:new Set(), ca:new Set(), nt:new Set(),
                in:new Set(), mc:new Set()};
-  const 読む = (kk)=>{ try{ return DB.loadRaw(trashKindOf(kk).key()); }catch(e){ return []; } };
+  // 途中で読めなかったら、そのことを持ち帰る。空として扱うと、
+  // 中の記録を数え漏らしたまま親だけ消してしまう（監査64回目 Minor）
+  out.読めた = true;
+  const 読む = (kk)=>{
+    try{ return DB.loadRaw(trashKindOf(kk).key()); }
+    catch(e){ out.読めた = false; return []; }
+  };
   if(k==='sv'){
     out.sv.add(uuid);
     const sts = 読む('st').filter(x=>x && x.survey_uuid===uuid);
@@ -6734,7 +8031,20 @@ function trashTargets(k, uuid){
     読む('nt').filter(x=>x && x.survey_uuid===uuid).forEach(x=>out.nt.add(x.uuid));
   }else if(k==='st'){
     out.st.add(uuid);
-    読む('ca').filter(x=>x && x.station_uuid===uuid).forEach(x=>out.ca.add(x.uuid));
+    // 地点を消すときは、その地点の地図で作った記録も一緒に。
+    // 残すと、開く道の無い記録だけが残る（監査41回目 Critical）
+    const 全st = 読む('st');
+    let 増えた = true;
+    while(増えた){
+      増えた = false;
+      全st.forEach(x=>{
+        if(!x || out.st.has(x.uuid)) return;
+        if(out.st.has(x.spot_uuid) || out.st.has(x.parent_uuid)){
+          out.st.add(x.uuid); 増えた = true;
+        }
+      });
+    }
+    読む('ca').filter(x=>x && out.st.has(x.station_uuid)).forEach(x=>out.ca.add(x.uuid));
   }else if(k==='ca'){
     out.ca.add(uuid);
   }else{
@@ -6745,14 +8055,14 @@ function trashTargets(k, uuid){
     try{
       DB.loadRaw(DB.key.mc).filter(x=>x && out.st.has(x.station_uuid))
         .forEach(x=>out.mc.add(x.uuid));
-    }catch(e){}
+    }catch(e){ out.読めた = false; }
   }
   // 1尾ずつの記録も、魚の記録と一緒に消す
   if(out.ca.size && DB.key.ind){
     try{
       DB.loadRaw(DB.key.ind).filter(x=>x && out.ca.has(x.catch_uuid))
         .forEach(x=>out.in.add(x.uuid));
-    }catch(e){}
+    }catch(e){ out.読めた = false; }
   }
   return out;
 }
@@ -6906,6 +8216,15 @@ async function gdFetch(path, opts, token){
   }
   return res.json();
 }
+/* ドライブのファイルを1つ消す。中身の欠けた写真を片付けるのに使う */
+async function gdDelete(fileId, token){
+  if(!fileId) return false;
+  const res = await fetch('https://www.googleapis.com/drive/v3/files/'
+    + encodeURIComponent(fileId), {method:'DELETE',
+    headers:{Authorization:'Bearer '+token}});
+  if(res.status === 401) gdTokenClear();
+  return res.ok || res.status === 404;
+}
 /* 置き場のフォルダ。同じ名前が2つできても、いちばん古いものに寄せる */
 async function gdFolder(token){
   const q = encodeURIComponent("mimeType='application/vnd.google-apps.folder' and name='"
@@ -6921,17 +8240,70 @@ async function gdFolder(token){
 }
 /* このアプリの記録を、ひとまとめの文字にする */
 const CLOUD_KEYS = ['sv','st','ca','ind','nt','si','mc'];
+/* 送る控えから、親を失った「迷子の行」を外す。手元の記録は消さない。
+   外さずに送ると、戻すときの検査に引っかかって自分の控えを拒む（監査49回目 Major）。
+   何件外したかは呼び出し側へ返し、人に伝える */
+function cloudPrune(box){
+  const 外した = {};
+  const 生き = (k)=>{
+    const m = Object.create(null);
+    (box[k]||[]).forEach(x=>{ if(x && safeId(x.uuid)) m[x.uuid] = x; });
+    return m;
+  };
+  const 絞る = (k, 欄, 先m)=>{
+    const 前 = (box[k]||[]).length;
+    box[k] = (box[k]||[]).filter(x=>{
+      const u = x && x[欄];
+      return !!(u && safeId(u) && 先m[u]);
+    });
+    const 差 = 前 - box[k].length;
+    if(差) 外した[k] = (外した[k]||0) + 差;
+  };
+  絞る('st', 'survey_uuid', 生き('sv'));
+  絞る('nt', 'survey_uuid', 生き('sv'));
+  const stm = 生き('st');
+  絞る('ca', 'station_uuid', stm);
+  絞る('mc', 'station_uuid', stm);
+  絞る('ind', 'catch_uuid', 生き('ca'));
+  // 消えた地点・親の単位を指したままの結び付きは、印だけ外す（記録は残す）
+  const stm2 = 生き('st');
+  (box.st||[]).forEach(x=>{
+    ['spot_uuid','parent_uuid'].forEach(欄=>{
+      const u = x[欄];
+      if(u && (!safeId(u) || !stm2[u] || stm2[u].survey_uuid !== x.survey_uuid)){
+        x[欄] = '';
+        外した['つながり'] = (外した['つながり']||0) + 1;
+      }
+    });
+  });
+  return 外した;
+}
 function cloudPack(){
   const box = {};
   CLOUD_KEYS.forEach(k=>{ box[k] = DB.loadRaw(DB.key[k]); });   // 読めなければ例外
+  const 外した = cloudPrune(box);
+  const n = Object.keys(外した).reduce((a,k)=>a+外した[k], 0);
+  if(n) window._cloudPruned = 外した; else window._cloudPruned = null;
   return JSON.stringify({app:'fish_survey', version:APP_VERSION,
     saved_at: nowISO(), data: box});
 }
 /* 読んだ文字が、このアプリの控えとして使えるか */
 /* IDとして安全な形か。細工したIDが画面の作りに紛れ込むのを防ぐ
    （2026-08-20 の監査 Critical） */
+/* 入れ物の名前として使ってよいIDか。
+   __proto__ のような特別な名前は、辞書に入れると中身をすり替えられる */
+const 使えない名 = {'__proto__':1, 'constructor':1, 'prototype':1,
+  'toString':1, 'valueOf':1, 'hasOwnProperty':1};
+/* 記録のIDを、画面の欄を探す文字（CSSセレクタ）に混ぜるときの逃がし方。
+   「:」「.」を含むIDだと、別の欄を指したり例外になる（監査52回目 Minor） */
+function cssId(v){
+  const s = String(v==null ? '' : v);
+  if(window.CSS && CSS.escape) return CSS.escape(s);
+  return s.replace(/[^A-Za-z0-9_-]/g, ch=>String.fromCharCode(92)+ch);
+}
 function safeId(v){
   return typeof v === 'string' && v.length > 0 && v.length <= 64
+    && !使えない名[v]
     && /^[A-Za-z0-9_:.-]+$/.test(v);
 }
 function cloudCheck(text){
@@ -6964,13 +8336,69 @@ function cloudCheck(text){
     }
     数[k] = o.data[k].length;
   }
+  // 親子のつながりも確かめる。形だけ正しい迷子の記録で置き換えると、
+  // 戻したあと画面から手が届かなくなる（監査34回目 Major）
+  // ふつうのオブジェクトを辞書にすると、__proto__ などの名前で
+  // 中身をすり替えられる。素の入れ物を使う（監査36回目 Critical）
+  const 集 = Object.create(null);
+  CLOUD_KEYS.forEach(k=>{
+    集[k] = Object.create(null);
+    o.data[k].forEach(x=>{ 集[k][x.uuid] = x; });
+  });
+  // 親のIDが空でも通していたので、迷子の記録を含む控えが合格していた
+  //（監査35回目 Critical）。親は必ず要る
+  const 親を確かめる = (k, 欄, 先, 名)=>{
+    for(const x of o.data[k]){
+      const u = x[欄];
+      if(!u || !safeId(u) || !集[先][u]) return `${名}のつながりが切れています（${k}）`;
+    }
+    return '';
+  };
+  // 任意の結び付き（同じ調査の中を指しているか）
+  const 同じ調査か = (k, 欄, 先, 名)=>{
+    for(const x of o.data[k]){
+      const u = x[欄];
+      if(!u) continue;
+      const t = 集[先][u];
+      if(!safeId(u) || !t) return `${名}の行き先がありません（${k}）`;
+      if(t.survey_uuid && x.survey_uuid && t.survey_uuid !== x.survey_uuid){
+        return `${名}が別の調査を指しています（${k}）`;
+      }
+    }
+    return '';
+  };
+  const 迷子 = 親を確かめる('st','survey_uuid','sv','箇所と調査')
+    || 親を確かめる('ca','station_uuid','st','魚の記録と箇所')
+    || 親を確かめる('ind','catch_uuid','ca','1尾ずつの記録と魚の記録')
+    || 親を確かめる('nt','survey_uuid','sv','メモと調査')
+    || 親を確かめる('mc','station_uuid','st','メッシュのマスと箇所')
+    || 同じ調査か('st','spot_uuid','st','地点の結び付き')
+    || 同じ調査か('st','parent_uuid','st','親の単位');
+  if(迷子) return {ok:false, why:迷子};
   return {ok:true, saved_at:o.saved_at||'', version:o.version||'', 数, data:o.data};
 }
 /* 控えで置き換える。いまの記録は消えるので、必ず確かめてから呼ぶ */
 function cloudApply(data){
+  // 通信を待っている間に、別のタブへ使用権が移ることがある。
+  // そのまま置き換えると、別のタブで入れた記録を消す（監査38回目 Critical）
+  if(!writeAllowed()){
+    toast('このタブでは戻せません。記録を入れているタブでお試しください', 8000);
+    return false;
+  }
   const 元 = {};
   try{ CLOUD_KEYS.forEach(k=>{ 元[k] = DB.loadRaw(DB.key[k]); }); }
   catch(e){ toast('いまの記録を読み取れないため、戻せませんでした', 8000); return false; }
+  const 打ちかけを捨てる = ()=>{
+    // 控えで置き換えたのに古い打ちかけが残っていると、
+    // 同じIDの記録を開いたときに、そちらが優先されて元へ戻る（監査67回目 Major）
+    try{ localStorage.removeItem('fs_draft_edit'); }catch(e){}
+    try{ Object.keys(DRAFT_HOLD).forEach(k=>{ delete DRAFT_HOLD[k]; }); }catch(e){}
+    try{ Object.keys(SPOT_HOLD).forEach(k=>{ delete SPOT_HOLD[k]; }); }catch(e){}
+    try{ draftUnbind(); }catch(e){}
+    try{ if(SPOT_TYPE_T){ clearTimeout(SPOT_TYPE_T); SPOT_TYPE_T = null; } }catch(e){}
+    try{ if(ENV_AUTO_TIMER){ clearTimeout(ENV_AUTO_TIMER); ENV_AUTO_TIMER = null; }
+         ENV_FORM = ''; ENV_DIRTY = false; }catch(e){}
+  };
   for(const k of CLOUD_KEYS){
     if(!DB.save(DB.key[k], data[k] || [])){
       // 途中で失敗したら、書いた分を戻す（半端な状態を残さない）。
@@ -6987,6 +8415,13 @@ function cloudApply(data){
       return false;
     }
   }
+  打ちかけを捨てる();     // ぜんぶ置き換えられたときだけ
+  // 写真の「付ける先」の印も片付ける。残すと、置き換えたあとの画面で
+  // 前の写真が出てきて、別の記録に付いてしまう（監査70回目 Major）
+  try{ if(typeof photoOwnerResetAll === 'function') photoOwnerResetAll(); }catch(e){}
+  try{ PHOTO_OWNER = ''; PHOTO_OWNER_SV = '';
+       PHOTO_OWNER_INFO = {mode:'', kind:'', station:'', species:''}; }catch(e){}
+  try{ SCREENS._photos = []; }catch(e){}
   return true;
 }
 /* ============ 写真も預ける ============
@@ -6998,11 +8433,42 @@ function cloudPhotoIds(){
   return Array.from(savedPhotoIds());
 }
 /* まだドライブに無いもの。名前は「ID.拡張子」 */
-function cloudPhotoNeed(ids, ドライブの名前){
-  const ある = new Set((ドライブの名前||[]).map(n=>String(n).split('.')[0]));
-  return (ids||[]).filter(id=>!ある.has(id));
+/* 送らなくてよい写真かどうか。
+   名前と「0バイトでない」だけで見ていたので、大きさの合わないファイルが
+   残っていると「もうある」と見なして永久に送り直さなかった（監査37回目 Critical）。
+   大きさ（sizes）が分かるときは、それも突き合わせる */
+/* 送り直しが要る写真。
+   ドライブに同じ名前のファイルが複数あることがある。
+   「大きさの合うものがちょうど1つ」のときだけ、送らなくてよいとみなす。
+   最後の1件で上書きして判断すると、壊れたほうを残したまま済ませてしまう
+  （監査39回目 Critical） */
+function cloudPhotoNeed(ids, 候補, 手元){
+  return (ids||[]).filter(id=>{
+    const l = (候補 && 候補[id]) || [];
+    if(!l.length) return true;                       // まだ無い
+    const m = 手元 ? 手元[id] : undefined;
+    if(m === undefined) return l.length !== 1;       // 手元の大きさが分からない
+    const 合う = l.filter(f=>f.size !== undefined && +f.size === +m);
+    return !(合う.length === 1 && l.length === 1);   // ちょうど1つで、それが合うとき以外は送る
+  });
 }
 /* 記録は指しているのに、この端末に実体が無い写真 */
+/* 記録に控えてある「この写真は何バイトのはず」を、IDごとに集める。
+   同じ名前の候補が複数あるとき、いちばん大きいものを選ぶと、
+   通信に失敗してできた大きな壊れファイルを拾いうる（監査44回目 Minor） */
+function cloudPhotoSizes(){
+  const out = {};
+  try{
+    Object.keys(DB.key).forEach(kk=>{
+      DB.loadRaw(DB.key[kk]).forEach(x=>{
+        ((x && x.photos) || []).forEach(pp=>{
+          if(pp && pp.id && +pp.size > 0) out[pp.id] = +pp.size;
+        });
+      });
+    });
+  }catch(e){}
+  return out;
+}
 async function cloudPhotoMissing(){
   const ids = cloudPhotoIds();
   const out = [];
@@ -7050,11 +8516,50 @@ async function cloudSavePhotos(token, folder){
   const 写真folder = await gdSubFolder(folder, GD_PHOTO_FOLDER, token);
   const ある = await gdListNames(写真folder, token);
   // 中身の入っていない（0バイトの）ファイルは「無い」ものとして送り直す
-  const 使えるある = ある.filter(f=>f.size === undefined || +f.size > 0);
-  const 送る = cloudPhotoNeed(ids, 使えるある.map(f=>f.name));
-  let 送った = 0, 失敗 = 0;
-  for(let i=0; i<送る.length; i++){
-    const id = 送る[i];
+  // IDごとに、ドライブ側の候補をぜんぶ並べる（同じ名前が複数あることがある）
+  const 候補 = {};
+  ある.forEach(f=>{
+    const k = String(f.name).split('.')[0];
+    (候補[k] || (候補[k] = [])).push(f);
+  });
+  const 手元の大きさ = {};
+  for(const id of ids){
+    try{ const r = await PhotoDB.get(id); if(r && r.blob) 手元の大きさ[id] = r.blob.size; }
+    catch(e){}
+  }
+  // 手元に実体が無いIDは、ドライブ側の候補の数にかかわらず、ここで外す。
+  // 候補がちょうど1件だと「送らなくてよい」と見なされ、
+  // 失敗の数にも入らなかった（監査62回目 Minor）
+  const 手元に無い = {};
+  ids.forEach(id=>{ if(手元の大きさ[id] === undefined) 手元に無い[id] = true; });
+  const 送る = cloudPhotoNeed(ids, 候補, 手元の大きさ).filter(id=>!手元に無い[id]);
+  // 大きさの合わないファイルは、送る前に片付ける。
+  // 残すと同じ名前が2つ並び、戻すときに壊れたほうを拾いうる
+  // 送り直すものは、先に古いファイルを片付ける。
+  // ただし「大きさの合う正しいファイル」が1つでもあるうちは消さない。
+  // 消してから送信に失敗すると、正しい控えまで失う（監査39回目 Critical）
+  const 消せなかった = {}, 正しいのが残った = {};
+  for(const id of 送る){
+    const l = 候補[id] || [];
+    const m = 手元の大きさ[id];
+    const 正しい = l.filter(f=>m!==undefined && f.size!==undefined && +f.size === +m);
+    // 正しいものを1つだけ残し、それ以外（0バイト・大きさ違い・重複）を消す
+    const 残す = 正しい.length ? 正しい[0] : null;
+    for(const f of l){
+      if(残す && f.id === 残す.id) continue;
+      let ok = false;
+      try{ ok = await gdDelete(f.id, token); }catch(e){}
+      if(!ok) 消せなかった[id] = true;
+    }
+    // 正しいものが残っているなら、送り直さなくてよい。
+    // ただし「消せなかった」は別に覚えて、あとで知らせる（監査40回目 Minor）
+    if(残す) 正しいのが残った[id] = true;
+  }
+  const 送れる = 送る.filter(id=>!消せなかった[id] && !正しいのが残った[id]);
+  const 消せず = 送る.filter(id=>消せなかった[id]).length;
+  let 送った = 0, 失敗 = 消せず + Object.keys(手元に無い).length;
+  for(let i=0; i<送れる.length; i++){
+    const id = 送れる[i];
     let rec = null;
     try{ rec = await PhotoDB.get(id); }catch(e){}
     if(!rec || !rec.blob){ 失敗++; continue; }
@@ -7079,13 +8584,15 @@ async function cloudSavePhotos(token, folder){
         body});
       if(!up.ok) throw new Error('ドライブ '+up.status);
       const r2 = await up.json().catch(()=>null);
-      // 送った大きさが合わないものは、送れていないものとして扱う
+      // 送った大きさが合わないものは、送れていないものとして扱う。
+      // 中途半端なファイルを残すと、次から「もうある」と見なされる
       if(r2 && r2.size !== undefined && +r2.size !== rec.blob.size){
+        if(r2.id){ try{ await gdDelete(r2.id, token); }catch(e){} }
         throw new Error('大きさが合いません');
       }
       送った++;
     }catch(e){ 失敗++; }
-    if(i % 5 === 4) toast(`写真を預けています…（${i+1}/${送る.length}）`, 4000);
+    if(i % 5 === 4) toast(`写真を預けています…（${i+1}/${送れる.length}）`, 4000);
   }
   return {送った, 全部: ids.length, 失敗};
 }
@@ -7097,10 +8604,28 @@ async function cloudRestorePhotos(token, folder){
   try{ 写真folder = await gdSubFolder(folder, GD_PHOTO_FOLDER, token); }
   catch(e){ return {戻した:0, 足りない:足りない.length}; }
   const ある = await gdListNames(写真folder, token);
+  // 0バイトのファイルは写真ではない。取り込むと「開けない写真」が増える。
+  // 同じ名前が複数あるときは、記録に控えた大きさと合うものだけを取る。
+  // 「いちばん大きいもの」だと、壊れた大きなファイルを拾いうる（監査44回目 Minor）
+  const 期待 = cloudPhotoSizes();
+  const 候補 = {};
+  ある.filter(f=>f.size === undefined || +f.size > 0).forEach(f=>{
+    const k = String(f.name).split('.')[0];
+    (候補[k] || (候補[k] = [])).push(f);
+  });
   const 表 = {};
-  // 0バイトのファイルは写真ではない。取り込むと「開けない写真」が増える
-  ある.filter(f=>f.size === undefined || +f.size > 0)
-    .forEach(f=>{ 表[String(f.name).split('.')[0]] = f; });
+  Object.keys(候補).forEach(k=>{
+    const l = 候補[k];
+    const want = 期待[k];
+    // 大きさが分かっているなら、候補が1つでも必ず照合する。
+    // しないと、通信に失敗してできた壊れファイルをそのまま戻す（監査45回目 Minor）
+    if(want > 0){
+      const 合う = l.filter(f=>f.size === undefined || +f.size === want);
+      if(合う.length === 1) 表[k] = 合う[0];
+      return;
+    }
+    if(l.length === 1) 表[k] = l[0];
+  });
   let 戻した = 0;
   for(let i=0; i<足りない.length; i++){
     const id = 足りない[i];
@@ -7112,6 +8637,8 @@ async function cloudRestorePhotos(token, folder){
       if(!res.ok) throw new Error('ドライブ '+res.status);
       const blob = await res.blob();
       if(!blob || !blob.size) throw new Error('中身がありません');
+      // 落とし終わってから、もう一度大きさを見る
+      if(期待[id] > 0 && blob.size !== 期待[id]) throw new Error('大きさが合いません');
       const ext = String(f.name).split('.').slice(1).join('.') || 'jpg';
       await PhotoDB.put({id, blob, ext, size: blob.size, added_at: nowISO()});
       戻した++;
@@ -7128,6 +8655,22 @@ async function cloudSave(){
   let text;
   try{ text = cloudPack(); }
   catch(e){ toast('記録を読み取れないため、保存できませんでした', 8000); return; }
+  // 送る前に、戻せる控えかを自分で確かめる。
+  // 確かめずに上げると、「保存しました」と出た控えを、あとで自分が拒む（監査49回目 Major）
+  const 点検 = cloudCheck(text);
+  if(!点検.ok){
+    toast('この控えは戻せない形なので、保存しませんでした（' + 点検.why + '）。'
+      + '前の控えはそのまま残しています', 12000);
+    return;
+  }
+  const 外した = window._cloudPruned;
+  if(外した){
+    const 内訳 = Object.keys(外した)
+      .map(k=>`${({sv:'調査',st:'箇所',ca:'魚の記録',ind:'1尾ずつ',nt:'メモ',
+                   mc:'メッシュのマス'})[k] || k}${外した[k]}件`).join('・');
+    toast('もとの記録が見あたらない分（' + 内訳 + '）は、控えに入れていません。'
+      + '手元の記録はそのままです', 10000);
+  }
   toast('ドライブに保存しています…', 8000);
   try{
     const token = await gdGetToken();
@@ -7265,9 +8808,13 @@ function spotsAdd(svUuid, lat, lon, acc){
   if(!validPt([la, lo])){ toast('位置がおかしいので置けません'); return null; }
   const no = nextStationNo(svUuid);
   if(no===null){ toast('番号が大きすぎて、これ以上置けません', 7000); return null; }
+  const 地点番号 = nextSpotNo(svUuid);   // 番号は1回だけ決める
   const rec = {uuid:uuid(), survey_uuid:svUuid, station_no:no,
     is_spot: true,          // 「新しい調査」の地図で置いた調査地点。物理環境の測点と混ぜない
-    name: 'P' + no, started_at: nowISO(), survey_time_start: timeValue(),
+    survey_date: recDay(sv),
+    // 名前は地点だけで数える。station_no は並び順に使うので、今までどおり通し
+    spot_no: 地点番号,
+    name: 'P' + 地点番号, started_at: nowISO(), survey_time_start: autoTime(sv),
     survey_type: sv.survey_type_default || '目視', env_points: [],
     latitude: la, longitude: lo,
     gps_accuracy: (acc===undefined||acc===null) ? '' : Math.round(acc),
@@ -7284,9 +8831,9 @@ function spotsDrawAll(svUuid, sel){
   const map = MAPS.main.map; if(!map) return;
   try{ SPOTLAYER.forEach(x=>map.removeLayer(x)); }catch(e){}
   SPOTLAYER = [];
-  spotList(svUuid).forEach(st=>{
+  editSpots(svUuid).forEach(st=>{
     const pt = stationPt(st); if(!pt) return;
-    const 済み = DB.catchesOf(st.uuid).length > 0;
+    const 済み = spotTotals(st.uuid).尾 > 0;
     const 選び = !!sel && st.uuid===sel;
     SPOTLAYER.push(L.marker(pt,
       {icon:envBadge(st.name||'', 済み?'#3fb950':'#4aa3ff', 選び?42:34, true)})
@@ -7296,14 +8843,34 @@ function spotsDrawAll(svUuid, sel){
 SCREENS.spot = (stUuid)=>{
   const st = DB.liveStation(stUuid);
   if(!st) return null;
+  // 印の無い箇所では、この画面のボタンが噛み合わない（地図が地点なしで開く）。
+  // 入力欄の画面へ回す（監査41回目 Major）
+  if(!st.is_spot) return SCREENS.station(stUuid);
   const sv = DB.getAlive(DB.key.sv, st.survey_uuid);
   if(!sv) return null;
   const cs = DB.catchesOf(stUuid);
-  const 尾 = stationTotal(st);
-  const 種 = new Set(cs.map(c=>c.species_id).filter(Boolean)).size;
-  const 環境あり = !!(st.habitat_type || st.substrate1 || numOf(st.depth_rep_cm)!==''
-    || numOf(st.velocity_rep_cms)!=='' || (st.env_points||[]).length);
-  const 動いている = effortRunning(st);
+  const 合計 = spotTotals(stUuid);        // 地点そのもの＋この地点の地図で作った分
+  const 尾 = 合計.尾, 種 = 合計.種;
+  const 直接種 = new Set(cs.map(c=>c.species_id).filter(Boolean)).size;
+  const 直接尾 = stationTotal(st);
+  const 直接環境 = !!envHasOwn(st);
+  // 前の版で地点へ直に入れた、写真・漁具・労力。
+  // 見落とすと、値は残っているのに画面から直せない（監査50回目 Major）
+  const 直接写真 = (st.photos||[]).length;
+  // 前の版で地点へ直に入れた「労力」まわり。1つでも見落とすと、
+  // 値は残っているのに画面から直せない（監査69回目 Major）
+  const 直接漁具 = gearCount(st) || st.effort_started_at
+    || numOf(st.effort_seconds)!=='' || numOf(st.effort_passes)!==''
+    || numOf(st.width_m)!=='' || numOf(st.length_m_manual)!==''
+    || numOf(st.area_m2_manual)!=='';
+  // この地点の地図で作った物理環境の記録。
+  // env_method の有無だけで数えると、前の版で env_method が付いた
+  // 魚の単位まで混ざる（監査50回目 Minor）
+  const 環境の数 = spotStations(stUuid)
+    .filter(x=>x.uuid!==stUuid && stationKind(sv, x)==='物理環境').length;
+  const 環境あり = 直接環境 || 環境の数 > 0;
+  // 地点では通電を積まない。押している間かどうかは「終えたか」で決める
+  const 動いている = !st.ended_at;
   return {
     title: st.name || '地点',
     sub:[{text: sv.river_name||''},
@@ -7313,60 +8880,74 @@ SCREENS.spot = (stUuid)=>{
       <div class="card">
         <div class="row">
           <div class="grow">
-            <div class="dim small">${動いている ? '記録中です' : 'はじめると、時刻と道筋が残ります'}</div>
+            <div class="dim small">${動いている ? '記録中です' : 'この地点は終えています'}</div>
             <div>${esc(st.survey_time_start||'—')}${
-              st.survey_time_end ? ' 〜 '+esc(st.survey_time_end) : ''}
-              <span class="dim small">　通電 ${esc(fmtDur(effortSeconds(st)))}</span></div>
+              st.survey_time_end ? ' 〜 '+esc(st.survey_time_end) : ''}</div>
+            <div class="dim small">通電（電気ショッカー）は、地図の
+              <b>▼採捕記録</b>で単位ごとに測ります。</div>
           </div>
           <button class="btn ${動いている?'ng':'ok'}" style="width:auto;margin:0"
-            onclick="toggleEffort('${stUuid}')">${動いている?'ストップ':'はじめる'}</button>
+            onclick="toggleEffort('${stUuid}')">${動いている?'終える':'再開する'}</button>
         </div>
       </div>
 
       <button class="btn pri"
         onclick="nav('fishMap',{survey:'${st.survey_uuid}',spot:'${stUuid}'})">
-        魚類調査（地図で記録する）</button>
+        魚類調査（地図で記録する）${種 ? `　${種}種 ${尾}尾` : ''}</button>
       <button class="btn"
         onclick="nav('envMap',{survey:'${st.survey_uuid}',spot:'${stUuid}'})">
-        物理環境調査（地図で記録する）</button>
+        物理環境調査（地図で記録する）${環境の数 ? `　${環境の数}件` : ''}</button>
       <div class="dim small">この地点のあたりで地図が開きます。
         記録は地図の上で、範囲・瀬淵・ポイント（魚）／ライン・測点（物理環境）として入れます。</div>
 
       <!-- 「この地点に直接入れる（前のやり方）」は普段は出さない（2026-08-21）。
            ただし、前のやり方でこの地点に直接入れた記録があるときだけ出す。
            消してしまうと、その記録に手が届かなくなる -->
-      ${(種 || 環境あり) ? foldHtml('spotform', '前のやり方で入れた記録を直す', '', `
+      ${(直接種 || 直接環境 || 直接写真 || 直接漁具)
+        ? foldHtml('spotform', '前のやり方で入れた記録を直す', '', `
         <div class="dim small">この地点には、地図を使わずに直接入れた記録があります。
           直すときはこちらから。新しく入れるときは、上の「魚類調査」「物理環境調査」を使ってください。</div>
-        ${種 ? `<button class="btn" onclick="nav('station','${stUuid}')">
-          魚類の入力欄（${種}種 ${尾}尾）</button>` : ''}
-        ${環境あり ? `<button class="btn ok" onclick="nav('env','${stUuid}')">
-          川の環境の入力欄（入力済み）</button>` : ''}`) : ''}
+        ${直接種 ? `<button class="btn" onclick="nav('station','${stUuid}')">
+          魚類の入力欄（${直接種}種 ${直接尾}尾）</button>` : ''}
+        ${直接環境 ? `<button class="btn ok" onclick="nav('env','${stUuid}')">
+          川の環境の入力欄（入力済み）</button>` : ''}
+        ${(直接漁具 && !直接種) ? `<button class="btn" onclick="nav('station','${stUuid}')">
+          採捕記録・労力の入力欄（入力済み）</button>` : ''}
+        ${直接写真 ? `<button class="btn" onclick="nav('stationEdit',{uuid:'${stUuid}'})">
+          この地点に付いた写真（${直接写真}枚）</button>` : ''}`) : ''}
 
-      ${foldHtml('spotsum', '集計', `<span class="fsub">${種}種 ${尾}尾</span>`, `
+      ${(()=>{
+        // 見出し・本文・通電は、同じ対象から出す。
+        // 見出しだけ子の分を数えて、本文が地点そのものだけだと食い違う（監査38回目 Major）
+        const 仲間 = spotStations(stUuid);
+        const 種別 = {};
+        仲間.forEach(x=>DB.catchesOf(x.uuid).forEach(c=>{
+          const t = catchTotal(c);
+          const k = c.species_id || c.species_name;
+          if(!k || t<=0) return;
+          const e = 種別[k] || (種別[k] = {name: c.species_name||c.species_id||k, 尾:0});
+          e.尾 += t;
+        }));
+        const 並び = Object.keys(種別).map(k=>種別[k])
+          .sort((a,b)=> b.尾 - a.尾 || String(a.name).localeCompare(String(b.name),'ja'));
+        const 秒 = effortStations(仲間, DB.stationsOf(st.survey_uuid))
+          .reduce((a,x)=>a+spotEffort(x), 0);
+        return foldHtml('spotsum', '集計', `<span class="fsub">${種}種 ${尾}尾</span>`, `
         <div class="row">
           <div class="grow"><div class="dim small">種数</div><div class="big">${種}</div></div>
           <div class="grow"><div class="dim small">尾数</div><div class="big">${尾}</div></div>
           <div class="grow"><div class="dim small">通電</div>
-            <div class="big">${esc(fmtDur(effortSeconds(st)))}</div></div>
+            <div class="big">${esc(fmtDur(秒))}</div></div>
         </div>
-        ${cs.length ? cs.map(c=>`<div class="row" style="margin-bottom:4px">
-          <div class="grow">${esc(c.species_name||c.species_id||'（種なし）')}</div>
-          <div>${catchTotal(c)}尾</div></div>`).join('')
-          : '<div class="dim small">まだ魚の記録がありません。</div>'}`)}
+        ${並び.length ? 並び.map(x=>`<div class="row" style="margin-bottom:4px">
+          <div class="grow">${esc(x.name)}</div>
+          <div>${x.尾}尾</div></div>`).join('')
+          : '<div class="dim small">まだ魚の記録がありません。</div>'}`);
+      })()}
 
       <button class="btn" onclick="nav('stationEdit',{uuid:'${stUuid}'})">この地点の設定</button>
     `,
-    onMount(){
-      if(effortRunning(st)){
-        EFFORT_TIMER = setInterval(()=>{
-          const el = $('#effClock');
-          const now = DB.getAlive(DB.key.st, stUuid);
-          if(!el || !now || !effortRunning(now)){ clearInterval(EFFORT_TIMER); EFFORT_TIMER=null; return; }
-          el.textContent = fmtDur(effortSeconds(now));
-        }, 1000);
-      }
-    }
+    onMount(){}
   };
 };
 SCREENS.trash = ()=>{
@@ -7422,18 +9003,28 @@ SCREENS.trash = ()=>{
   };
 };
 SCREENS.fishMap = (arg)=>{
-  const {sv: svUuid, spot} = mapArg(arg);
+  const {sv: svUuid, spot: 頼まれた, record: 指名, loose: 未所属だけ} = mapArg(arg);
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
+  const spot = mapEnterSpot(svUuid, 頼まれた, 未所属だけ);   // 一覧を作る前に決める
+  selResetOnSpotChange(svUuid, spot);   // 描きかけを控えてから、調査を切り替える
   fishUseSurvey(svUuid);
-  const list = DB.stationsOf(svUuid).filter(x=>unitKindOf(x));
+  // 読み込み直したあとも、描きかけの続きから再開できるようにする
+  if(!FISH_NEXT.draw){
+    const 途中 = mapStations(svUuid, 'fish').filter(polyDrawing)[0];
+    if(途中) FISH_NEXT = {kind:FISH_NEXT.kind, draw:途中.uuid, survey:svUuid};
+  }
+  if(指名 && mapStations(svUuid, 'fish', spot).some(x=>x.uuid===指名)) FISH_SEL = 指名;
+  const list = mapStations(svUuid, 'fish');
   const 描き中 = fishDrawing();
   // いま開いている調査のものだけを選べる（ほかの調査の記録に書き込ませない）
   if(FISH_SEL && !list.some(x=>x.uuid===FISH_SEL)) FISH_SEL = null;
   const cur = FISH_SEL ? (list.find(x=>x.uuid===FISH_SEL) || null) : null;
   const 子 = cur ? unitChildren(cur.uuid, list) : [];
-  // 描きかけ（閉じていない囲い）には、記録を入れさせない
-  const 描きかけ = !!(cur && isUnitPoly(cur) && !polyClosed(cur));
+  // 描きかけ（まだ「囲いを閉じる」を押していない）には、記録を入れさせない。
+  // 角が3個そろったかどうかで見ると、3個目を置いた時点で入力欄が出てしまい、
+  // そこへ入れた記録は、囲いをやめたときに見えなくなる（監査60回目 Critical）
+  const 描きかけ = polyDrawing(cur);
   const chip = (st)=>{
     const k = unitKindOf(st);
     const 中 = unitChildren(st.uuid, list).length;
@@ -7450,13 +9041,14 @@ SCREENS.fishMap = (arg)=>{
          {text:`${list.length}件`}],
     html:`
       ${地点札}
+      ${recDayBarHtml(sv)}
       ${baseMapButtonsHtml()}
       <div id="fishmap" class="map"
         style="height:${envMapBig()?'80vh':'46vh'};min-height:260px"></div>
       <div class="dim small" id="fishHint"></div>
       <div class="dim small" id="fishGps"></div>
 
-      <button class="btn" onclick="if(fishUseMap('${svUuid}', false)) navReplace('surveyHub','${svUuid}')"
+      <button class="btn" onclick="if(fishUseMap('${svUuid}', false)) goTo('survey','${svUuid}')"
         >一覧で見る（箇所の並び）</button>
 
       <div class="card">
@@ -7468,6 +9060,10 @@ SCREENS.fishMap = (arg)=>{
           大きい単位は、中に入っているものの集計になります。</div>
       </div>
 
+      ${MAP_LOOSE ? `<div class="warnbox">ここには、<b>地点に属さない以前の記録</b>だけを
+        出しています。直すことはできますが、新しくは作れません。
+        新しく作るときは、地点を選んでから開いてください。</div>` : ''}
+      ${cur ? recDayWarnHtml(sv, cur) : ''}
       ${!cur ? '' : `<div class="card" id="fishUnitCard">
         <div class="row">
           <div class="grow">
@@ -7622,16 +9218,28 @@ SCREENS.fishMap = (arg)=>{
           el.textContent = fmtDur(effortSeconds(now));
         }, 1000);
       }
+      // 採捕記録（漁具・通電・川幅）の書きかけ。
+      // 箇所ハブには付いていたのに、魚の地図には付いていなかった。
+      // 漁具を打っている最中に地図をタップすると、打った分が消えていた（監査33回目 Critical）
+      if(cur && $('#gearBox')){
+        const dkey = 'effort:'+cur.uuid;
+        const dbase = collectEffort();
+        const dd = draftForForm(dkey);
+        if(dd){ applyEffort(dd); toast('採捕記録の書きかけを戻しました'); }
+        draftBind(dkey, collectEffort, dbase);
+      }
       fishSyncHint();
       fishDrawAll(svUuid);
       drawMe('main');
       FISH_MAP_SV = svUuid;
       map.on('click', e=>{
+        if(cur && $('#gearBox') && !saveEffort(cur.uuid, {quiet:true})) return;
         fishAddAt(svUuid, e.latlng.lat, e.latlng.lng, null);
         render();
       });
       map.on('moveend zoomend', ()=>fishRememberView(svUuid));
-      if(!v){
+      // 地点から開いたときは、その地点のあたりを出したいので動かさない
+      if(!v && !spot){
         const pts = fishAllPoints(svUuid);
         if(pts.length>1){
           try{ map.fitBounds(L.latLngBounds(pts).pad(0.3), {animate:false}); }catch(e){}
@@ -7658,8 +9266,12 @@ function fishSyncHint(){
                             : '地図をタップすると、囲いを描きはじめます');
 }
 function fishAddHere(svUuid){
+  if(fixBusy()) return;      // 待っている間の二度押しで、二重に置かない
   toast('現在地を取っています…');
+  const 確かめ = fixGuard(svUuid);
   getFixOnce(f=>{
+    fixDone();
+    if(!確かめ()) return;
     if(!f){ toast('現在地を取れませんでした。地図をタップしても置けます', 6000); return; }
     if(f.acc > GPS_MAX_ACC){
       toast(`いまの位置は ±${Math.round(f.acc)}m と粗いので置いていません`, 8000);
@@ -7667,13 +9279,18 @@ function fishAddHere(svUuid){
     }
     fishAddAt(svUuid, f.lat, f.lon, f.acc);
     render();
-  });
+  }, {keep:true});     // 置いてよいかは 確かめ() が見る
 }
 function fishDelete(u){
   const st = DB.liveStation(u); if(!st) return;
   const 中 = unitChildren(u, DB.stationsOf(st.survey_uuid)).length;
   if(!confirm(`${st.name} を消します。${中?`中の ${中}件は残りますが、囲いの外に出ます。`:''}`
     + '中の記録も一緒に見えなくなります。よろしいですか？')) return;
+  if(!flushBeforeDelete(u)){
+    toast('打ちかけを保存できないので、消しませんでした。'
+      + '足りないところを直すか、端末の空き容量をご確認ください', 9000);
+    return;
+  }
   if(!DB.softDelete(DB.key.st, u)) return;
   draftClearFor('箇所', u);
   if(FISH_SEL === u) FISH_SEL = null;
@@ -7683,20 +9300,33 @@ function fishDelete(u){
   render();
 }
 SCREENS.envMap = (arg)=>{
-  const {sv: svUuid, spot} = mapArg(arg);
+  const {sv: svUuid, spot: 頼まれた, record: 指名, loose: 未所属だけ} = mapArg(arg);
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
+  const spot = mapEnterSpot(svUuid, 頼まれた, 未所属だけ);   // 一覧を作る前に決める
+  selResetOnSpotChange(svUuid, spot);   // 描きかけを控えてから、調査を切り替える
   envUseSurvey(svUuid);        // 別の調査から持ち越さない
+  if(指名 && mapStations(svUuid, 'env', spot).some(x=>x.uuid===指名)) ENV_SEL = 指名;
   const all = DB.stationsOf(svUuid);
   // メッシュの範囲は位置の持ち方が違うので、点・線の並びに混ぜない。
   // 混ぜると、位置の無い点として並んでしまう
+  // メッシュは地点で絞らない。地点ごとのメッシュを作る入口がまだ無いので、
+  // 絞ると前に作ったメッシュが地点から開いた画面で見えなくなるだけ。
+  // 「地点ごとのメッシュ」は tasks/todo.md に回した（監査37回目 Major）
   const meshes = all.filter(isMesh);
   // 地点（新しい調査の地図で置いたもの）は、ここでは記録として扱わない。
   // 地点は「大まかにこの辺」の目印で、詳しい記録はこの画面で作る
-  const list = all.filter(x=>!isMesh(x) && !x.is_spot);
+  // 魚の単位（E・P/F・P）も、この一覧には出さない。
+  // 出すと、物理環境の入力欄から魚の単位へ環境の値を書き込めてしまう（監査32回目 Major）
+  const list = mapStations(svUuid, 'env');
   // 選んでいるものが消えていたら、いちばん新しいものにする
   if(ENV_SEL && !list.some(x=>x.uuid===ENV_SEL)) ENV_SEL = null;
-  if(!ENV_SEL && list.length) ENV_SEL = list[list.length-1].uuid;
+  // 何も選んでいないときに自動で選ぶのは、この地点で作ったものだけ。
+  // 調査ぜんぶの最新を選ぶと、P2を開いたのに P1 の記録を直してしまう
+  if(!ENV_SEL){
+    const 候補 = list.filter(x=>ofSpot(x, spot));
+    if(候補.length) ENV_SEL = 候補[候補.length-1].uuid;
+  }
   const cur = ENV_SEL ? list.find(x=>x.uuid===ENV_SEL) : null;
 
   const chip = (st)=>{
@@ -7719,6 +9349,7 @@ SCREENS.envMap = (arg)=>{
          {text:`${list.length}件`}],
     html:`
       ${fromSpotHtml(spot)}
+      ${recDayBarHtml(sv)}
       ${baseMapButtonsHtml()}
       <div id="envmap" class="map"
         style="height:${envMapBig()?'80vh':'46vh'};min-height:260px"></div>
@@ -7871,7 +9502,7 @@ function envDrawAll(svUuid){
   ENVLAYER = [];
   const pts = [];
   const range = envColorRange(svUuid);
-  DB.stationsOf(svUuid).filter(x=>!isMesh(x)).forEach(st=>{
+  mapStations(svUuid, 'env').forEach(st=>{
     const on = st.uuid === ENV_SEL;
     const byCol = envColorOf(st, range);
     // 色分けを選んでいるときは、選んでいるものは大きさで見せる（色は基準のまま）
@@ -7914,17 +9545,26 @@ function envAddHere(svUuid){
     toast('消すものを選んでいます。先に「やめる」を押してください', 6000);
     return;
   }
+  if(fixBusy()) return;      // 待っている間の二度押しで、二重に置かない
   toast('現在地を取っています…');
+  const 確かめ = fixGuard(svUuid);
+  // どのラインに足すかは、いま決めておく。待っている間に選び直されても、
+  // 返ってきた座標が別のラインへ行かないようにする（監査47回目 Critical）
+  const 相手 = ENV_NEXT.kind === 'LE' ? envLineTarget(svUuid)
+             : ENV_NEXT.kind === 'V'  ? envBendTarget(svUuid) : null;
+  const 相手UU = 相手 ? 相手.uuid : '';
   getFixOnce(f=>{
+    fixDone();
+    if(!確かめ()) return;
     if(!f){ toast('現在地を取れませんでした。地図をタップしても置けます', 6000); return; }
     if(f.acc > GPS_MAX_ACC){
       toast(`いまの位置は ±${Math.round(f.acc)}m と粗いので置いていません。`
         + '空の見えるところでお試しいただくか、地図をタップしてください', 9000);
       return;
     }
-    envAddAt(svUuid, f.lat, f.lon, f.acc);
+    envAddAt(svUuid, f.lat, f.lon, f.acc, 相手UU);
     render();
-  });
+  }, {keep:true});     // 置いてよいかは 確かめ() が見る
 }
 function envSelect(u){
   if(ENV_SEL === u) return;
@@ -7936,6 +9576,11 @@ function envSelect(u){
 function envDelete(u){
   const st = DB.get(DB.key.st, u); if(!st) return;
   if(!confirm(`${st.name} を消します。中の記録も消えます。よろしいですか？`)) return;
+  if(!flushBeforeDelete(u)){
+    toast('打ちかけを保存できないので、消しませんでした。'
+      + '足りないところを直すか、端末の空き容量をご確認ください', 9000);
+    return;
+  }
   if(DB.softDelete(DB.key.st, u)){
     draftClearFor('箇所', u);
     if(ENV_SEL === u) ENV_SEL = null;
@@ -7986,6 +9631,16 @@ let ENV_AUTO_TIMER = null;
 const ENV_AUTO_MS = 600;        // 打ち終わるのを少し待ってから
 function envAutoSave(stUuid){
   ENV_DIRTY = true;
+  // 書きかけの「いま見ている欄」は1つしか覚えられないので、
+  // 同じ画面にある採捕記録に取られていることがある。
+  // 取られていても消えないよう、この欄の控えは自分で直に書く（監査51回目 Critical）
+  if(ownsLock()){
+    try{
+      const v = collectEnvItem();
+      DRAFT_HOLD['envitem:'+stUuid] = v;
+      draftSave('envitem:'+stUuid, v);
+    }catch(e){}
+  }
   if(ENV_AUTO_TIMER){ clearTimeout(ENV_AUTO_TIMER); ENV_AUTO_TIMER = null; }
   ENV_AUTO_TIMER = setTimeout(()=>{
     ENV_AUTO_TIMER = null;
@@ -8033,14 +9688,21 @@ let ENV_HIST = [];
 const ENV_HIST_MAX = 30;
 function envHistPush(item){
   if(!item) return;
+  // どの地点で行った操作かも覚える。覚えないと、P2で「1つ戻す」を押したときに
+  // P1の操作を取り消してしまう（監査39回目 Critical）
+  item.spot = MAP_SPOT || '';
   ENV_HIST.push(item);
   if(ENV_HIST.length > ENV_HIST_MAX) ENV_HIST.shift();
+}
+/* いまの調査・いまの地点の操作か */
+function envHistMine(x, svUuid){
+  return !!x && x.sv === svUuid && (x.spot||'') === (MAP_SPOT||'');
 }
 function envHistClear(svUuid){
   ENV_HIST = ENV_HIST.filter(x=>x && x.sv === svUuid);
 }
 function envCanUndo(svUuid){
-  return ENV_HIST.some(x=>x && x.sv === svUuid);
+  return ENV_HIST.some(x=>envHistMine(x, svUuid));
 }
 /* 1つ戻す。戻せたら true */
 function envUndo(svUuid){
@@ -8049,7 +9711,7 @@ function envUndo(svUuid){
     return false;
   }
   let i = ENV_HIST.length - 1;
-  while(i >= 0 && !(ENV_HIST[i] && ENV_HIST[i].sv === svUuid)) i--;
+  while(i >= 0 && !envHistMine(ENV_HIST[i], svUuid)) i--;
   if(i < 0){ toast('戻せるものがありません'); return false; }
   const h = ENV_HIST[i];
   ENV_HIST.splice(i, 1);
@@ -8126,7 +9788,7 @@ function envMarkPlaced(){ ENV_PLACE_SEQ = ++ENV_SEQ; }
    4) 終わっていないラインがちょうど1本ならそれ
    5) ラインがちょうど1本ならそれ */
 function envBendTarget(svUuid){
-  const 線 = st => st && isLine(st) && linePt(st,'start');
+  const 線 = st => st && isLine(st) && linePt(st,'start') && ofSpot(st, MAP_SPOT);
   const 未完 = st => 線(st) && !linePt(st,'end');
   const sel = ENV_SEL ? DB.getAlive(DB.key.st, ENV_SEL) : null;
   const この調査 = st => st && st.survey_uuid===svUuid;
@@ -8136,14 +9798,24 @@ function envBendTarget(svUuid){
     if(未完(st) && この調査(st)) return st;
   }
   if(線(sel) && この調査(sel)) return sel;
-  const 未完たち = DB.stationsOf(svUuid).filter(未完);
+  const 未完たち = mapStations(svUuid, 'env').filter(未完);
   if(未完たち.length===1) return 未完たち[0];
-  const 線ぜんぶ = DB.stationsOf(svUuid).filter(線);
+  const 線ぜんぶ = mapStations(svUuid, 'env').filter(線);
   return 線ぜんぶ.length===1 ? 線ぜんぶ[0] : null;
 }
 /* 曲がりを1つ足す。終点があるラインでは、終点の手前に入れる */
-function envAddBend(svUuid, la, lo, acc){
-  const st = envBendTarget(svUuid);
+function envAddBend(svUuid, la, lo, acc, targetUuid){
+  let st;
+  if(targetUuid){
+    const t = DB.getAlive(DB.key.st, targetUuid);
+    st = (t && t.survey_uuid===svUuid && isLine(t) && linePt(t,'start')) ? t : null;
+    if(!st){
+      toast('現在地を取っている間に、曲げる相手のラインが変わったので置いていません', 8000);
+      return null;
+    }
+  }else{
+    st = envBendTarget(svUuid);
+  }
   if(!st){
     toast('どのラインを曲げるか決められません。'
       + '先にラインを選ぶか、ラインの始まりを置いてください', 8000);
@@ -8202,7 +9874,7 @@ function envSnapTo(svUuid, lat, lon, 除く){
   if(!map || typeof map.latLngToContainerPoint !== 'function') return null;
   let here; try{ here = map.latLngToContainerPoint([lat, lon]); }catch(e){ return null; }
   let 近い = null, 距離 = ENV_SNAP_PX;
-  DB.stationsOf(svUuid).filter(x=>!isMesh(x)).forEach(st=>{
+  mapStations(svUuid, 'env').forEach(st=>{
     if(除く && st.uuid === 除く) return;
     const 角 = [];
     if(envKindOf(st) === 'L'){
@@ -8391,6 +10063,9 @@ let MESHLAYER = [];
 SCREENS.meshSetup = (stUuid)=>{
   const st = DB.liveStation(stUuid);
   if(!st) return null;
+  // 地点（目印）には格子を作らせない。作ると、地点と物理環境の記録が混ざる
+  //（監査56回目 Critical）
+  if(st.is_spot) return null;
   const sv = DB.get(DB.key.sv, st.survey_uuid);
   const c = meshCorners(st);
   const pr = prefs();
@@ -8575,6 +10250,12 @@ function showMeshPlan(){
 /* 格子を決めて保存する */
 function saveMesh(stUuid){
   const st = DB.liveStation(stUuid); if(!st) return;
+  // 地点（目印）には格子を作らせない。作ると、地点と物理環境の記録が混ざる
+  //（監査56回目 Critical）
+  if(st.is_spot){
+    toast('地点には格子を作れません。物理環境調査の地図から作ってください', 8000);
+    return;
+  }
   const tmp = tmpMeshStation();
   const cerr = meshCornerError((window._meshCorners||[]).filter(Boolean));
   if(cerr){ toast(cerr, 6000); return; }
@@ -8607,6 +10288,13 @@ function saveMesh(stUuid){
 }
 /* 箇所を保存してから格子の画面へ。保存できなければ動かない */
 function toMeshSetup(svUuid, stUuid){
+  // 地点（目印）には格子を作らせない。作ると、地点と物理環境の記録が混ざる
+  //（監査56回目 Critical）
+  const st0 = stUuid ? DB.liveStation(stUuid) : null;
+  if(st0 && st0.is_spot){
+    toast('地点には格子を作れません。物理環境調査の地図から作ってください', 8000);
+    return;
+  }
   if(stUuid){ nav('meshSetup', stUuid); return; }
   toast('先にこの記録を保存します…');
   saveStation(svUuid, '', {then:'meshSetup'});
@@ -8784,7 +10472,7 @@ SCREENS.meshCell = (arg)=>{
     onMount(){
       const key = 'meshcell:'+arg.station+':'+row+':'+col;
       const base = collectMeshCell();
-      const d = draftGet(key);
+      const d = draftForForm(key);
       if(d){
         applySels(d);
         applySeg('mx_sub', d.__sub); applySeg('mx_hab', d.__hab);
@@ -8996,7 +10684,7 @@ SCREENS.catchEdit = (arg)=>{
       // （2026-08-17 の監査 Critical）
       SCREENS._photos = ((c && c.photos)||[]).slice();
       const base = collectCatch();      // 書きかけを戻す前の姿を控える
-      const d = draftGet(key);
+      const d = draftForForm(key);
       if(d){
         applyVals({'#c_n':d.count_unmeasured, '#c_note':d.notes});
         applySeg('conf', d.identification_confidence);
@@ -9225,7 +10913,7 @@ SCREENS.env = (stUuid)=>{
       startGps();                       // 測点に位置を添えるため
       const dkey = 'env:'+stUuid;
       const dbase = collectEnv();
-      const dd = draftGet(dkey);
+      const dd = draftForForm(dkey);
       if(dd){
         applySels(dd);
         applySeg('p_sub', dd.__sub);
@@ -9278,7 +10966,7 @@ function addEnvPoint(stUuid){
   if(!DB.upsert(DB.key.st, st)) return;      // 保存できていないので欄も消さない
   // 測点の欄だけを空にして控え直す。そのまま render() すると、
   // まだ保存していない代表値やカバーの入力まで消える
-  const dft = draftGet('env:'+stUuid) || {};
+  const dft = draftForForm('env:'+stUuid) || {};
   ['#p_d','#p_v','#p_note'].forEach(k=>{ dft[k] = ''; });
   dft.__sub = '';
   draftSave('env:'+stUuid, dft);
@@ -9416,7 +11104,7 @@ SCREENS.siteEdit = (arg)=>{
       startGps();
       const dkey = 'site:'+(si.uuid||'new');
       const dbase = collectSite();
-      const dd = draftGet(dkey);
+      const dd = draftForForm(dkey);
       if(dd){ applySels(dd); toast('書きかけを戻しました'); }
       draftBind(dkey, collectSite, dbase);
       const c = (numVal('#si_lat')!=='' && numVal('#si_lon')!=='')
@@ -9545,7 +11233,7 @@ SCREENS.noteEdit = (arg)=>{
       const key = 'note:'+(arg.uuid || ('new:'+svUuid));
       SCREENS._photos = ((n && n.photos)||[]).slice();     // 先にこのメモの写真に入れ替える
       const base = collectNote();       // 書きかけを戻す前の姿を控える
-      const d = draftGet(key);
+      const d = draftForForm(key);
       if(d){ applyVals({'#n_body':d.content}); toast('書きかけを戻しました'); }
       photosBegin(n, d, {key, survey:svUuid, kind:'メモ'});
       draftBind(key, collectNote, base);
@@ -9791,6 +11479,32 @@ function delIndividual(u){
 }
 
 /* ---------- 地図 ---------- */
+/* 「地図で見る」から記録を開く。種類ごとに正しい画面へ。
+   何でも入力欄の画面へ送っていたので、地点に魚や環境の値を直接入れられた
+  （監査42回目 Major）*/
+function mapOpenRecord(stUuid){
+  const st = DB.liveStation(stUuid); if(!st) return;
+  if(st.is_spot){ nav('spot', stUuid); return; }
+  // 押した記録そのものを選んで開く。渡さないと、別の記録の入力欄が開く
+  //（監査43回目 Major）
+  // 地点のある調査で、どの地点にも属さない記録を開くときは、
+  // その分だけの地図にする。しないと、調査ハブの専用画面の決まりを抜けて
+  // 全部が混ざり、新しく作れてしまう（監査55回目 Major）
+  const 地点あり = spotList(st.survey_uuid).some(x=>x.is_spot);
+  const 未所属 = 地点あり && !st.spot_uuid;
+  if(unitKindOf(st)){
+    nav('fishMap', {survey: st.survey_uuid, spot: st.spot_uuid || '',
+                    record: stUuid, loose: 未所属 ? 1 : 0});
+    return;
+  }
+  const sv0 = DB.getAlive(DB.key.sv, st.survey_uuid) || {};
+  if(stationKind(sv0, st) === '物理環境' && !isMesh(st)){
+    nav('envMap', {survey: st.survey_uuid, spot: st.spot_uuid || '',
+                   record: stUuid, loose: 未所属 ? 1 : 0});
+    return;
+  }
+  nav('station', stUuid);      // 前のやり方で作った箇所
+}
 SCREENS.map = (svUuid)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
@@ -9827,7 +11541,7 @@ SCREENS.map = (svUuid)=>{
         const n = stationTotal(st);
         L.marker(p, {icon:dotIcon('#3fb950',13)}).addTo(map)
           .bindPopup(`<b>${esc(st.name||'')}</b><br>${esc(st.habitat_type||'')} ${n}尾`
-            + `<br><a href="#" onclick="nav('station','${st.uuid}');return false;">開く</a>`);
+            + `<br><a href="#" onclick="mapOpenRecord('${st.uuid}');return false;">開く</a>`);
       });
       // 測点も小さく出す
       DB.stationsOf(svUuid).forEach(st=>{
@@ -10225,20 +11939,43 @@ SCREENS.exportHub = (svUuid)=>{
         <br><br>取り込み側は、環境区分・水温・水深・流速・調査方法・時刻などが
         すべて同じ箇所を1つとして扱います。分けて残したいときは、
         時刻か環境の値のどれかが違うようにしてください。</div>` : ''}
-      ${envOnly ? `<div class="card">
+      ${!canExportDbCsv(sv) ? `<div class="card">
         <h3 style="margin-top:0">データベース取り込み用のCSV（31列）</h3>
-        <div class="warnbox">この調査は<b>物理環境</b>なので、31列のCSVは出しません。<br>
+        <div class="warnbox">この調査には<b>魚の記録がありません</b>ので、31列のCSVは出しません。<br>
           31列のCSVは1行が「1種の結果」で、種IDが要るためです。<br>
           川の環境は、下の「箇所ごとの記録」「測点ごとの水深・流速」に出ます。</div>
       </div>` : `<div class="card">
         <div class="big">${r.rows.length} 行</div>
         <div class="dim small">データベース取り込み用のCSV（31列）</div>
-        ${(()=>{ const ds = Array.from(new Set(r.rows.map(x=>x['調査日']))).filter(Boolean).sort();
-          if(ds.length<=1) return '';
-          return `<div class="warnbox">この調査は <b>${ds.length}日</b>にわたります
-            （${esc(ds.join('・'))}）。<br>
-            取り込み側は調査日ごとに分けるので、データベースには
-            <b>${ds.length}件の調査</b>として入ります。</div>`; })()}
+        ${(()=>{
+          // 取り込み側が「同じ調査」とみなす手がかりそのもので数える。
+          // 日付だけで数えると、同じ日でも地点や天気が違えば分かれる分を
+          // 見落とし、実際より少なく見せてしまう（監査65回目 Major）
+          const 鍵 = new Set(r.rows.map(x=>FS_EVENT_KEY
+            .map(c=>String(x[c]==null?'':x[c])).join(String.fromCharCode(1))));
+          const ds = Array.from(new Set(r.rows.map(x=>x['調査日']))).filter(Boolean).sort();
+          if(鍵.size<=1) return '';
+          return `<div class="warnbox">このCSVは、データベースには
+            <b>${鍵.size}件の調査</b>として入ります。<br>
+            取り込み側は、調査日のほか 地点名・区間名・天気・河川形態A などが
+            違えば別の調査として分けます。${ds.length>1
+              ? `（この調査は ${ds.length}日にわたります：${esc(ds.join('・'))}）` : ''}
+            </div>`; })()}
+        ${(()=>{
+          // いまの取り込み側は見分けが狭いので、ここで別の調査として出しても
+          // 取り込むと1つに合流してしまう組み合わせがある（監査69回目 Critical）
+          const w = eventMergeWarn(r.rows);
+          if(!w.length) return '';
+          return `<div class="warnbox"><b>データベース側を直すまでの間、
+            次の分は1つの調査にまとめられます。</b><br>
+            ${w.slice(0,5).map(x=>esc(x)).join('<br>')}
+            ${w.length>5?`<br>ほか ${w.length-5}件`:''}<br>
+            このCSVは正しく分かれています。取り込み側がまだ
+            <b>業務番号・河川名・地点名・調査日・緯度・経度</b>しか見ておらず、
+            区間名・天気・河川形態A・季節・業務名 を見ていないためです。<br>
+            <b>データベース側をこのCSVに合わせて直す予定です。</b>
+            それまでに分けて入れたいときは、地点ごとの<b>地点名</b>を変えてください。
+            </div>`; })()}
         ${r.excluded.length ? `<div class="warnbox">除外 ${r.excluded.length}件<br>
           ${r.excluded.slice(0,10).map(e=>esc(e)).join('<br>')}
           ${r.excluded.length>10?`<br>ほか ${r.excluded.length-10}件`:''}</div>` : ''}
@@ -10611,8 +12348,8 @@ function exportExtraCsv(svUuid, kind){
 
 function exportDbCsv(svUuid){
   const svk = DB.getAlive(DB.key.sv, svUuid);
-  if(isEnvSurvey(svk)){
-    toast('この調査は物理環境なので、31列のCSVは出せません。'
+  if(!canExportDbCsv(svk)){
+    toast('この調査には魚の記録がないので、31列のCSVは出せません。'
       + '「箇所ごとの記録」「測点ごとの水深・流速」をお使いください', 8000);
     return;
   }
