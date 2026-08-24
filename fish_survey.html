@@ -145,7 +145,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v123';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v124';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -6797,7 +6797,7 @@ SCREENS.stationEdit = (arg)=>{
       ${isNew ? `<input type="hidden" id="s_no" value="${no}">` : ''}
       ${isNew?'':`<button class="btn ng" onclick="${st.is_spot
         ? `spotRemove('${arg.uuid}')` : `deleteStation('${arg.uuid}')`}"
-        >この${st.is_spot ? '地点' : stWord(sv)}を削除する</button>`}
+        >この${st.is_spot ? '地点' : (isMesh(st) ? '範囲' : stWord(sv))}を削除する</button>`}
     `,
     onMount(){
       if(isDetail(sv)){
@@ -7079,9 +7079,20 @@ function deleteStation(u){
   const st0 = DB.liveStation(u);
   if(st0 && st0.is_spot){ spotRemove(u); return; }
   const st = DB.get(DB.key.st, u);
-  const n = DB.catchesOf(u).length;
   const W = stWordOf(st);
-  if(!confirm(`この${W}を削除します。${n>0?`記録${n}件も一緒に見えなくなります。`:''}よろしいですか？`)) return;
+  // メッシュは「採捕記録」ではなく「入力済みのマス」を数えて知らせる
+  //（2026-08-24 の実機の声：間違えて作った範囲を消す仕組み）
+  let 文;
+  if(st && isMesh(st)){
+    const n = meshCellsOf(u).length;
+    文 = `この${W}を削除します。`
+      + (n>0 ? `入力済みのマス${n}件も一緒に見えなくなります。` : '')
+      + 'ごみ箱から戻せます。よろしいですか？';
+  }else{
+    const n = DB.catchesOf(u).length;
+    文 = `この${W}を削除します。${n>0?`記録${n}件も一緒に見えなくなります。`:''}よろしいですか？`;
+  }
+  if(!confirm(文)) return;
   // 印を付けるのは箇所1つだけ。中の記録は「親が消えている」ことで隠れる。
   // 何件も書き込むと、途中で失敗したときに迷子の記録が残る
   if(!DB.softDelete(DB.key.st, u)) return;
@@ -12333,7 +12344,10 @@ SCREENS.mesh = (stUuid)=>{
       ${baseMapButtonsHtml()}
       <div id="meshmap2" class="map"></div>
 
-      <button class="btn" onclick="nav('meshSetup','${stUuid}')">範囲と格子を決める</button>
+      <button class="btn" onclick="nav('meshSetup','${stUuid}')">範囲と格子を決め直す</button>
+      <button class="btn" onclick="nav('stationEdit',{uuid:'${stUuid}'})"
+        >この範囲の設定を開く（名前・日付など）</button>
+      <button class="btn ng" onclick="deleteStation('${stUuid}')">この範囲をごみ箱へ</button>
     `,
     onMount(){
       const g2 = meshGeom(st);
