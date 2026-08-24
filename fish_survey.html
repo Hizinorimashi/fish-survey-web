@@ -145,7 +145,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v129';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v130';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -13342,7 +13342,7 @@ SCREENS.individuals = (caUuid)=>{
         </div>`
        : '<div class="card dim">まだ1尾も測っていません。</div>'}
 
-      <button class="btn" onclick="goBack()">測り終える</button>
+      <button class="btn" onclick="measureDone('${caUuid}')">測り終える</button>
     `,
     onMount(){
       const el=$('#i_tl'); if(el) el.focus();
@@ -13353,6 +13353,23 @@ SCREENS.individuals = (caUuid)=>{
 };
 
 /* 測る魚種を切り替える。画面は積み上げず、入れ替える */
+/* 測り終えたら、その記録の魚類調査の画面へ戻る（2026-08-24 の実機の声）。
+   goBack だと、魚種の選び直しなどで積んだ画面の分だけ戻りすぎて、
+   地点の一覧まで飛んでしまうことがあった。
+   地図で作った記録（E・P/F・P）なら、その地点の魚の地図へ。
+   前のやり方の箇所なら、箇所の画面へ */
+function measureDone(caUuid){
+  const c = DB.getAlive(DB.key.ca, caUuid);
+  const st = c ? DB.liveStation(c.station_uuid) : null;
+  if(!st){ goBack(); return; }
+  if(unitKindOf(st)){
+    FISH_SEL = st.uuid;
+    goTo('fishMap', {survey: st.survey_uuid, spot: st.spot_uuid || '',
+                     record: st.uuid});
+    return;
+  }
+  goTo('station', st.uuid);
+}
 function switchMeasure(caUuid){
   navReplace('individuals', caUuid);
 }
