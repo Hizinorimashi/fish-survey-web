@@ -145,7 +145,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v127';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v128';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1196,12 +1196,22 @@ const SPECIES_STAMP = {n:103, sha:"9db2a39aa715"};
 function speciesById(id){ return SPECIES.find(s=>s.id===id) || null; }
 /* 検索。正式な和名・科名に加えて、旧名や現場の呼び名（別名）でも見つかるようにする。
    別名で見つけても、保存されるのは常に種ID */
+/* ひらがなをカタカナに直す（検索用）。魚の名前はカタカナで持っているので、
+   「やまめ」と打ってもヤマメが出るようにする（2026-08-24 の実機の声） */
+function kataOf(s){
+  return String(s||'').replace(/[ぁ-ゖ]/g,
+    ch=>String.fromCharCode(ch.charCodeAt(0)+0x60));
+}
 function speciesSearch(q){
   q = String(q||'').trim();
   if(!q) return SPECIES;
+  const qs = [q];
+  const k = kataOf(q);
+  if(k !== q) qs.push(k);          // ひらがなで打たれたら、カタカナでも探す
+  const hit = name => qs.some(x=>String(name).indexOf(x)>=0);
   const hitIds = new Set();
-  Object.keys(SPECIES_ALIAS).forEach(name=>{ if(name.indexOf(q)>=0) hitIds.add(SPECIES_ALIAS[name]); });
-  return SPECIES.filter(s=> s.ja.indexOf(q)>=0 || (s.fam||'').indexOf(q)>=0 || hitIds.has(s.id));
+  Object.keys(SPECIES_ALIAS).forEach(name=>{ if(hit(name)) hitIds.add(SPECIES_ALIAS[name]); });
+  return SPECIES.filter(s=> hit(s.ja) || hit(s.fam||'') || hitIds.has(s.id));
 }
 function speciesAliasOf(id){
   return Object.keys(SPECIES_ALIAS).filter(n=>SPECIES_ALIAS[n]===id);
@@ -7671,6 +7681,35 @@ function fishClosePoly(svUuid){
   toast(`${st.name} を閉じました` + (中 ? `（中に ${中}件）` : ''), 5000);
   return true;
 }
+/* 描いている途中の囲いの角を、最後の1つだけ取り消す（2026-08-24 の実機の声）。
+   地図のボタンから使う。最初の1つを取り消したら、描きかけごとやめる */
+function fishUndoCorner(svUuid){
+  const st = fishDrawing();
+  if(!st){
+    toast('いま描いている囲いがありません。角を置いてからお使いください', 5000);
+    return false;
+  }
+  const pts = (st.poly||[]);
+  if(pts.length <= 1){
+    if(!DB.softDelete(DB.key.st, st.uuid)){
+      toast('取り消せませんでした', 6000); return false;
+    }
+    FISH_NEXT = {kind:FISH_NEXT.kind, draw:'', survey:FISH_NEXT.survey};
+    if(FISH_SEL === st.uuid) FISH_SEL = null;
+    unitRelink(st.survey_uuid);   // 消えた囲いを親に持ったままにしない
+    toast('最初の角を取り消したので、囲いを描くのをやめました', 5000);
+    render();
+    return true;
+  }
+  st.poly = pts.slice(0, -1);
+  if(!DB.upsert(DB.key.st, st)){
+    toast('取り消せませんでした（端末の空き容量をご確認ください）', 6000);
+    return false;
+  }
+  toast(`${st.name} の角を1つ戻しました（残り ${st.poly.length}個）`);
+  render();
+  return true;
+}
 /* 描いている途中の囲いを、まるごとやめる */
 function fishCancelPoly(){
   const st = fishDrawing();
@@ -11114,6 +11153,7 @@ SCREENS.fishMap = (arg)=>{
       ], 'bottomleft');
       addMapIconBar(map, [
         {icon:'addHere', title:'いまいる場所に足す', tap:()=>fishAddHere(svUuid)},
+        {icon:'undo', title:'角を1つ戻す', tap:()=>fishUndoCorner(svUuid)},
         {icon:'polyClose', title:'囲いを閉じる',
          tap:()=>{ if(fishClosePoly(svUuid)) render(); }},
       ], 'bottomright');
