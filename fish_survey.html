@@ -71,7 +71,10 @@ button{font-family:inherit;font-size:15px;cursor:pointer}
 .seg button.on{background:var(--accent);border-color:var(--accent);color:#04121f;font-weight:700}
 .seg.basemap button{font-size:13px;padding:7px 10px}
 #toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(20px);
-  background:#0f1720;border:1px solid var(--line);color:var(--fg);padding:11px 16px;border-radius:9px;
+  /* 背景も文字もテーマの色にそろえる。背景だけ濃い色で固定すると、
+     明るい表示のとき「黒地に黒文字」になって読めない（2026-08-24 の実機の声） */
+  background:var(--panel);border:1px solid var(--line);color:var(--fg);
+  box-shadow:0 4px 16px rgba(0,0,0,.35);padding:11px 16px;border-radius:9px;
   max-width:88vw;opacity:0;pointer-events:none;transition:.2s;z-index:2000;font-size:14px;text-align:center}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 .map{width:100%;height:60vh;min-height:320px;border-radius:10px;overflow:hidden;background:#0d1219}
@@ -142,7 +145,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v122';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v123';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
