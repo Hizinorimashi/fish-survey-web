@@ -142,7 +142,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v121';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v122';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -3474,8 +3474,10 @@ function destroyMaps(){
   });
   OPOLYLAYER=null; SITEMARK=null; SVMARK=null; SVSITES=[];
 }
-/* 地図を寄せられる上限。タイルは18までなので、その先は引き伸ばして見せる */
-const MAP_MAX_ZOOM = 22;
+/* 地図を寄せられる上限。タイルは18までなので、その先は引き伸ばして見せる。
+   小さい川では写真がぼやけても、マスの線や囲いはくっきり大きくなるので、
+   操作のしやすさを優先して深めに取る（2026-08-24 の実機の声） */
+const MAP_MAX_ZOOM = 24;
 /* この端末で地図を回せるか。部品が読めていれば回せる */
 function canRotate(){
   return !!(window.L && L.Map && L.Map.prototype
