@@ -145,7 +145,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v126';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v127';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1055,7 +1055,7 @@ function searchPlace(name){
 /* <<<FS_SPECIES_AUTO_START>>>
    ここから下は自動生成。手で書き換えない。
    作り直す: 魚類データベース/scripts/generate_fish_app_species.py
-   元:       species_master の is_active=TRUE を sort_order 順に 101種 */
+   元:       species_master の is_active=TRUE を sort_order 順に 103種 */
 const SPECIES = [
   {id:"FW001", ja:"ミツバヤツメ", fam:"ヤツメウナギ科", ord:1},
   {id:"FW003", ja:"キタスナヤツメ", fam:"ヤツメウナギ科", ord:2},
@@ -1106,58 +1106,60 @@ const SPECIES = [
   {id:"FW042", ja:"ミヤベイワナ", fam:"サケ科", ord:47},
   {id:"FW043", ja:"ニジマス", fam:"サケ科", ord:48},
   {id:"FW044", ja:"サケ", fam:"サケ科", ord:49},
-  {id:"FW045", ja:"ベニザケ", fam:"サケ科", ord:50},
-  {id:"FW046", ja:"ヒメマス", fam:"サケ科", ord:51},
-  {id:"FW047", ja:"カラフトマス", fam:"サケ科", ord:52},
-  {id:"FW048", ja:"マスノスケ", fam:"サケ科", ord:53},
-  {id:"FW049", ja:"ギンザケ", fam:"サケ科", ord:54},
-  {id:"FW050", ja:"サクラマス（ヤマメ）", fam:"サケ科", ord:55},
-  {id:"FW051", ja:"サツキマス（アマゴ）", fam:"サケ科", ord:56},
-  {id:"FW052", ja:"イトヨ", fam:"トゲウオ科", ord:57},
-  {id:"FW053", ja:"陸封型イトヨ", fam:"トゲウオ科", ord:58},
-  {id:"FW054", ja:"ニホンイトヨ", fam:"トゲウオ科", ord:59},
-  {id:"FW095", ja:"イトヨ属", fam:"トゲウオ科", ord:60},
-  {id:"FW055", ja:"エゾトミヨ", fam:"トゲウオ科", ord:61},
-  {id:"FW056", ja:"トミヨ", fam:"トゲウオ科", ord:62},
-  {id:"FW057", ja:"トミヨ属汽水型", fam:"トゲウオ科", ord:63},
-  {id:"FW098", ja:"トミヨ属", fam:"トゲウオ科", ord:64},
-  {id:"FW058", ja:"ボラ", fam:"ボラ科", ord:65},
-  {id:"FW059", ja:"メナダ", fam:"ボラ科", ord:66},
-  {id:"FW060", ja:"グッピー", fam:"カダヤシ科", ord:67},
-  {id:"FW061", ja:"コクチモーリー", fam:"カダヤシ科", ord:68},
-  {id:"FW062", ja:"ミナミメダカ", fam:"メダカ科", ord:69},
-  {id:"FW063", ja:"ブルーギル", fam:"サンフィッシュ科", ord:70},
-  {id:"FW064", ja:"オオクチバス", fam:"サンフィッシュ科", ord:71},
-  {id:"FW065", ja:"コクチバス", fam:"サンフィッシュ科", ord:72},
-  {id:"FW066", ja:"カワスズメ", fam:"カワスズメ科", ord:73},
-  {id:"FW067", ja:"ナイルティラピア", fam:"カワスズメ科", ord:74},
-  {id:"FW068", ja:"カジカ中卵型", fam:"カジカ科", ord:75},
-  {id:"FW069", ja:"カンキョウカジカ", fam:"カジカ科", ord:76},
-  {id:"FW070", ja:"ハナカジカ", fam:"カジカ科", ord:77},
-  {id:"FW071", ja:"エゾハナカジカ", fam:"カジカ科", ord:78},
-  {id:"FW105", ja:"カジカ属", fam:"カジカ科", ord:79},
-  {id:"FW072", ja:"ミミズハゼ", fam:"ハゼ科", ord:80},
-  {id:"FW073", ja:"シロウオ", fam:"ハゼ科", ord:81},
-  {id:"FW074", ja:"マハゼ", fam:"ハゼ科", ord:82},
-  {id:"FW075", ja:"アシシロハゼ", fam:"ハゼ科", ord:83},
-  {id:"FW076", ja:"アカオビシマハゼ", fam:"ハゼ科", ord:84},
-  {id:"FW077", ja:"シモフリシマハゼ", fam:"ハゼ科", ord:85},
-  {id:"FW078", ja:"ヌマチチブ", fam:"ハゼ科", ord:86},
-  {id:"FW079", ja:"ルリヨシノボリ", fam:"ハゼ科", ord:87},
-  {id:"FW101", ja:"トウヨシノボリ種群", fam:"ハゼ科", ord:88},
-  {id:"FW099", ja:"ヨシノボリ属", fam:"ハゼ科", ord:89},
-  {id:"FW080", ja:"スミウキゴリ", fam:"ハゼ科", ord:90},
-  {id:"FW081", ja:"ウキゴリ", fam:"ハゼ科", ord:91},
-  {id:"FW082", ja:"シマウキゴリ", fam:"ハゼ科", ord:92},
-  {id:"FW083", ja:"ビリンゴ", fam:"ハゼ科", ord:93},
-  {id:"FW084", ja:"ジュズカケハゼ", fam:"ハゼ科", ord:94},
-  {id:"FW085", ja:"カムルチー", fam:"タイワンドジョウ科", ord:95},
-  {id:"FW086", ja:"ヌマガレイ", fam:"カレイ科", ord:96},
-  {id:"FW087", ja:"イシガレイ", fam:"カレイ科", ord:97},
-  {id:"FW108", ja:"スジエビ", fam:"テナガエビ科", ord:98},
-  {id:"FW109", ja:"テナガエビ", fam:"テナガエビ科", ord:99},
-  {id:"FW110", ja:"ヌマエビ", fam:"ヌマエビ科", ord:100},
-  {id:"FW111", ja:"モクズガニ", fam:"モクズガニ科", ord:101},
+  {id:"FW044J", ja:"サケ稚魚", fam:"サケ科", ord:50},
+  {id:"FW045", ja:"ベニザケ", fam:"サケ科", ord:51},
+  {id:"FW046", ja:"ヒメマス", fam:"サケ科", ord:52},
+  {id:"FW047", ja:"カラフトマス", fam:"サケ科", ord:53},
+  {id:"FW048", ja:"マスノスケ", fam:"サケ科", ord:54},
+  {id:"FW049", ja:"ギンザケ", fam:"サケ科", ord:55},
+  {id:"FW050", ja:"サクラマス", fam:"サケ科", ord:56},
+  {id:"FW050J", ja:"ヤマメ", fam:"サケ科", ord:57},
+  {id:"FW051", ja:"サツキマス（アマゴ）", fam:"サケ科", ord:58},
+  {id:"FW052", ja:"イトヨ", fam:"トゲウオ科", ord:59},
+  {id:"FW053", ja:"陸封型イトヨ", fam:"トゲウオ科", ord:60},
+  {id:"FW054", ja:"ニホンイトヨ", fam:"トゲウオ科", ord:61},
+  {id:"FW095", ja:"イトヨ属", fam:"トゲウオ科", ord:62},
+  {id:"FW055", ja:"エゾトミヨ", fam:"トゲウオ科", ord:63},
+  {id:"FW056", ja:"トミヨ", fam:"トゲウオ科", ord:64},
+  {id:"FW057", ja:"トミヨ属汽水型", fam:"トゲウオ科", ord:65},
+  {id:"FW098", ja:"トミヨ属", fam:"トゲウオ科", ord:66},
+  {id:"FW058", ja:"ボラ", fam:"ボラ科", ord:67},
+  {id:"FW059", ja:"メナダ", fam:"ボラ科", ord:68},
+  {id:"FW060", ja:"グッピー", fam:"カダヤシ科", ord:69},
+  {id:"FW061", ja:"コクチモーリー", fam:"カダヤシ科", ord:70},
+  {id:"FW062", ja:"ミナミメダカ", fam:"メダカ科", ord:71},
+  {id:"FW063", ja:"ブルーギル", fam:"サンフィッシュ科", ord:72},
+  {id:"FW064", ja:"オオクチバス", fam:"サンフィッシュ科", ord:73},
+  {id:"FW065", ja:"コクチバス", fam:"サンフィッシュ科", ord:74},
+  {id:"FW066", ja:"カワスズメ", fam:"カワスズメ科", ord:75},
+  {id:"FW067", ja:"ナイルティラピア", fam:"カワスズメ科", ord:76},
+  {id:"FW068", ja:"カジカ中卵型", fam:"カジカ科", ord:77},
+  {id:"FW069", ja:"カンキョウカジカ", fam:"カジカ科", ord:78},
+  {id:"FW070", ja:"ハナカジカ", fam:"カジカ科", ord:79},
+  {id:"FW071", ja:"エゾハナカジカ", fam:"カジカ科", ord:80},
+  {id:"FW105", ja:"カジカ属", fam:"カジカ科", ord:81},
+  {id:"FW072", ja:"ミミズハゼ", fam:"ハゼ科", ord:82},
+  {id:"FW073", ja:"シロウオ", fam:"ハゼ科", ord:83},
+  {id:"FW074", ja:"マハゼ", fam:"ハゼ科", ord:84},
+  {id:"FW075", ja:"アシシロハゼ", fam:"ハゼ科", ord:85},
+  {id:"FW076", ja:"アカオビシマハゼ", fam:"ハゼ科", ord:86},
+  {id:"FW077", ja:"シモフリシマハゼ", fam:"ハゼ科", ord:87},
+  {id:"FW078", ja:"ヌマチチブ", fam:"ハゼ科", ord:88},
+  {id:"FW079", ja:"ルリヨシノボリ", fam:"ハゼ科", ord:89},
+  {id:"FW101", ja:"トウヨシノボリ種群", fam:"ハゼ科", ord:90},
+  {id:"FW099", ja:"ヨシノボリ属", fam:"ハゼ科", ord:91},
+  {id:"FW080", ja:"スミウキゴリ", fam:"ハゼ科", ord:92},
+  {id:"FW081", ja:"ウキゴリ", fam:"ハゼ科", ord:93},
+  {id:"FW082", ja:"シマウキゴリ", fam:"ハゼ科", ord:94},
+  {id:"FW083", ja:"ビリンゴ", fam:"ハゼ科", ord:95},
+  {id:"FW084", ja:"ジュズカケハゼ", fam:"ハゼ科", ord:96},
+  {id:"FW085", ja:"カムルチー", fam:"タイワンドジョウ科", ord:97},
+  {id:"FW086", ja:"ヌマガレイ", fam:"カレイ科", ord:98},
+  {id:"FW087", ja:"イシガレイ", fam:"カレイ科", ord:99},
+  {id:"FW108", ja:"スジエビ", fam:"テナガエビ科", ord:100},
+  {id:"FW109", ja:"テナガエビ", fam:"テナガエビ科", ord:101},
+  {id:"FW110", ja:"ヌマエビ", fam:"ヌマエビ科", ord:102},
+  {id:"FW111", ja:"モクズガニ", fam:"モクズガニ科", ord:103},
 ];
 const SPECIES_ALIAS = {
   "アカハラ": "FW021",
@@ -1170,7 +1172,9 @@ const SPECIES_ALIAS = {
   "エゾイワナ": "FW040",
   "カジカ": "FW105",
   "キングサーモン": "FW048",
-  "サクラマス": "FW050",
+  "サクラマス稚魚": "FW050J",
+  "サクラマス（ヤマメ）": "FW050",
+  "サケの稚魚": "FW044J",
   "スナヤツメ": "FW103",
   "スナヤツメ北方種": "FW003",
   "セッパリマス": "FW047",
@@ -1179,37 +1183,15 @@ const SPECIES_ALIAS = {
   "ブラックバス": "FW064",
   "ヘラブナ": "FW008",
   "マルタウグイ": "FW019",
-  "ヤマメ": "FW050",
   "ヨシノボリ": "FW101",
   "ライギョ": "FW085",
 };
-const SPECIES_STAMP = {n:101, sha:"d7be0336f474"};
+const SPECIES_STAMP = {n:103, sha:"9db2a39aa715"};
 /* <<<FS_SPECIES_AUTO_END>>> */
 
-/* 手直し：親魚と稚魚を分けて記録できるようにする（2026-08-23 の実機の声）。
-   サクラマス＝親魚、ヤマメ＝稚魚（川に残る型）。サケ＝親魚、サケ稚魚＝稚魚。
-   種リストを作り直しても消えないよう、自動生成の区画の外に置く。
-   新しいID（FW050J・FW044J）は、データベース側の種マスタにも
-   あとで足す（tasks/todo.md に宿題） */
-(function(){
-  const 直す = (id, ja)=>{ const x = SPECIES.find(s=>s.id===id); if(x) x.ja = ja; };
-  const 後に足す = (id, rec)=>{
-    if(SPECIES.some(s=>s.id===rec.id)) return;
-    const i = SPECIES.findIndex(s=>s.id===id);
-    const 元 = SPECIES[i];
-    SPECIES.splice(i+1, 0, Object.assign({ord: 元 ? 元.ord : 999}, rec));
-  };
-  直す('FW050', 'サクラマス');
-  後に足す('FW050', {id:'FW050J', ja:'ヤマメ', fam:'サケ科'});
-  後に足す('FW044', {id:'FW044J', ja:'サケ稚魚', fam:'サケ科'});
-  // 「ヤマメ」「サクラマス」は正式な和名になったので、別名からは外す
-  //（名前そのもので見つかる。別名に残すと、正式な和名を横取りしてしまう）
-  delete SPECIES_ALIAS['ヤマメ'];
-  delete SPECIES_ALIAS['サクラマス'];
-  SPECIES_ALIAS['サクラマス稚魚'] = 'FW050J';
-  SPECIES_ALIAS['サクラマス（ヤマメ）'] = 'FW050';
-  SPECIES_ALIAS['サケの稚魚'] = 'FW044J';
-})();
+/* 親魚と稚魚の区別（サクラマス FW050／ヤマメ FW050J、サケ FW044／サケ稚魚 FW044J）は
+   2026-08-24 に正本（データベースの種マスタ）へ取り込んだ。
+   ここでの手直しは不要になった（自動生成の区画に含まれて届く） */
 
 function speciesById(id){ return SPECIES.find(s=>s.id===id) || null; }
 /* 検索。正式な和名・科名に加えて、旧名や現場の呼び名（別名）でも見つかるようにする。
@@ -4722,31 +4704,9 @@ const FS_HABITAT_KEY = ['環境区分','河川形態B','水温','水深','流速
    魚類データベース app/pages/4_資料管理.py の _EVENT_KEY と同じ並び */
 const FS_EVENT_KEY = ['業務番号','業務名','河川名','地点名','区間名',
   '調査日','季節','天気','緯度','経度','河川形態A'];
-/* いまの取り込み側（魚類データベース app/database.py の get_event_by_key）が
-   「同じ調査」とみなすのは、この6項目だけ。こちらの11項目より狭い。
-   そのため、こちらで別の調査として出した行が、取り込むと1つに合流し、
-   地点情報や魚が別の調査のものになる（監査69回目 Critical）。
-   本当の直しは取り込み側を11項目にそろえること（Phase 5）。
-   それまでは、合流してしまう組み合わせを書き出す前に知らせる */
-const FS_EVENT_KEY_DB = ['業務番号','河川名','地点名','調査日','緯度','経度'];
-/* 取り込み側で合流してしまう組み合わせを探す。無ければ空の配列 */
-function eventMergeWarn(rows){
-  const 表 = {};
-  (rows||[]).forEach(r=>{
-    const 狭い = FS_EVENT_KEY_DB.map(c=>String(r[c]==null?'':r[c]))
-      .join(String.fromCharCode(1));
-    const 広い = FS_EVENT_KEY.map(c=>String(r[c]==null?'':r[c]))
-      .join(String.fromCharCode(1));
-    (表[狭い] || (表[狭い] = new Set())).add(広い);
-  });
-  const out = [];
-  Object.keys(表).forEach(k=>{
-    if(表[k].size <= 1) return;
-    const 見本 = k.split(String.fromCharCode(1));
-    out.push(`${見本[1]||''} ${見本[2]||''} ${見本[3]||''}（${表[k].size}件が1つに）`);
-  });
-  return out;
-}
+/* 取り込み側（魚類データベース）は 2026-08-24 に同じ11項目にそろえた。
+   6項目しか見ずに調査が合流する問題（監査69回目 Critical）は解消し、
+   合流の警告（FS_EVENT_KEY_DB・eventMergeWarn）は役目を終えて撤去した */
 
 /* データベース取り込み用の行を組み立てる。
    1行 = 1種の結果。落とすものは黙って落とさず、理由と件数を返す */
@@ -13959,21 +13919,6 @@ SCREENS.exportHub = (svUuid)=>{
             取り込み側は、調査日のほか 地点名・区間名・天気・河川形態A などが
             違えば別の調査として分けます。${ds.length>1
               ? `（この調査は ${ds.length}日にわたります：${esc(ds.join('・'))}）` : ''}
-            </div>`; })()}
-        ${(()=>{
-          // いまの取り込み側は見分けが狭いので、ここで別の調査として出しても
-          // 取り込むと1つに合流してしまう組み合わせがある（監査69回目 Critical）
-          const w = eventMergeWarn(r.rows);
-          if(!w.length) return '';
-          return `<div class="warnbox"><b>データベース側を直すまでの間、
-            次の分は1つの調査にまとめられます。</b><br>
-            ${w.slice(0,5).map(x=>esc(x)).join('<br>')}
-            ${w.length>5?`<br>ほか ${w.length-5}件`:''}<br>
-            このCSVは正しく分かれています。取り込み側がまだ
-            <b>業務番号・河川名・地点名・調査日・緯度・経度</b>しか見ておらず、
-            区間名・天気・河川形態A・季節・業務名 を見ていないためです。<br>
-            <b>データベース側をこのCSVに合わせて直す予定です。</b>
-            それまでに分けて入れたいときは、地点ごとの<b>地点名</b>を変えてください。
             </div>`; })()}
         ${r.excluded.length ? `<div class="warnbox">除外 ${r.excluded.length}件<br>
           ${r.excluded.slice(0,10).map(e=>esc(e)).join('<br>')}
