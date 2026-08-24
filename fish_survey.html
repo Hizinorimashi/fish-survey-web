@@ -145,7 +145,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v125';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v126';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -12140,6 +12140,9 @@ function undoMeshCorner(){
   while(i >= 0 && !list[i]) i--;
   if(i < 0){ toast('戻す四隅がありません'); return; }
   list.length = i;               // その1つと、後ろの空きをまとめて外す
+  // 前に残った空き（順番を飛ばして押さえた分）も片付ける。残すと、
+  // 次の地図タップが1つ目ではなく2つ目として入ってしまう（監査85回目 minor）
+  while(list.length && !list[list.length-1]) list.pop();
   window._meshCorners = list;
   drawMeshSetup();
   showMeshPlan();
