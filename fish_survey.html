@@ -145,7 +145,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v124';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v125';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -12051,7 +12051,10 @@ SCREENS.meshSetup = (stUuid)=>{
             </tr>`).join('')}
         </tbody></table>
         <div class="dim small" id="mesh_gps"></div>
-        <button class="btn sm" onclick="clearMeshCorners()">四隅を消してやり直す</button>
+        <div class="row">
+          <button class="btn sm" onclick="undoMeshCorner()">1つ戻す</button>
+          <button class="btn sm" onclick="clearMeshCorners()">四隅を消してやり直す</button>
+        </div>
       </div>
 
       ${baseMapButtonsHtml()}
@@ -12127,6 +12130,20 @@ function grabMeshCorner(i){
     showMeshPlan();
     toast(`${i+1}つ目を押さえました`);
   });
+}
+/* 押さえた四隅を、最後の1つだけ取り消す（2026-08-24 の実機の声）。
+   「いまここ」で順番を飛ばして押さえた場合の空きは数えず、
+   入っている中でいちばん後ろの1つを外す */
+function undoMeshCorner(){
+  const list = (window._meshCorners||[]).slice();
+  let i = list.length - 1;
+  while(i >= 0 && !list[i]) i--;
+  if(i < 0){ toast('戻す四隅がありません'); return; }
+  list.length = i;               // その1つと、後ろの空きをまとめて外す
+  window._meshCorners = list;
+  drawMeshSetup();
+  showMeshPlan();
+  toast(`${i+1}つ目を取り消しました`);
 }
 function clearMeshCorners(){
   if(!confirm('押さえた四隅を消します。よろしいですか？')) return;
@@ -12325,8 +12342,8 @@ SCREENS.mesh = (stUuid)=>{
 
       ${g ? `<div class="card">
         <h3 style="margin-top:0">マス（数字は水深cm）</h3>
-        <div class="dim small">緑は入力済み。タップで開きます。
-          左が左岸、上が上流です。</div>
+        <div class="dim small">緑は入力済み。タップで開きます（下の地図のマスを
+          タップしても開けます）。左が左岸、上が上流です。</div>
         ${grid}
       </div>` : ''}
 
@@ -12366,9 +12383,12 @@ SCREENS.mesh = (stUuid)=>{
       for(let r=0;r<g2.rows && k<draw;r++){
         for(let cc=0;cc<g2.cols && k<draw;cc++,k++){
           const on = !!cm[r+'_'+cc];
-          MESHLAYER.push(L.polygon(meshCellPoly(g2.corners, g2.rows, g2.cols, r, cc),
+          const poly = L.polygon(meshCellPoly(g2.corners, g2.rows, g2.cols, r, cc),
             {color: on ? '#2ea043' : '#4aa3ff', weight:1,
-             fillOpacity: on ? .35 : .05}).addTo(map));
+             fillOpacity: on ? .35 : .05}).addTo(map);
+          // 地図のマスをタップしても、そのマスの入力を開ける（2026-08-24 の実機の声）
+          poly.on('click', ()=>nav('meshCell', {station: stUuid, row: r, col: cc}));
+          MESHLAYER.push(poly);
         }
       }
       try{ map.fitBounds(L.latLngBounds(g2.corners).pad(0.2), {animate:false}); }catch(e){}
@@ -12397,6 +12417,8 @@ SCREENS.meshCell = (arg)=>{
       <div class="card">
         <div class="dim small">位置（四隅から計算）
           ${esc(pos[0].toFixed(6)+', '+pos[1].toFixed(6))}</div>
+        ${cur.measured_at ? `<div class="dim small">記録した時刻 ${esc(fmtTime(cur.measured_at))}
+          （最初に保存したとき、自動で付きます。CSVにも出ます）</div>` : ''}
         <label>水深（cm）</label>
         <input id="mx_d" inputmode="decimal" value="${esc(gv('depth_cm'))}"
           placeholder="干出していれば 0">
@@ -12479,6 +12501,10 @@ function saveMeshCell(stUuid, row, col, next){
                   : {uuid:uuid(), survey_uuid:st.survey_uuid, station_uuid:stUuid,
                      row, col, measured_at:nowISO()};
   rec.grid_id = meshGridId(st);
+  // 記録した時刻は、最初の保存のときに自動で付く。あとから直しても
+  // 上書きしない（現場で測った時刻の意味を守る）。前の版で時刻の無い
+  // マスだけ、ここで穴埋めする
+  if(!rec.measured_at) rec.measured_at = nowISO();
   rec.survey_uuid = rec.survey_uuid || st.survey_uuid;
   rec.station_uuid = rec.station_uuid || stUuid;
   rec.row = row; rec.col = col;
