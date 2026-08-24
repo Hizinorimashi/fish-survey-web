@@ -145,7 +145,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v128';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v129';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -13912,6 +13912,95 @@ function packDrop(id){
   });
 }
 
+/* ---- データベースへ直接送る（2026-08-24・鳥アプリの方式を魚版に） ----
+   送るのは31列CSVと同じ行。受け口（魚類データベースの fish_ingest_server.py）は
+   同じものを2回受け取っても増やさない作りなので、押し直しても安全。
+   自動では送らない。押したときだけ送る */
+function dbSendUrl(){ return String(prefs().dbsend_url||'').trim(); }
+function dbSendToken(){ return String(prefs().dbsend_token||''); }
+/* 宛先の検査。おかしな宛先に記録を投げないための門。
+   受け口は「通り道」（/app-ingest）の下に居るので、パスは許す */
+function dbSendCheckUrl(raw){
+  const v = String(raw||'').trim().replace(/\/+$/,'');
+  if(!v) return {why:'宛先が空です'};
+  let u = null;
+  try{ u = new URL(v); }catch(e){}
+  if(!u) return {why:'宛先の形がおかしいです'};
+  if(u.protocol !== 'https:') return {why:'宛先は https で始めてください'};
+  if(u.username || u.password) return {why:'宛先に名前やパスワードを入れないでください'};
+  if(u.search || u.hash) return {why:'宛先に ? や # を付けないでください'};
+  if(/\/(ingest|ping)$/i.test(u.pathname)){
+    return {why:'宛先は /ingest まで書かず、その手前までにしてください'};
+  }
+  return {url:v, ts:/\.ts\.net$/i.test(u.hostname)};
+}
+function dbSendSavePrefs(){
+  if($('#dbs_url')) prefSet('dbsend_url', strVal('#dbs_url'));
+  if($('#dbs_token')) prefSet('dbsend_token', $('#dbs_token').value||'');
+}
+async function dbSendTest(){
+  dbSendSavePrefs();
+  const c = dbSendCheckUrl(dbSendUrl());
+  if(!c.url){ toast(c.why, 7000); return; }
+  toast('つながるか試しています…');
+  try{
+    const r = await fetch(c.url + '/ping', {method:'GET'});
+    const j = await r.json();
+    toast(j && j.ok === true ? 'つながりました'
+      : '返事の形が違います。宛先をご確認ください', 6000);
+  }catch(e){
+    toast('つながりませんでした。電波と宛先をご確認ください', 8000);
+  }
+}
+async function dbSendNow(svUuid){
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
+  dbSendSavePrefs();
+  const c = dbSendCheckUrl(dbSendUrl());
+  if(!c.url){ toast(c.why, 7000); return; }
+  const token = dbSendToken();
+  if(!token){ toast('合言葉を入れてください', 6000); return; }
+  if(/[^\x20-\x7e]/.test(token)){
+    // そのまま送ると意味の分からない通信エラーになる（鳥アプリの教訓）
+    toast('合言葉に日本語などが混ざっています。'
+      + 'データベースが表示した半角の合言葉を入れてください', 9000);
+    return;
+  }
+  if(!c.ts && !confirm('宛先が Tailscale（.ts.net）ではありません。'
+    + 'この宛先に記録を送りますか？')) return;
+  const r = buildDbRows(sv);
+  if(r.blocked.length){ toast('このままでは送れません：' + r.blocked[0], 9000); return; }
+  if(!r.rows.length){ toast('送る行がありません', 6000); return; }
+  toast('送っています…', 8000);
+  let res = null, j = null;
+  try{
+    res = await fetch(c.url + '/ingest', {
+      method:'POST',
+      headers:{'Content-Type':'application/json',
+               'Authorization':'Bearer ' + token,
+               'X-Device-Id': deviceId()},
+      body: JSON.stringify({app:'fish_survey', kind:'db_rows', version:1,
+        survey_uuid: sv.uuid, rows: r.rows}),
+    });
+    try{ j = await res.json(); }catch(e){}
+  }catch(e){
+    toast('送れませんでした（通信エラー）。電波の良いところでお試しください', 10000);
+    return;                        // 受領の印は更新しない
+  }
+  if(!res.ok || !j || j.ok !== true){
+    const why = (j && (j.error || j.message)) || ('HTTP ' + res.status);
+    toast('送れませんでした：' + why, 12000);
+    return;                        // 受領の印は更新しない
+  }
+  const sv2 = DB.getAlive(DB.key.sv, svUuid);
+  if(sv2){
+    sv2.db_sent_at = nowISO();
+    sv2.db_receipt = (j.receipt == null ? '' : String(j.receipt));
+    DB.upsert(DB.key.sv, sv2);
+  }
+  toast('送りました。' + String(j.message||''), 10000);
+  render();
+}
+
 /* ---------- 書き出し ---------- */
 SCREENS.exportHub = (svUuid)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
@@ -13971,6 +14060,25 @@ SCREENS.exportHub = (svUuid)=>{
           前回の書き出し：${esc(fmtDate(sv.exported_at))} ${esc(fmtTime(sv.exported_at))}<br>
           同じCSVをもう一度取り込むと、記録が二重に増えます。</div>` : ''}
       </div>`}
+      ${canExportDbCsv(sv) ? `<div class="card">
+        <h3 style="margin-top:0">データベースへ直接送る</h3>
+        <div class="dim small">上と同じ31列の中身を、CSVを作らずにそのまま
+          データベースへ送ります。<b>同じものを2回送っても、向こうでは増えません。</b></div>
+        <label>宛先</label>
+        <input id="dbs_url" value="${esc(dbSendUrl())}"
+          placeholder="https://…….ts.net/app-ingest">
+        <label>合言葉</label>
+        <input id="dbs_token" type="password" value="${esc(dbSendToken())}"
+          placeholder="データベース側の受け口が表示したもの">
+        <div class="row">
+          <button class="btn sm" onclick="dbSendTest()">つながるか試す</button>
+        </div>
+        <button class="btn pri" ${r.blocked.length?'disabled':''}
+          onclick="dbSendNow('${svUuid}')">いま送る</button>
+        ${sv.db_sent_at ? `<div class="dim small" style="margin-top:8px">
+          前回の送信：${esc(fmtDate(sv.db_sent_at))} ${esc(fmtTime(sv.db_sent_at))}
+          ${sv.db_receipt ? `（受領証 ${esc(sv.db_receipt)}）` : ''}</div>` : ''}
+      </div>` : ''}
       <div class="card">
         <h3 style="margin-top:0">31列に乗らない分</h3>
         <div class="row">
