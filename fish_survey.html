@@ -145,7 +145,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v133';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v134';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -8203,6 +8203,22 @@ function fishAddSpecies(stUuid, spId){
   toast(`${rec.species_name} を足しました。尾数を入れてください`);
   render();
 }
+/* この単位が31列CSVの行になるか（＝開始時刻が要るか）。
+   buildDbRows と同じ条件で、そのつど記録から数え直す。
+   画面を作ったときの値を持ち回ると、あとから尾数を入れたときにずれる
+   （監査93回目 Major。尾数はその場で保存し、画面を作り直さないため） */
+function fishUnitNeedsTime(stUuid){
+  return DB.catchesOf(stUuid)
+    .some(c=>c.species_id && catchTotal(c) > 0 && !badCount(c));
+}
+/* 開始時刻が要る単位で、時刻が空のときだけ断りを出す。
+   t を省くと、いま保存されている時刻で判断する */
+function fishTimeWarnSync(stUuid, t){
+  const w = $('#fu_warn'); if(!w) return;
+  const 時 = (t === undefined)
+    ? ((DB.liveStation(stUuid) || {}).survey_time_start || '') : t;
+  w.style.display = (fishUnitNeedsTime(stUuid) && !時) ? '' : 'none';
+}
 /* 魚地図で選んでいる単位の時刻を、その場で保存する。
    画面は作り直さない（地図を描き直すと、いま見ている場所が動くため）。
    断りの箱だけ、その場で出し入れする */
@@ -8212,15 +8228,10 @@ function fishSaveTime(stUuid){
   // 残すと、画面は入ったように見えるのに、書き出しと送信は古い時刻を使う
   //（監査92回目 Major）
   const 元 = {t1: String(st.survey_time_start||''), t2: String(st.survey_time_end||'')};
-  const 断りを合わせる = (t)=>{
-    const w = $('#fu_warn');
-    // 断りを出すのは「31列CSVの行になる単位」だけ。作ったときに印を持たせてある
-    if(w) w.style.display = (w.dataset.need==='1' && !t) ? '' : 'none';
-  };
   const 戻す = ()=>{
     if($('#fu_t1')) $('#fu_t1').value = 元.t1;
     if($('#fu_t2')) $('#fu_t2').value = 元.t2;
-    断りを合わせる(元.t1);
+    fishTimeWarnSync(stUuid, 元.t1);
   };
   if(!writeAllowed()){
     戻す();
@@ -8236,7 +8247,7 @@ function fishSaveTime(stUuid){
     toast('保存できませんでした（端末の空き容量をご確認ください）', 8000);
     return false;
   }
-  断りを合わせる(t1);
+  fishTimeWarnSync(stUuid, t1);
   toast('時刻を保存しました（' + (t1 || '開始は空') + '）');
   return true;
 }
@@ -8259,6 +8270,9 @@ function fishSaveCount(caUuid){
   }
   const mark = $('#fc_saved_'+cssId(caUuid));
   if(mark) mark.textContent = '保存しました（' + timeValue() + '）';
+  // 尾数が入ると、その単位は31列CSVの行になる＝開始時刻が要る。
+  // 画面は作り直さないので、断りだけここで出し直す（監査93回目 Major）
+  fishTimeWarnSync(c.station_uuid);
   return true;
 }
 function fishSetConf(caUuid, v){
@@ -11108,8 +11122,7 @@ SCREENS.fishMap = (arg)=>{
           // ところが、この単位の設定画面へ行く道が魚地図には無かったため、
           // 過去の調査を書き起こすと直しようがなく詰んでいた
           //（2026-08-27 の実機の声）。ここで直に入れられるようにする
-          const 行になる = DB.catchesOf(cur.uuid)
-            .some(c=>c.species_id && catchTotal(c) > 0);
+          const 行になる = fishUnitNeedsTime(cur.uuid);
           // 横に2つ並べると、端末によっては時刻の枠が重なって見える
           //（2026-08-27 の実機の声）。1行に1つずつ、枠は小さめに収める
           return `<div style="margin:6px 0">
@@ -11126,7 +11139,7 @@ SCREENS.fishMap = (arg)=>{
                 onchange="fishSaveTime('${cur.uuid}')">
             </div>
           </div>
-          <div class="warnbox" id="fu_warn" data-need="${行になる?'1':'0'}"${
+          <div class="warnbox" id="fu_warn"${
             (行になる && !cur.survey_time_start) ? '' : ' style="display:none"'}>
             開始時刻が空です。このままでは、ここの記録は書き出せません
             （取り込み側が、別々の箇所を1つにまとめてしまうため）。</div>`;
