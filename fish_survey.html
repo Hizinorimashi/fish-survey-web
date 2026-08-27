@@ -145,7 +145,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v131';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v132';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -4783,7 +4783,7 @@ function buildDbRows(sv){
     // 書き出せない、ということが起きる（監査50回目 Critical）
     const 行になる = snap.ca.some(c=>c.station_uuid===st.uuid
       && c.species_id && catchTotal(c, snap) > 0 && !badCount(c, snap));
-    if(行になる && !st.survey_time_start){
+    if(行になる && !spotTimes(st, snap.st).start){
       blocked.push(`${unitLabel(st, snap.st)}：開始時刻が入っていません`);
     }
     snap.ca.filter(c=>c.station_uuid===st.uuid)
@@ -5008,7 +5008,9 @@ function dbRowOf(sv, st, c, inds){
     '同定確度': c ? (c.identification_confidence||'') : '',
     'コピー数':'', '在不在':'',
     '流量': numOf(st.flow_rate),
-    '開始時刻':st.survey_time_start||'', '終了時刻':st.survey_time_end||'',
+    // 地点の時刻は、その中の記録から決まる（早い方〜遅い方）
+    '開始時刻': spotTimes(st, inds && inds.st).start,
+    '終了時刻': spotTimes(st, inds && inds.st).end,
     '備考': c ? (c.notes||'') : '',
     '業務番号':sv.project_number||'', '業務名':sv.project_name||'',
   };
@@ -5142,7 +5144,8 @@ function buildStationRows(sv, snap){
       '河川形態B':st.river_morphology_b||'',
       '調査区分':st.survey_type||'', '調査方法':stationMethods(st).join(','),
       '漁具の件数': gearCount(st),
-      '開始時刻':st.survey_time_start||'', '終了時刻':st.survey_time_end||'',
+      '開始時刻': spotTimes(st, snap.st).start,
+      '終了時刻': spotTimes(st, snap.st).end,
       '水温': numOf(st.water_temp),
       '測点数': envPoints(st).length,
       '位置つき測点数': envPoints(st).filter(x=>numOf(x.latitude)!=='').length,
@@ -6681,7 +6684,16 @@ SCREENS.stationEdit = (arg)=>{
                    min="${esc(days[0])}" max="${esc(days[days.length-1])}">`}
             <div class="dim small">調査は ${esc(surveyPeriodText(sv))}。
               日付ごとに、別々の調査としてデータベースに入ります。</div>`; })()}
-        <div class="row">
+        ${(()=>{
+          // 地点の時刻は、中の記録から決まる。手で入れさせない
+          //（入れても中の単位の時刻と食い違うだけだった。2026-08-27 の実機の声）
+          const 時 = spotTimes(st);
+          if(時.自動) return `<label>時刻</label>
+            <div class="big">${esc(時.start||'—')}${時.end ? ' 〜 '+esc(時.end) : ''}</div>
+            <div class="dim small">この地点の中の記録から決まります
+              （いちばん早い開始 〜 いちばん遅い終了）。ここで入れる必要はありません。<br>
+              直すときは、地図でその記録（ポイントや瀬淵、測点）を選んで時刻を入れてください。</div>`;
+          return `<div class="row">
           <div class="grow">
             <label>開始</label>
             <input id="s_t1" type="time" value="${esc(g('survey_time_start'))}">
@@ -6698,7 +6710,8 @@ SCREENS.stationEdit = (arg)=>{
             onclick="nowInto('#s_t2')">いま</button>
         </div>
         <div class="warnbox">開始の時刻は必ず入れてください。
-          空だと、取り込み側が別々の瀬淵を1つの箇所にまとめてしまいます。</div>
+          空だと、取り込み側が別々の瀬淵を1つの箇所にまとめてしまいます。</div>`;
+        })()}
       </div>
       ${st.is_spot ? '' : `<div class="card">
         <h3 style="margin-top:0">環境の取り方</h3>
@@ -6955,8 +6968,12 @@ function saveStation(svUuid, stUuid, opt){
   if(名前がずれる){
     toast(`ほかで記録が増えたため、番号を ${noShown} から ${noNew} に直しました`, 7000);
   }
-  rec.survey_time_start = f.survey_time_start;
-  rec.survey_time_end   = f.survey_time_end;
+  // 時刻の欄が画面に無いとき（地点で、中の記録から自動に決まっているとき）は
+  // 書き戻さない。空で上書きすると、前に入れた値を消してしまう
+  if($('#s_t1')){
+    rec.survey_time_start = f.survey_time_start;
+    rec.survey_time_end   = f.survey_time_end;
+  }
   if(surveyIsMultiDay(sv)){
     // 何日かにわたる調査では、その箇所がどの日か覚えておく
     rec.survey_date = f.survey_date || stationDate(rec, sv);
@@ -7448,6 +7465,24 @@ function spotStations(stUuid){
   const st = DB.liveStation(stUuid); if(!st) return [];
   return [st].concat(DB.stationsOf(st.survey_uuid)
     .filter(x=>x.uuid!==stUuid && x.spot_uuid===stUuid));
+}
+/* 地点の時刻は、その中の記録から決める。始まりはいちばん早い方、
+   終わりはいちばん遅い方。地点そのものに手で入れさせない。
+   手で入れても、中の単位に入れた時刻と食い違うだけだった
+   （2026-08-27 の実機の声）。
+   中の記録に時刻がまったく無いときだけ、地点に入れた値を使う
+   （前のやり方で地点に直接入れた記録があるときのため） */
+function spotTimes(st, list){
+  const 自分 = {start: (st && st.survey_time_start) || '',
+                end:   (st && st.survey_time_end)   || '', 自動: false};
+  if(!st || !st.is_spot) return 自分;
+  const 子 = (list || DB.stationsOf(st.survey_uuid))
+    .filter(x=>x && !x.deleted_at && x.uuid!==st.uuid && x.spot_uuid===st.uuid);
+  const 始 = 子.map(x=>String(x.survey_time_start||'')).filter(Boolean).sort();
+  const 終 = 子.map(x=>String(x.survey_time_end||x.survey_time_start||'')).filter(Boolean).sort();
+  if(!始.length && !終.length) return 自分;
+  return {start: 始[0] || 自分.start,
+          end:   終[終.length-1] || 自分.end, 自動: true};
 }
 /* この地点の種数・尾数。二重に数えないよう、記録は各単位の自分の分だけ足す */
 function spotTotals(stUuid){
@@ -10835,18 +10870,22 @@ SCREENS.spot = (stUuid)=>{
   const 環境あり = 直接環境 || 環境の数 > 0;
   // 地点では通電を積まない。押している間かどうかは「終えたか」で決める
   const 動いている = !st.ended_at;
+  // 地点の時刻は、中の記録から決まる（早い方〜遅い方）
+  const 時 = spotTimes(st);
   return {
     title: st.name || '地点',
     sub:[{text: sv.river_name||''},
-         {text: st.survey_time_start ? st.survey_time_start : '未開始',
-          cls: st.survey_time_start ? 'ok' : 'warn'}],
+         {text: 時.start ? 時.start : '未開始',
+          cls: 時.start ? 'ok' : 'warn'}],
     html:`
       <div class="card">
         <div class="row">
           <div class="grow">
             <div class="dim small">${動いている ? '記録中です' : 'この地点は終えています'}</div>
-            <div>${esc(st.survey_time_start||'—')}${
-              st.survey_time_end ? ' 〜 '+esc(st.survey_time_end) : ''}</div>
+            <div>${esc(時.start||'—')}${
+              時.end ? ' 〜 '+esc(時.end) : ''}</div>
+            ${時.自動 ? `<div class="dim small">時刻は、この地点の中の記録から
+              決まります（いちばん早い開始〜いちばん遅い終了）。</div>` : ''}
             <div class="dim small">通電（電気ショッカー）は、地図の
               <b>▼採捕記録</b>で単位ごとに測ります。</div>
           </div>
@@ -11046,13 +11085,21 @@ SCREENS.fishMap = (arg)=>{
           //（2026-08-27 の実機の声）。ここで直に入れられるようにする
           const 行になる = DB.catchesOf(cur.uuid)
             .some(c=>c.species_id && catchTotal(c) > 0);
-          return `<div class="row" style="margin:6px 0">
-            <div class="grow"><div class="dim small">開始時刻</div>
-              <input id="fu_t1" type="time" value="${esc(cur.survey_time_start||'')}"
-                onchange="fishSaveTime('${cur.uuid}')"></div>
-            <div class="grow"><div class="dim small">終了時刻</div>
-              <input id="fu_t2" type="time" value="${esc(cur.survey_time_end||'')}"
-                onchange="fishSaveTime('${cur.uuid}')"></div>
+          // 横に2つ並べると、端末によっては時刻の枠が重なって見える
+          //（2026-08-27 の実機の声）。1行に1つずつ、枠は小さめに収める
+          return `<div style="margin:6px 0">
+            <div class="row" style="margin-bottom:6px">
+              <div class="dim small" style="flex:none;width:5.5em">開始時刻</div>
+              <input id="fu_t1" type="time" style="max-width:170px"
+                value="${esc(cur.survey_time_start||'')}"
+                onchange="fishSaveTime('${cur.uuid}')">
+            </div>
+            <div class="row">
+              <div class="dim small" style="flex:none;width:5.5em">終了時刻</div>
+              <input id="fu_t2" type="time" style="max-width:170px"
+                value="${esc(cur.survey_time_end||'')}"
+                onchange="fishSaveTime('${cur.uuid}')">
+            </div>
           </div>
           <div class="warnbox" id="fu_warn"${
             (行になる && !cur.survey_time_start) ? '' : ' style="display:none"'}>
