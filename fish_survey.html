@@ -145,7 +145,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v130';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v131';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2555,6 +2555,20 @@ function unitKindOf(st){
   return (k==='E' || k==='PF' || k==='P') ? k : '';
 }
 function isUnitPoly(st){ const k = unitKindOf(st); return k==='E' || k==='PF'; }
+/* 断り文などで「どれのことか」を言い切るための呼び名。
+   地点の P1 と、魚地図のポイント P1 は別ものなのに、名前だけだと
+   同じ「P1」に見える。種別と、どの地点の中かを添える
+   （2026-08-27 の実機の声。断り文のP1がどちらか分からず手が止まった） */
+function unitLabel(st, list){
+  if(!st) return '箇所';
+  const 名 = st.name || '箇所';
+  const 種 = st.is_spot ? '地点' : (UNIT_WORD[unitKindOf(st)] || '');
+  if(!種) return 名;
+  const 親 = st.spot_uuid
+    ? (((list || []).find(x=>x.uuid===st.spot_uuid) || DB.liveStation(st.spot_uuid) || {}).name || '')
+    : '';
+  return `${名}（${種}${親 ? `・地点 ${親} の中` : ''}）`;
+}
 /* 囲いの角。3つ以上そろって、はじめて囲いになる */
 function polyPts(st){
   return ((st && st.poly) || []).map(v=>{
@@ -4770,7 +4784,7 @@ function buildDbRows(sv){
     const 行になる = snap.ca.some(c=>c.station_uuid===st.uuid
       && c.species_id && catchTotal(c, snap) > 0 && !badCount(c, snap));
     if(行になる && !st.survey_time_start){
-      blocked.push(`${st.name||'箇所'}：開始時刻が入っていません`);
+      blocked.push(`${unitLabel(st, snap.st)}：開始時刻が入っていません`);
     }
     snap.ca.filter(c=>c.station_uuid===st.uuid)
       .sort((a,b)=>String(a.created_at||'').localeCompare(String(b.created_at||'')))
@@ -8144,6 +8158,28 @@ function fishAddSpecies(stUuid, spId){
   toast(`${rec.species_name} を足しました。尾数を入れてください`);
   render();
 }
+/* 魚地図で選んでいる単位の時刻を、その場で保存する。
+   画面は作り直さない（地図を描き直すと、いま見ている場所が動くため）。
+   断りの箱だけ、その場で出し入れする */
+function fishSaveTime(stUuid){
+  const st = DB.liveStation(stUuid); if(!st) return false;
+  if(!writeAllowed()){
+    toast('このタブでは直せません。記録を入れているタブでお試しください', 7000);
+    return false;
+  }
+  const t1 = strVal('#fu_t1'), t2 = strVal('#fu_t2');
+  if(String(st.survey_time_start||'')===t1 && String(st.survey_time_end||'')===t2) return true;
+  st.survey_time_start = t1;
+  st.survey_time_end = t2;
+  if(!DB.upsert(DB.key.st, st)){
+    toast('保存できませんでした（端末の空き容量をご確認ください）', 8000);
+    return false;
+  }
+  const w = $('#fu_warn');
+  if(w) w.style.display = t1 ? 'none' : '';
+  toast('時刻を保存しました（' + (t1 || '開始は空') + '）');
+  return true;
+}
 /* 尾数を、その場で保存する */
 function fishSaveCount(caUuid){
   const c = DB.getAlive(DB.key.ca, caUuid); if(!c) return false;
@@ -11003,6 +11039,26 @@ SCREENS.fishMap = (arg)=>{
           <button class="btn sm ng" style="width:auto;margin:0"
             onclick="fishDelete('${cur.uuid}')">消す</button>
         </div>
+        ${(()=>{
+          // 開始時刻が空だと、この単位の記録は書き出せない・送れない。
+          // ところが、この単位の設定画面へ行く道が魚地図には無かったため、
+          // 過去の調査を書き起こすと直しようがなく詰んでいた
+          //（2026-08-27 の実機の声）。ここで直に入れられるようにする
+          const 行になる = DB.catchesOf(cur.uuid)
+            .some(c=>c.species_id && catchTotal(c) > 0);
+          return `<div class="row" style="margin:6px 0">
+            <div class="grow"><div class="dim small">開始時刻</div>
+              <input id="fu_t1" type="time" value="${esc(cur.survey_time_start||'')}"
+                onchange="fishSaveTime('${cur.uuid}')"></div>
+            <div class="grow"><div class="dim small">終了時刻</div>
+              <input id="fu_t2" type="time" value="${esc(cur.survey_time_end||'')}"
+                onchange="fishSaveTime('${cur.uuid}')"></div>
+          </div>
+          <div class="warnbox" id="fu_warn"${
+            (行になる && !cur.survey_time_start) ? '' : ' style="display:none"'}>
+            開始時刻が空です。このままでは、ここの記録は書き出せません
+            （取り込み側が、別々の箇所を1つにまとめてしまうため）。</div>`;
+        })()}
         ${(()=>{
           const t = unitTotals(cur.uuid, list);
           const 数 = `<div class="row" style="margin:6px 0">
