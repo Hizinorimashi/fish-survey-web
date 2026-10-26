@@ -145,7 +145,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v136';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v137';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1308,13 +1308,20 @@ function isEnvSurvey(sv){ return surveyKind(sv) === '物理環境'; }
 /* 物理環境の取り方。箇所ごとに持つ。未設定は「点」（いままでの取り方） */
 function envMethod(st){
   const m = st && st.env_method;
-  return (m==='ライン' || m==='メッシュ') ? m : '点';
+  return (m==='ライン' || m==='メッシュ' || m==='囲い') ? m : '点';
 }
 function isLine(st){ return envMethod(st)==='ライン'; }
 function isMesh(st){ return envMethod(st)==='メッシュ'; }
+/* 物理環境の囲い（瀬・淵の範囲。2026-10-27）。
+   魚の囲い（unit_kind E/PF）とは別物。魚の親子・集計に混ぜないため unit_kind は持たない */
+function isEnvPoly(st){ return !!st && !unitKindOf(st) && envMethod(st)==='囲い'; }
+/* 描いている途中の物理環境の囲い。記録に残した印で見るので、読み込み直しても分かる */
+function envPolyDrawing(st){ return isEnvPoly(st) && st.poly_state === 'drawing'; }
+/* 記録として数えてよいか。魚の描きかけの囲いも、物理環境の描きかけの囲いも数えない */
+function recordReady(st){ return unitReady(st) && !envPolyDrawing(st); }
 /* 取り方ごとの呼び名 */
 function methodWord(m){
-  return m==='ライン' ? '区間' : (m==='メッシュ' ? '範囲' : '箇所');
+  return m==='ライン' ? '区間' : (m==='メッシュ' ? '範囲' : (m==='囲い' ? '囲い' : '箇所'));
 }
 /* 画面に出す呼び名 */
 function stWord(sv){
@@ -1415,7 +1422,7 @@ function surveyTally(svUuid){
   // 物理環境の記録（測点・ライン）は、魚の集計に混ぜない（監査32回目 Major）。
   // ただし前の版で魚の単位に「環境の取り方」が付いた分は、魚として数える
   // 描きかけの囲いは、まだ数えない（監査62回目 Major）
-  const 対象 = all.filter(st=>!isMesh(st) && unitReady(st)
+  const 対象 = all.filter(st=>!isMesh(st) && recordReady(st)
     && (st.is_spot || stationKind(sv, st) === '魚'));
   // 中に小さい単位があるもの（E1・P/F1 など）は、集計を出すだけの入れ物。
   // ただし、子を作る前にその親へ直接入れた記録は数え漏らさない
@@ -2018,7 +2025,7 @@ function envColorOf(st, range){
 /* 色分けの幅は、いま地図に出している記録から作る。
    調査ぜんぶから作ると、別の地点の極端な値で色が偏る（監査39回目 Minor） */
 function envColorRange(svUuid){
-  const list = mapStations(svUuid, 'env');
+  const list = mapStations(svUuid, 'env').filter(recordReady);   // 描きかけの囲いは入れない
   const v = nums(list.map(x=>x.velocity_rep_cms));
   const d = nums(list.map(x=>x.depth_rep_cm));
   return {vLo: v.length?Math.min.apply(null,v):0, vHi: v.length?Math.max.apply(null,v):0,
@@ -2095,7 +2102,9 @@ function envFitAll(svUuid){
 function envAllPoints(svUuid){
   const pts = [];
   mapStations(svUuid, 'env').forEach(st=>{
-    if(envKindOf(st)==='L'){
+    if(envKindOf(st)==='A'){
+      polyPts(st).forEach(v=>pts.push(v));     // 描きかけの角も、見えるように入れる
+    }else if(envKindOf(st)==='L'){
       const a = linePt(st,'start'), b = linePt(st,'end');
       if(a) pts.push(a);
       if(b) pts.push(b);
@@ -2114,6 +2123,7 @@ function envToggleBig(){ prefSet('env_map_big', !envMapBig()); render(); }
 /* その箇所が点か線か。物理環境の調査だけで使う */
 function envKindOf(st){
   if(isMesh(st)) return 'M';        // メッシュはこの画面では扱わない
+  if(isEnvPoly(st)) return 'A';     // 囲い（瀬・淵の範囲）。点に落とさない
   return isLine(st) ? 'L' : 'P';
 }
 /* 開始だけで、終わっていないライン。LE のつなぎ先になる */
@@ -2192,7 +2202,7 @@ function envUseSurvey(svUuid){
 /* 足せるもの。V は「曲がり」 */
 function envKindWord(k){
   return k==='P' ? 'ポイント' : k==='LS' ? 'ラインの始まり'
-       : k==='LE' ? 'ラインの終わり' : '曲がり';
+       : k==='LE' ? 'ラインの終わり' : k==='A' ? '囲い（瀬・淵の範囲）' : '曲がり';
 }
 function envSetKind(k){
   const sv = ENV_NEXT.survey;
@@ -2201,6 +2211,8 @@ function envSetKind(k){
   else if(k === 'P')       ENV_NEXT = {kind:'P', auto:false, line:'', survey:sv};
   // 曲がりは、続けて置くもの。交互には入れない
   else if(k === 'V')       ENV_NEXT = {kind:'V', auto:false, line:ENV_NEXT.line, survey:sv};
+  // 囲いも交互には入れない（角を続けて足すもの）
+  else if(k === 'A')       ENV_NEXT = {kind:'A', auto:false, line:ENV_NEXT.line, survey:sv};
   else                     ENV_NEXT = {kind:k, auto:true, line:ENV_NEXT.line, survey:sv};
   if(!envSyncNextUI()) render();
 }
@@ -2291,15 +2303,35 @@ function envSyncNextUI(){
       行き先 = t ? `　<b>${esc(t.name||'')}</b> に足します`
                  : '　<span class="pill ng">どのラインに足すか決められません</span>';
     }
-    hint.innerHTML = `つぎ：<b>${esc(名)}</b>${行き先}`
-      + `　地図をタップ／狙いの印で置けます`
-      + (ENV_NEXT.auto ? '（始まり→終わりで交互）' : '（同じものが続きます）');
+    const 描き = envPolyDrawings(ENV_NEXT.survey);
+    if(描き.length){
+      // 描いている間は、つぎに置けるのは囲いの角だけ
+      hint.innerHTML = `<b>${esc(描き.map(x=>x.name||'').join('・'))}</b> を描いています。`
+        + '地図をタップ／狙いの印で角を足し、「囲いを閉じる」で閉じてください';
+    }else if(ENV_NEXT.kind === 'A'){
+      hint.innerHTML = `つぎ：<b>${esc(名)}</b>　地図をタップ／狙いの印で、角を1つずつ置きます`;
+    }else{
+      hint.innerHTML = `つぎ：<b>${esc(名)}</b>${行き先}`
+        + `　地図をタップ／狙いの印で置けます`
+        + (ENV_NEXT.auto ? '（始まり→終わりで交互）' : '（同じものが続きます）');
+    }
   }
   const box = $('#envPending');
   if(box){
     const p = envPendingLine(ENV_NEXT.survey);
-    box.innerHTML = p ? `<div class="warnbox">${esc(p.name)} は始まりだけです。`
-      + `ラインの終わりを置いてください。</div>` : '';
+    const t = envPolyTarget(ENV_NEXT.survey);
+    const 描き = t.st ? [t.st] : t.many;
+    box.innerHTML = (p ? `<div class="warnbox">${esc(p.name)} は始まりだけです。`
+      + `ラインの終わりを置いてください。</div>` : '')
+      + (描き.length ? `<div class="warnbox">${t.many.length ? esc(envPolyManyMsg(t.many))
+          : `${esc(t.st.name||'')} を描いています（角 ${polyPts(t.st).length}個）。`
+            + '角が3つ以上になったら閉じてください。'}
+          <div class="row" style="margin-top:6px">
+            <button class="btn sm pri" style="width:auto;margin:0"
+              onclick="if(envPolyClose('${ENV_NEXT.survey}')) render()">囲いを閉じる</button>
+            <button class="btn sm ng" style="width:auto;margin:0"
+              onclick="if(envPolyCancel('${ENV_NEXT.survey}')) render()">描くのをやめる</button>
+          </div></div>` : '');
   }
   return true;
 }
@@ -2336,6 +2368,145 @@ function envLineTarget(svUuid){
   return list.length===1 ? list[0] : null;
 }
 
+/* ---------- 物理環境の囲い（瀬・淵の範囲。2026-10-27） ----------
+   描いている囲いは、画面の変数に覚えず、毎回記録から探す。
+   「この調査・この地点で、描きかけの囲い」。読み込み直し・JSON復元・
+   クラウド合成のあとでも、記録がそのまま正しい行き先になる */
+function envPolyDrawings(svUuid, spot){
+  const sp = (spot === undefined) ? MAP_SPOT : spot;
+  // 地点はぴったり同じものだけ。ofSpot は「地点なし＝調査ぜんぶ」なので、
+  // 調査から開いた地図で、P1 の描きかけに角を足してしまう
+  return DB.stationsOf(svUuid).filter(st=>envPolyDrawing(st)
+    && st.record_kind === 'env' && (st.spot_uuid||'') === (sp||''));
+}
+/* 角を足す相手。2つ以上あるときは、選んでいるものだけ。勝手に選ばない */
+function envPolyTarget(svUuid){
+  const list = envPolyDrawings(svUuid);
+  if(list.length <= 1) return {st: list[0] || null, many: []};
+  const sel = list.filter(x=>x.uuid === ENV_SEL)[0];
+  return {st: sel || null, many: sel ? [] : list};
+}
+function envPolyManyMsg(many){
+  return `描きかけの囲いが${many.length}つあります（${many.map(x=>x.name||'').join('・')}）。`
+    + '下の「記録」で続ける囲いを選ぶか、どちらかを消してください';
+}
+/* 囲いの角を1つ足す。最初の1つなら、囲いの記録を作る */
+function envPolyAdd(svUuid, sv, la, lo, targetUuid){
+  const t = envPolyTarget(svUuid);
+  if(t.many.length){ toast(envPolyManyMsg(t.many), 9000); return null; }
+  // 現在地を待つ前に決めた相手と、いまの相手が違うなら置かない
+  // （待つ間に選び直された・別の端末から描きかけが届いた）
+  if(targetUuid !== undefined && targetUuid !== null){
+    const いま = t.st ? t.st.uuid : 'new';
+    if(いま !== targetUuid){
+      toast('現在地を取っている間に、描いている囲いが変わったので置いていません', 8000);
+      return null;
+    }
+  }
+  if(t.st){
+    const st = t.st;
+    st.poly = (st.poly||[]).concat([{lat:la, lon:lo}]);
+    if(!DB.upsert(DB.key.st, st)){
+      toast('置けませんでした（端末の空き容量をご確認ください）', 8000);
+      return null;
+    }
+    ENV_SEL = st.uuid;
+    toast(`${st.name} の角を置きました（${st.poly.length}個目）`);
+    return st.uuid;
+  }
+  const no = nextStationNo(svUuid);
+  if(no===null){ toast('番号が大きすぎて、これ以上置けません', 7000); return null; }
+  // 囲いであること・どの地点か・いつの記録か・描きかけの印を、最初の1回の保存で入れる
+  const rec = {
+    uuid: uuid(), survey_uuid: svUuid, station_no: no,
+    spot_uuid: MAP_SPOT || '',
+    record_kind: 'env',
+    survey_date: recDay(sv),
+    started_at: nowISO(), env_points: [],
+    survey_time_start: autoTime(sv),
+    survey_type: sv.survey_type_default || '目視',
+    env_method: '囲い', name: envAutoName(svUuid, 'A'),
+    poly: [{lat:la, lon:lo}],
+    poly_state: 'drawing',
+  };
+  if(!DB.upsert(DB.key.st, rec)) return null;
+  ENV_SEL = rec.uuid;
+  toast(`${rec.name} を描きはじめました。角を足して「囲いを閉じる」で閉じてください`, 7000);
+  return rec.uuid;
+}
+/* 囲いを閉じる。形がおかしいときは閉じない。閉じる印と終わりの時刻は1回で保存する */
+function envPolyClose(svUuid){
+  if(!writeAllowed()){
+    toast('このタブでは閉じられません。記録を入れているタブでお試しください', 7000);
+    return false;
+  }
+  const t = envPolyTarget(svUuid);
+  if(t.many.length){ toast(envPolyManyMsg(t.many), 9000); return false; }
+  const st = t.st;
+  if(!st){ toast('いま描いている囲いがありません'); return false; }
+  const 具合 = polyProblem(polyPts(st));
+  if(具合){ toast(具合, 8000); return false; }
+  const sv = DB.getAlive(DB.key.sv, svUuid);
+  const 前 = {time: st.survey_time_end || '', ended: st.ended_at || ''};
+  const st2 = JSON.parse(JSON.stringify(st));
+  delete st2.poly_state;
+  if(!st2.survey_time_end) st2.survey_time_end = autoTime(sv);
+  st2.ended_at = st2.ended_at || nowISO();
+  if(!DB.upsert(DB.key.st, st2)){
+    toast('閉じたことを保存できませんでした。描きかけのままです', 8000);
+    return false;
+  }
+  envHistPush({type:'閉じた', sv:svUuid, uuid:st.uuid, name:st.name,
+    prevTime:前.time, prevEnded:前.ended});
+  envMarkPlaced();
+  ENV_SEL = st.uuid;
+  toast(`${st.name} を閉じました（角 ${polyPts(st2).length}個）。下で環境を入れてください`, 6000);
+  return true;
+}
+/* 描きかけの囲いの角を、最後の1つだけ戻す。最初の1つなら描きかけごとやめる。
+   画面の履歴に頼らない（アプリを開き直したあとでも戻せる） */
+function envPolyUndoCorner(st){
+  const pts = st.poly || [];
+  if(pts.length <= 1){
+    if(!DB.softDelete(DB.key.st, st.uuid)){
+      toast('戻せませんでした（端末の空き容量をご確認ください）', 8000); return false;
+    }
+    draftClearFor('箇所', st.uuid);
+    if(ENV_SEL === st.uuid) ENV_SEL = null;
+    toast('最初の角を戻したので、囲いを描くのをやめました', 5000);
+    return true;
+  }
+  st.poly = pts.slice(0, -1);
+  if(!DB.upsert(DB.key.st, st)){
+    toast('戻せませんでした（端末の空き容量をご確認ください）', 8000); return false;
+  }
+  toast(`${st.name} の角を1つ戻しました（残り ${st.poly.length}個）`);
+  return true;
+}
+/* 描きかけの囲いを、まるごとやめる */
+function envPolyCancel(svUuid){
+  if(!writeAllowed()){
+    toast('このタブではやめられません。記録を入れているタブでお試しください', 7000);
+    return false;
+  }
+  const t = envPolyTarget(svUuid);
+  if(t.many.length){ toast(envPolyManyMsg(t.many), 9000); return false; }
+  const st = t.st;
+  if(!st) return false;
+  if(!confirm(`${st.name} を描くのをやめます。よろしいですか？`)) return false;
+  if(!DB.softDelete(DB.key.st, st.uuid)){
+    toast('やめられませんでした（端末の空き容量をご確認ください）', 8000); return false;
+  }
+  draftClearFor('箇所', st.uuid);
+  if(ENV_SEL === st.uuid) ENV_SEL = null;
+  toast('やめました');
+  return true;
+}
+/* 調査の中に、描きかけの囲いが残っているか（地点を問わない）。調査を終える前に見る */
+function envPolyOpenIn(svUuid){
+  return DB.stationsOf(svUuid).filter(envPolyDrawing);
+}
+
 /* いまの種類で1件足す。時刻はここで自動的に刻む */
 /* 相手（どのラインに足すか）は、現在地を待ちはじめる前に決めて渡せる。
    待っている間に人が別のラインを選ぶと、返ってきた座標が
@@ -2360,6 +2531,19 @@ function envAddAt(svUuid, lat, lon, acc, targetUuid){
   if(!validPt([la, lo])){ toast('位置がおかしいので追加できません'); return null; }
   const now = timeValue();
 
+  // 囲いを描いている間は、ほかのものを置かない。
+  // 置けると、閉じ忘れた描きかけが残ったまま記録が進む
+  if(k !== 'A'){
+    const 描き = envPolyDrawings(svUuid);
+    if(描き.length){
+      toast(`${描き[0].name} を描いています。先に「囲いを閉じる」か`
+        + '「描くのをやめる」を押してください', 8000);
+      return null;
+    }
+  }
+  if(k === 'A'){
+    return envPolyAdd(svUuid, sv, la, lo, targetUuid);
+  }
   if(k === 'V'){
     return envAddBend(svUuid, la, lo, acc, targetUuid);
   }
@@ -4863,7 +5047,8 @@ function buildDbRows(sv){
     return {rows:[], excluded:[], warnings:[], blocked:[e.message]};
   }
 
-  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid && unitReady(x))
+  // 物理環境の囲いは31列の対象にしない（魚の記録の単位ではない。2026-10-27）
+  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid && recordReady(x) && !isEnvPoly(x))
     .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
   // 代表点が空でも、地点が置いてあれば取り直す（前回M6の直しを入口でも効かせる）
   const pos = surveyPos(sv);
@@ -4932,7 +5117,7 @@ function buildDbRows(sv){
    地点から魚の地図に入って魚を記録できる。調査の種類ではなく、
    実際に魚の記録があるかで決める（監査33回目 Critical） */
 function hasFishRecords(svUuid){
-  return DB.stationsOf(svUuid).some(st=>DB.catchesOf(st.uuid)
+  return DB.stationsOf(svUuid).some(st=>recordReady(st) && !isEnvPoly(st) && DB.catchesOf(st.uuid)
     .some(c=>c.species_id && catchTotal(c) > 0));
 }
 function canExportDbCsv(sv){
@@ -5115,7 +5300,7 @@ function dbRowOf(sv, st, c, inds){
 /* 1尾ずつの記録（1行＝1尾） */
 function buildIndRows(sv, snap){
   const rows = [];
-  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid && unitReady(x))
+  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid && recordReady(x))
     .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
   stations.forEach(st=>{
     snap.ca.filter(c=>c.station_uuid===st.uuid).forEach(c=>{
@@ -5144,7 +5329,7 @@ const FS_POINT_COLS = ['調査日','河川名','地点名','箇所','測点番�
   '緯度','経度','GPS精度m','位置の決め方','調査ID','箇所ID'];
 function buildPointRows(sv, snap){
   const rows = [];
-  snap.st.filter(x=>x.survey_uuid===sv.uuid)
+  snap.st.filter(x=>x.survey_uuid===sv.uuid && recordReady(x))
     .sort((a,b)=>(a.station_no||0)-(b.station_no||0))
     .forEach(st=>{
       const pts = envPoints(st);
@@ -5182,7 +5367,7 @@ function buildPointRows(sv, snap){
 
 /* 箇所ごと（1行＝1箇所） */
 function buildStationRows(sv, snap){
-  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid && unitReady(x))
+  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid && recordReady(x))
     .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
   return stations.map(st=>{
     const len = stationLengths(st), area = stationAreas(st);
@@ -5219,8 +5404,9 @@ function buildStationRows(sv, snap){
       '記録の単位': UNIT_MARK[unitKindOf(st)] || '',
       '単位の呼び名': UNIT_WORD[unitKindOf(st)] || '',
       '親の単位': st.parent_uuid ? ((snap.st.find(x=>x.uuid===st.parent_uuid)||{}).name||'') : '',
-      '囲いの角数': isUnitPoly(st) ? polyPts(st).length : '',
-      '囲い座標': isUnitPoly(st) ? polyText(st) : '',
+      // 物理環境の囲い（瀬・淵の範囲）も、同じ列に形を出す
+      '囲いの角数': (isUnitPoly(st) || isEnvPoly(st)) ? polyPts(st).length : '',
+      '囲い座標': (isUnitPoly(st) || isEnvPoly(st)) ? polyText(st) : '',
       // 親子は調査の中でしか結ばないので、ここで調査ごとに絞る必要はない
       '中の記録の種数': unitKindOf(st) ? unitTotals(st.uuid, snap.st, snap).種 : '',
       '中の記録の尾数': unitKindOf(st) ? unitTotals(st.uuid, snap.st, snap).尾 : '',
@@ -5326,7 +5512,7 @@ function spotFishChildren(st){
 /* 書き出しに「そのまま出す」ための値。集計とは分ける */
 function stationEffortRaw(st){ return effortSeconds(st); }
 function effortStations(stations, all){
-  const 生き = (stations||[]).filter(st=>!isMesh(st) && unitReady(st));
+  const 生き = (stations||[]).filter(st=>!isMesh(st) && recordReady(st));
   // 種類は env_method だけでは決まらない（前の版で魚の単位にも付いた）。
   // stationKind に合わせないと、その単位の通電・距離・面積が漏れる（監査44回目 Major）
   const sv0 = DB.getAlive(DB.key.sv, (生き[0]||{}).survey_uuid) || null;
@@ -5334,7 +5520,7 @@ function effortStations(stations, all){
   // 親子は調査ぜんぶから見る。その日・その地点の分だけで見ると、
   // 別の日に子を作った親を「子のない単位」と取り違える（監査36回目 Major）
   const 親 = {};
-  (all || stations || []).filter(unitReady)
+  (all || stations || []).filter(recordReady)
     .forEach(st=>{ if(st && st.parent_uuid) 親[st.parent_uuid] = true; });
   // 子を作る前に親へ直接入れた記録があれば、その親も数える。
   // 除くと、魚は集計に出るのに通電・箇所数だけ消える（監査34回目 Major）。
@@ -5363,7 +5549,7 @@ function effortStations(stations, all){
    31列CSVのまとまり方と食い違わないよう、日付＋地点で1行にする（監査33回目 Major） */
 function buildSurveyRow(sv, snap){
   // 描きかけの囲いは、書き出しに混ぜない（監査62回目 Major）
-  const all = snap.st.filter(x=>x.survey_uuid===sv.uuid && unitReady(x));
+  const all = snap.st.filter(x=>x.survey_uuid===sv.uuid && recordReady(x));
   const 組 = {};
   // 地点の目印そのものは、記録を持っていなければ数えない。
   // 数えると「箇所数1・尾数0」の架空の行ができ、31列CSVと食い違う（監査38回目 Major）
@@ -5578,7 +5764,7 @@ const FS_GEAR_COLS = ['調査日','河川名','地点名','箇所','漁具の番
   '数','規格','使った分','回数','備考','調査ID','箇所ID'];
 
 function buildGearRows(sv, snap){
-  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid && unitReady(x))
+  const stations = snap.st.filter(x=>x.survey_uuid===sv.uuid && recordReady(x))
     .sort((a,b)=>(a.station_no||0)-(b.station_no||0));
   const rows = [];
   stations.forEach(st=>{
@@ -5657,7 +5843,7 @@ const NOT_IN_DB_CSV = ['通電秒数','漁具ごとの数・規格・時間','�
 /* ---------- ホーム ---------- */
 /* ホームの調査カード。1枚ぶんを作る（一覧と検索の両方で使う） */
 function homeSvCard(s){
-  const nSt = DB.stationsOf(s.uuid).length;
+  const nSt = DB.stationsOf(s.uuid).filter(recordReady).length;   // 描きかけの囲いは数えない
   const nSp = speciesCount(DB.catchesOfSurvey(s.uuid), null);
   const cls = s.status==='調査中' ? 'ok' : (s.status==='終了' ? '' : 'warn');
   if(pickOn()){
@@ -6674,6 +6860,13 @@ function startSurvey(u){
 }
 function endSurvey(u){
   const sv = DB.get(DB.key.sv, u); if(!sv) return;
+  // 描きかけの囲いが残っていたら終えない。勝手に閉じたり消したりもしない（2026-10-27）
+  const 描き = envPolyOpenIn(u);
+  if(描き.length){
+    toast(`描きかけの囲いがあります（${描き.map(x=>x.name||'').join('・')}）。`
+      + '地図で閉じるか「描くのをやめる」を押してから終えてください', 10000);
+    return;
+  }
   // 通電を押しっぱなしのまま終えると、そのあとも秒数が増え続けて
   // 単位努力量あたりの尾数が狂う（2026-08-17 の監査 Major）
   const running = DB.stationsOf(u).filter(effortRunning);
@@ -6814,8 +7007,9 @@ SCREENS.stationEdit = (arg)=>{
       </div>
       ${st.is_spot ? '' : `<div class="card">
         <h3 style="margin-top:0">環境の取り方</h3>
-        <div onclick="setTimeout(onStationMethod,0)">
-          ${segHtml('envm2', OPT.envMethod, envMethod(isNew ? {env_method:defMethod} : st))}</div>
+        ${isEnvPoly(st) ? `<div><b>囲い</b>（地図で描いた瀬・淵の範囲。取り方はここでは変えられません）</div>`
+        : `<div onclick="setTimeout(onStationMethod,0)">
+          ${segHtml('envm2', OPT.envMethod, envMethod(isNew ? {env_method:defMethod} : st))}</div>`}
         <div class="dim small" style="margin-top:8px">
           <b>点</b>＝測点を打つ／<b>ライン</b>＝区間の始点と終点を押さえる／
           <b>メッシュ</b>＝格子を切る</div>
@@ -7088,7 +7282,10 @@ function saveStation(svUuid, stUuid, opt){
   // 書くと、同じ記録が魚の単位でありながら物理環境の記録にもなり、
   // 書き出しで二重に扱われる（監査41回目 Major）
   if(!rec.is_spot && !unitKindOf(rec)){
-  rec.env_method        = (f.env_method==='ライン' || f.env_method==='メッシュ')
+  // 囲い（地図で描いたもの）は、この画面で取り方を変えない。
+  // 「点」に書き換えると、形を持ったまま点として扱われる（2026-10-27）
+  rec.env_method        = isEnvPoly(rec) ? '囲い'
+                        : (f.env_method==='ライン' || f.env_method==='メッシュ')
                             ? f.env_method : '点';
   if(rec.env_method==='ライン'){
     rec.line_direction  = f.line_direction || '上流→下流';
@@ -7583,7 +7780,7 @@ function spotTimes(st, list, sv){
   const 子 = (list || DB.stationsOf(st.survey_uuid))
     .filter(x=>x && !x.deleted_at && x.uuid!==st.uuid && x.spot_uuid===st.uuid
       && x.survey_uuid===st.survey_uuid
-      && unitReady(x)                                   // 描きかけの囲いは数えない
+      && recordReady(x)                                   // 描きかけの囲いは数えない
       && (!svr || stationDate(x, svr)===日));            // 何日かにわたるなら同じ日だけ
   const 始 = 子.map(x=>String(x.survey_time_start||'')).filter(Boolean).sort();
   const 終 = 子.map(x=>String(x.survey_time_end||x.survey_time_start||'')).filter(Boolean).sort();
@@ -8111,7 +8308,9 @@ function envItemFormHtml(cur, sv, opt){
 ${(opt && opt.head === false) ? '' : `      <div class="card">
         <div class="row">
           <div class="grow"><div style="font-weight:700;font-size:18px">${esc(cur.name||'')}</div>
-            <div class="dim small">${envKindOf(cur)==='L'
+            <div class="dim small">${envKindOf(cur)==='A'
+              ? '囲い　角 '+polyPts(cur).length+'個'
+              : envKindOf(cur)==='L'
               ? (linePt(cur,'end') ? '区間 '+esc(fmtDist(lineDist(cur)))
                     + (lineVias(cur).length ? `　曲がり ${lineVias(cur).length}個` : '')
                                    : '<span class="pill warn">終わりがまだ</span>'
@@ -8126,8 +8325,10 @@ ${(opt && opt.head === false) ? '' : `      <div class="card">
         </div>
 
         ${(envFixFold(cur.uuid), '')}${foldHtml('envfix', '位置と時刻を直す',
-          `<span class="fsub">${envKindOf(cur)==='L' ? '始点・終点・時刻' : '位置・時刻'}</span>`,
-          (envKindOf(cur)==='L' ? ['始点','終点'] : ['点']).map(w=>{
+          `<span class="fsub">${envKindOf(cur)==='L' ? '始点・終点・時刻'
+            : envKindOf(cur)==='A' ? '時刻' : '位置・時刻'}</span>`,
+          // 囲いの形は、ここでは直さない（角を動かすのは今回やらない。2026-10-27）
+          (envKindOf(cur)==='L' ? ['始点','終点'] : envKindOf(cur)==='A' ? [] : ['点']).map(w=>{
             const ある = w==='点' ? !!stationPt(cur)
                        : !!linePt(cur, w==='始点' ? 'start' : 'end');
             const 待ち = envMoveOn(cur.uuid, w);
@@ -8152,11 +8353,13 @@ ${(opt && opt.head === false) ? '' : `      <div class="card">
               <button class="btn sm ng" style="width:auto;margin:0"
                 onclick="if(envClearBends('${cur.uuid}')) render()">全部消す</button>
             </div>` : '')
-          + `<div class="dim small">「地図で直す」を押してから、地図をタップしてください。</div>
-          <div class="row" style="margin-top:8px">
+          + (envKindOf(cur)==='A'
+            ? `<div class="dim small">囲いの形を直すときは、消して描き直してください。</div>`
+            : `<div class="dim small">「地図で直す」を押してから、地図をタップしてください。</div>`)
+          + `<div class="row" style="margin-top:8px">
             <div class="grow"><label>開始時刻</label>
               <input type="time" id="ev_t1" value="${esc(cur.survey_time_start||'')}"></div>
-            ${envKindOf(cur)==='L' ? `<div class="grow"><label>終了時刻</label>
+            ${(envKindOf(cur)==='L' || envKindOf(cur)==='A') ? `<div class="grow"><label>終了時刻</label>
               <input type="time" id="ev_t2" value="${esc(cur.survey_time_end||'')}"></div>` : ''}
           </div>`, envMoveOn(cur.uuid))}
 `}
@@ -9080,6 +9283,9 @@ function cloudDraftReset(){
   try{ if(SPOT_TYPE_T){ clearTimeout(SPOT_TYPE_T); SPOT_TYPE_T = null; } }catch(e){}
   try{ if(ENV_AUTO_TIMER){ clearTimeout(ENV_AUTO_TIMER); ENV_AUTO_TIMER = null; }
        ENV_FORM = ''; ENV_DIRTY = false; }catch(e){}
+  // 地図の「1つ戻す」の履歴と選択も捨てる。置き換え前の記録を指したままになる。
+  // 描いている囲いは画面に覚えず記録から探すので、ここで消すものは無い（2026-10-27）
+  try{ ENV_HIST = []; ENV_SEL = null; ENV_MOVE = null; }catch(e){}
 }
 function cloudApply(data, 新しい墓標){
   // 通信を待っている間に、別のタブへ使用権が移ることがある。
@@ -10052,7 +10258,7 @@ function buildGeoJSON(sv, opt){
   opt = opt || {};
   const 写真 = geoPhotoTable(opt.items || photoItemsOf(sv), opt.paths);
   const 点 = [], 線 = [], 面 = [];
-  const sts = DB.stationsOf(sv.uuid).filter(unitReady);
+  const sts = DB.stationsOf(sv.uuid).filter(recordReady);
   for(const st of sts){
     const k = unitKindOf(st);
     if(isMesh(st)){
@@ -10095,6 +10301,17 @@ function buildGeoJSON(sv, opt){
         ring.push(ring[0]);                        // 面は始点で閉じる
         面.push(geoFeature({type:'Polygon', coordinates:[ring]},
           geoProps(sv, st, k==='E' ? '調査範囲' : '河川区分（瀬淵）', 写真)));
+      }
+    }else if(isEnvPoly(st)){
+      // 物理環境の囲い（瀬・淵の範囲）。閉じたものだけここに来る（描きかけは recordReady で外れる）
+      const pts = polyPts(st);
+      if(pts.length >= 3){
+        const ring = pts.map(geoLL);
+        ring.push(ring[0]);
+        const pr = geoProps(sv, st, '物理環境の囲い', 写真);
+        pr['水深cm'] = geoNum(st.depth_rep_cm); pr['流速cms'] = geoNum(st.velocity_rep_cms);
+        pr['環境区分'] = st.habitat_type||''; pr['河床材料'] = st.substrate1||'';
+        面.push(geoFeature({type:'Polygon', coordinates:[ring]}, pr));
       }
     }else if(isLine(st)){
       const a = linePt(st, 'start'), b = linePt(st, 'end');
@@ -10153,7 +10370,7 @@ function geoRepPt(st){
   };
   let pt = null, 置き場 = '';
   if(isMesh(st)){ const c = meshCorners(st); pt = c && 平均(c); 置き場 = '囲いのまん中'; }
-  else if(isUnitPoly(st)){ pt = 平均(polyPts(st)); 置き場 = '囲いのまん中'; }
+  else if(isUnitPoly(st) || isEnvPoly(st)){ pt = 平均(polyPts(st)); 置き場 = '囲いのまん中'; }
   else if(isLine(st)){ pt = linePt(st, 'start'); 置き場 = 'ラインの始点'; }
   if(!pt){ pt = stationPt(st); 置き場 = '記録の位置'; }
   return pt ? {pt, 置き場} : {pt:null, 置き場:'なし'};
@@ -11114,7 +11331,7 @@ SCREENS.spot = (stUuid)=>{
   // env_method の有無だけで数えると、前の版で env_method が付いた
   // 魚の単位まで混ざる（監査50回目 Minor）
   const 環境の数 = spotStations(stUuid)
-    .filter(x=>x.uuid!==stUuid && stationKind(sv, x)==='物理環境').length;
+    .filter(x=>x.uuid!==stUuid && stationKind(sv, x)==='物理環境' && recordReady(x)).length;
   const 環境あり = 直接環境 || 環境の数 > 0;
   // 地点では通電を積まない。押している間かどうかは「終えたか」で決める
   const 動いている = !st.ended_at;
@@ -11634,7 +11851,7 @@ SCREENS.envMap = (arg)=>{
 
   const chip = (st)=>{
     const k = envKindOf(st);
-    const half = (k==='L' && !linePt(st,'end'));
+    const half = (k==='L' && !linePt(st,'end')) || envPolyDrawing(st);
     const 選ぶ = envPickOn();
     const on = 選ぶ ? ENV_PICK.set.has(st.uuid) : (st.uuid===ENV_SEL);
     const act = 選ぶ ? `envPickToggle('${st.uuid}')` : `envSelect('${st.uuid}')`;
@@ -11649,7 +11866,7 @@ SCREENS.envMap = (arg)=>{
     title: `${sv.river_name||''} ${sv.site_name||''}`.trim() || '物理環境',
     sub:[{text:surveyPeriodText(sv)},
          {text:sv.status||'未開始', cls: sv.status==='調査中'?'ok':''},
-         {text:`${list.length}件`}],
+         {text:`${list.filter(recordReady).length}件`}],
     html:`
       ${fromSpotHtml(spot)}
       ${recDayBarHtml(sv)}
@@ -11693,7 +11910,10 @@ SCREENS.envMap = (arg)=>{
           : '<div class="dim small">まだありません。地図をタップするか、地図の右下の狙いの印で置いてください。</div>'}
       </div>
 
-      ${envItemFormHtml(cur, sv)}
+      ${(cur && envPolyDrawing(cur))
+        ? `<div class="card"><div class="dim small"><b>${esc(cur.name||'')}</b> は描いている途中です。
+            閉じると、ここで環境（環境区分・河床材料・水深・流速など）を入れられます。</div></div>`
+        : envItemFormHtml(cur, sv)}
 
       <div class="hr"></div>
       <div class="card">
@@ -11721,7 +11941,8 @@ SCREENS.envMap = (arg)=>{
       if(ENV_PICK && ENV_PICK.sv !== svUuid) ENV_PICK = null;
       if(ENV_MOVE && !DB.liveStation(ENV_MOVE.uuid)) ENV_MOVE = null;
       envHistClear(svUuid);       // ほかの調査の分は持ち越さない
-      envItemFormWire(cur, sv);
+      // 描きかけの囲いには入力欄を出さない（閉じる前に入れた値が、取り消すと見えなくなる）
+      envItemFormWire((cur && envPolyDrawing(cur)) ? null : cur, sv);
 
       // 地図。前に見ていた場所があればそこへ戻す（勝手に動かさない）
       MAP_SPOT = spot;
@@ -11743,34 +11964,22 @@ SCREENS.envMap = (arg)=>{
         {icon:'lineStart', key:'LS', title:'つぎはラインの始まり', tap:()=>envSetKind('LS')},
         {icon:'lineEnd',   key:'LE', title:'つぎはラインの終わり', tap:()=>envSetKind('LE')},
         {icon:'lineBend',  key:'V',  title:'つぎはラインの曲がり', tap:()=>envSetKind('V')},
+        {icon:'areaSmall', key:'A',  title:'つぎは囲い（瀬・淵の範囲）', tap:()=>envSetKind('A')},
       ], 'bottomleft');
       addMapIconBar(map, [
         {icon:'addHere', title:'いまいる場所に足す', tap:()=>envAddHere(svUuid)},
         {icon:'chain',   key:'chain', title:'ラインをつなげる／つなげない',
          tap:()=>envSetChain(!envChain())},
-        {icon:'undo', title:'1つ戻す（直前に置いた・動かした分）',
+        {icon:'undo', title:'1つ戻す（直前に置いた・動かした分・囲いの角）',
          tap:()=>{ if(envUndo(svUuid)) render(); }},
+        {icon:'polyClose', title:'囲いを閉じる',
+         tap:()=>{ if(envPolyClose(svUuid)) render(); }},
       ], 'bottomright');
       envSyncNextUI();
       envDrawAll(svUuid);
       drawMe('main');            // 開いた時点でも、いる場所を出す
       ENV_MAP_SV = svUuid;      // 片付ける直前に、見ている場所を覚えるため
-      map.on('click', e=>{
-        // 直す待ちのときは、新しく置かずに動かす
-        if(ENV_MOVE){
-          const m = ENV_MOVE;
-          // すぐ近くに置いてあるものがあれば、そこへ重ねる
-          const sn = envSnapTo(svUuid, e.latlng.lat, e.latlng.lng, m.uuid);
-          const la = sn ? sn.lat : e.latlng.lat, lo = sn ? sn.lon : e.latlng.lng;
-          if(envMoveTo(m.uuid, m.which, la, lo, null)){ envSnapTell(sn); render(); }
-          return;
-        }
-        if(envPickOn()){ toast('消すものを選んでいます。先に「やめる」を押してください', 6000); return; }
-        const sn = envSnapTo(svUuid, e.latlng.lat, e.latlng.lng, null);
-        const la = sn ? sn.lat : e.latlng.lat, lo = sn ? sn.lon : e.latlng.lng;
-        if(envAddAt(svUuid, la, lo, null)) envSnapTell(sn);
-        render();
-      });
+      map.on('click', e=>envMapClick(svUuid, e.latlng));
       // はじめて開いたときだけ、置いてあるものが入るようにする。
       // ただし地点から開いたときは、その地点のあたりを出したいので動かさない
       if(!v && !spot){
@@ -11785,16 +11994,17 @@ SCREENS.envMap = (arg)=>{
 };
 
 function envMapCenter(sv, cur){
+  // 物理環境の囲いは最初の角（魚の囲いはこれまでどおり）
+  const 位置 = st => envKindOf(st)==='L' ? (linePt(st,'start') || linePt(st,'end'))
+    : isEnvPoly(st) ? (polyPts(st)[0] || null)
+    : stationPt(st);
   if(cur){
-    const p = envKindOf(cur)==='L' ? (linePt(cur,'start') || linePt(cur,'end'))
-                                   : stationPt(cur);
+    const p = 位置(cur);
     if(p) return p;
   }
   const list = DB.stationsOf(sv.uuid).filter(x=>!isMesh(x));
   for(let i=list.length-1;i>=0;i--){
-    const st = list[i];
-    const p = envKindOf(st)==='L' ? (linePt(st,'start') || linePt(st,'end'))
-                                  : stationPt(st);
+    const p = 位置(list[i]);
     if(p) return p;
   }
   const svp = stationPt(sv);      // 調査そのものの位置（緯度だけで決めない）
@@ -11813,16 +12023,41 @@ function envDrawAll(svUuid){
     const on = st.uuid === ENV_SEL;
     const byCol = envColorOf(st, range);
     // 色分けを選んでいるときは、選んでいるものは大きさで見せる（色は基準のまま）
-    const col = byCol || (on ? '#f0883e' : (envKindOf(st)==='L' ? '#4aa3ff' : '#3fb950'));
+    const col = byCol || (on ? '#f0883e' : (envKindOf(st)==='L' ? '#4aa3ff'
+      : (envKindOf(st)==='A' ? '#a371f7' : '#3fb950')));
     const nm = st.name || '';
     const put = (pt, txt, square)=>{
       // 記号は L.marker。図形とちがって、クリックが地図に伝わらない
       ENVLAYER.push(L.marker(pt, {icon:envBadge(txt, col, on?30:24, on, square),
         zIndexOffset: on ? 1000 : 0})
-        .on('click', e=>{ L.DomEvent.stop(e); envSelect(st.uuid); }).addTo(map));
+        .on('click', e=>{ L.DomEvent.stop(e); envLayerTap(svUuid, st.uuid, e.latlng); }).addTo(map));
       pts.push(pt);
     };
-    if(envKindOf(st)==='L'){
+    if(envKindOf(st)==='A'){
+      // 囲い：閉じたものは面、描きかけは点線。角は小さな丸。名前はいちばん北の角
+      const vs = polyPts(st);
+      if(!vs.length) return;
+      const 描き中 = envPolyDrawing(st);
+      if(vs.length >= 3 && !描き中){
+        ENVLAYER.push(L.polygon(vs, {color:col, weight:on?4:3, opacity:.95,
+          fillColor:col, fillOpacity:on?.25:.15, bubblingMouseEvents:false})
+          .on('click', e=>{ L.DomEvent.stop(e); envLayerTap(svUuid, st.uuid, e.latlng); }).addTo(map));
+      }else if(vs.length >= 2){
+        ENVLAYER.push(L.polyline(vs, {color:col, weight:3, opacity:.9,
+          dashArray:'6 4', bubblingMouseEvents:false})
+          .on('click', e=>{ L.DomEvent.stop(e); envLayerTap(svUuid, st.uuid, e.latlng); }).addTo(map));
+      }
+      vs.forEach(v=>{
+        ENVLAYER.push(L.circleMarker(v, {radius:描き中?6:4, color:'#fff', weight:2,
+          fillColor:col, fillOpacity:1, bubblingMouseEvents:false})
+          .on('click', e=>{ L.DomEvent.stop(e); envLayerTap(svUuid, st.uuid, e.latlng); }).addTo(map));
+        pts.push(v);
+      });
+      const 北 = vs.slice().sort((a,c)=>c[0]-a[0])[0];
+      ENVLAYER.push(L.marker(北, {icon:envBadge(nm + (描き中?'…':''), col, on?30:24, on, true),
+        zIndexOffset: on ? 1000 : 0})
+        .on('click', e=>{ L.DomEvent.stop(e); envLayerTap(svUuid, st.uuid, e.latlng); }).addTo(map));
+    }else if(envKindOf(st)==='L'){
       const a = linePt(st,'start'), b = linePt(st,'end');
       if(a) put(a, nm, false);
       if(b) put(b, '終', true);
@@ -11830,13 +12065,13 @@ function envDrawAll(svUuid){
       lineVias(st).forEach(v=>{
         ENVLAYER.push(L.circleMarker(v, {radius:on?6:4, color:'#fff', weight:2,
           fillColor:col, fillOpacity:1, bubblingMouseEvents:false})
-          .on('click', e=>{ L.DomEvent.stop(e); envSelect(st.uuid); }).addTo(map));
+          .on('click', e=>{ L.DomEvent.stop(e); envLayerTap(svUuid, st.uuid, e.latlng); }).addTo(map));
         pts.push(v);
       });
       const path = linePath(st);
       if(path.length >= 2) ENVLAYER.push(L.polyline(path,
         {color:col, weight:on?6:4, opacity:.9, bubblingMouseEvents:false})
-        .on('click', e=>{ L.DomEvent.stop(e); envSelect(st.uuid); }).addTo(map));
+        .on('click', e=>{ L.DomEvent.stop(e); envLayerTap(svUuid, st.uuid, e.latlng); }).addTo(map));
     }else{
       const pt = stationPt(st);
       if(pt) put(pt, nm, false);
@@ -11844,6 +12079,35 @@ function envDrawAll(svUuid){
   });
   // ここでは地図を動かさない。
   // 点を置くたびに全体表示へ戻ると、寄って作業しているときに邪魔になる
+}
+
+/* 物理環境の地図をタップしたとき。地図そのものと、上に描いた記号・線・囲いの両方から呼ぶ */
+function envMapClick(svUuid, latlng){
+  if(!latlng) return;
+  // 直す待ちのときは、新しく置かずに動かす
+  if(ENV_MOVE){
+    const m = ENV_MOVE;
+    // すぐ近くに置いてあるものがあれば、そこへ重ねる
+    const sn = envSnapTo(svUuid, latlng.lat, latlng.lng, m.uuid);
+    const la = sn ? sn.lat : latlng.lat, lo = sn ? sn.lon : latlng.lng;
+    if(envMoveTo(m.uuid, m.which, la, lo, null)){ envSnapTell(sn); render(); }
+    return;
+  }
+  if(envPickOn()){ toast('消すものを選んでいます。先に「やめる」を押してください', 6000); return; }
+  // 描いている囲い自身の角には重ねない（同じ点が重なると形が崩れる）
+  const 描き = ENV_NEXT.kind === 'A' ? envPolyTarget(svUuid).st : null;
+  const sn = envSnapTo(svUuid, latlng.lat, latlng.lng, 描き ? 描き.uuid : null);
+  const la = sn ? sn.lat : latlng.lat, lo = sn ? sn.lon : latlng.lng;
+  if(envAddAt(svUuid, la, lo, null)) envSnapTell(sn);
+  render();
+}
+/* 描いた記号・線・囲いをタップしたとき。ふだんはその記録を選ぶ。
+   囲いを描いているとき（つぎが囲い）は、地図をタップしたのと同じに角を置く。
+   選ぶだけにすると、既存の囲いの内側やへりに、新しい囲いの角を置けない（監査103回目 Major）。
+   描いている間に記録を選ぶときは、下の「記録」の名前のボタンを使う */
+function envLayerTap(svUuid, u, latlng){
+  if(ENV_NEXT.kind === 'A' && !ENV_MOVE && !envPickOn()){ envMapClick(svUuid, latlng); return; }
+  envSelect(u);
 }
 
 /* いまいる場所に足す */
@@ -11859,7 +12123,13 @@ function envAddHere(svUuid){
   // 返ってきた座標が別のラインへ行かないようにする（監査47回目 Critical）
   const 相手 = ENV_NEXT.kind === 'LE' ? envLineTarget(svUuid)
              : ENV_NEXT.kind === 'V'  ? envBendTarget(svUuid) : null;
-  const 相手UU = 相手 ? 相手.uuid : '';
+  let 相手UU = 相手 ? 相手.uuid : '';
+  // 囲いは、角を足す相手（無ければ「新しく描く」）を待つ前に決める
+  if(ENV_NEXT.kind === 'A'){
+    const t = envPolyTarget(svUuid);
+    if(t.many.length){ fixDone(); toast(envPolyManyMsg(t.many), 9000); return; }
+    相手UU = t.st ? t.st.uuid : 'new';
+  }
   getFixOnce(f=>{
     fixDone();
     if(!確かめ()) return;
@@ -12017,6 +12287,11 @@ function envUndo(svUuid){
     toast('このタブでは戻せません。記録を入れているタブでお試しください', 7000);
     return false;
   }
+  // 囲いを描いている途中なら、その角を1つ戻す。描いている間はほかを置けないので、
+  // いちばん新しい操作はいつもこの角。画面の履歴に無くても（開き直したあとでも）戻せる
+  const 描き = envPolyTarget(svUuid);
+  if(描き.many.length){ toast(envPolyManyMsg(描き.many), 9000); return false; }
+  if(描き.st) return envPolyUndoCorner(描き.st);
   let i = ENV_HIST.length - 1;
   while(i >= 0 && !envHistMine(ENV_HIST[i], svUuid)) i--;
   if(i < 0){ toast('戻せるものがありません'); return false; }
@@ -12070,6 +12345,28 @@ function envUndo(svUuid){
   }
   if(h.type === '曲がり'){
     if(!envUndoBend(h.uuid)) return false;
+    return true;
+  }
+  if(h.type === '閉じた'){
+    // 閉じたのを取り消して、描きかけに戻す（続けて角を戻せる）
+    const st = DB.liveStation(h.uuid);
+    if(!st || !isEnvPoly(st)){ toast('その記録はもうありません'); return true; }
+    // 戻せなかったときは、履歴を元の位置へ戻す。消したままだと、もう一度押したときに
+    // 別の操作を戻してしまう（監査103回目 Major）
+    if(envPolyDrawings(svUuid).length){
+      ENV_HIST.splice(i, 0, h);
+      toast('ほかの囲いを描いているので、戻せません', 7000); return false;
+    }
+    st.poly_state = 'drawing';
+    st.survey_time_end = h.prevTime || '';
+    st.ended_at = h.prevEnded || '';
+    if(!DB.upsert(DB.key.st, st)){
+      ENV_HIST.splice(i, 0, h);
+      toast('戻せませんでした（端末の空き容量をご確認ください）', 8000);
+      return false;
+    }
+    ENV_SEL = st.uuid;
+    toast(`${h.name||''} を閉じたのを取り消しました。描きかけに戻っています`, 5000);
     return true;
   }
   if(h.type === '動かした'){
@@ -12184,7 +12481,9 @@ function envSnapTo(svUuid, lat, lon, 除く){
   mapStations(svUuid, 'env').forEach(st=>{
     if(除く && st.uuid === 除く) return;
     const 角 = [];
-    if(envKindOf(st) === 'L'){
+    if(envKindOf(st) === 'A'){
+      polyPts(st).forEach(v=>角.push({pt:v, w:'角'}));
+    }else if(envKindOf(st) === 'L'){
       const a = linePt(st,'start'), b = linePt(st,'end');
       if(a) 角.push({pt:a, w:'始点'});
       if(b) 角.push({pt:b, w:'終点'});
@@ -12221,6 +12520,7 @@ function envMoveOn(u, which){
   return !!(ENV_MOVE && ENV_MOVE.uuid === u && (!which || ENV_MOVE.which === which));
 }
 function envMoveStart(u, which){
+  if(isEnvPoly(DB.liveStation(u))){ toast('囲いの形は、ここでは直せません', 6000); return; }
   if(!writeAllowed()){
     toast('このタブでは直せません。記録を入れているタブでお試しください', 7000);
     return;
@@ -12233,6 +12533,8 @@ function envMoveStart(u, which){
 /* 位置を書き替える。lat/lon が空なら「位置なし」に戻す */
 function envMoveTo(u, which, la, lo, acc, 戻すとき){
   const st = DB.liveStation(u); if(!st) return false;
+  // 囲いは点ではない。点の位置として書き込まない（角を動かすのは今回やらない）
+  if(isEnvPoly(st)){ ENV_MOVE = null; toast('囲いの形は、ここでは直せません', 6000); return false; }
   const a = (acc===undefined || acc===null || acc==='') ? '' : Math.round(acc);
   // 動かす前の場所を控える（1つ戻すため）
   const 前 = which === '始点' ? {lat:st.line_start_lat, lon:st.line_start_lon, acc:st.line_start_acc}
@@ -14565,7 +14867,9 @@ function safeName(v){
 /* この調査の写真を、記録をたどって並べる */
 function photoItemsOf(sv){
   const items = [];
-  const stations = DB.stationsOf(sv.uuid);
+  // 描きかけの囲いの写真は出さない。記録（CSV・GeoJSON）に出ないのに写真だけ出ると、
+  // 付け先の無い写真になる（監査103回目 Major）。閉じれば出る（写真は消えない）
+  const stations = DB.stationsOf(sv.uuid).filter(recordReady);
   stations.forEach(st=>{
     const day = stationDate(st, sv);
     // st_id … どの箇所（ライン・測点・囲い）の写真か。QGIS用の書き出しで、
@@ -14632,7 +14936,11 @@ async function pendingPhotoItems(sv){
   // 混ぜると、消したはずの写真がZIPに入る（2026-08-18 の12回目の監査 Major）
   let owners; try{ owners = livePhotoOwners(); }catch(e){ throw e; }
   const 数 = {};
-  return recs.filter(r=>r && r.id && r.owner && !saved.has(r.id))
+  // 描きかけの囲いに付けようとしている写真も、記録と同じく出さない（監査103回目 Major）
+  const 描きID = new Set(DB.stationsOf(sv.uuid).filter(st=>!recordReady(st)).map(st=>st.uuid));
+  const 描きの分 = r=>描きID.has(r.owner) || 描きID.has(r.owner_st||'')
+    || String(r.owner||'').split(':').some(x=>描きID.has(x));
+  return recs.filter(r=>r && r.id && r.owner && !saved.has(r.id) && !描きの分(r))
     .filter(r=>{
       if(表[r.owner]) return true;                          // 生きている記録の分
       if(photoOwnerMode(r, owners) !== 'draft') return false; // 消した記録の分
@@ -14877,7 +15185,9 @@ const QGIS_HOWTO = [
   '--------',
   '・種別 … 調査地点／ポイント／調査範囲／河川区分（瀬淵）／物理環境ライン／測点／',
   '         測った点（ライン・測点の中で水深・流速を測った場所）／',
-  '         メッシュ範囲／メッシュのマス／歩いた道すじ／箇所（前のやり方）',
+  '         メッシュ範囲／メッシュのマス／物理環境の囲い（瀬・淵の範囲。面.geojson）／',
+  '         歩いた道すじ／箇所（前のやり方）',
+  '・物理環境の囲いは面です。囲いの中で別に測ったところは「測点」として点.geojson に入ります。',
   '・記録ID … 写真一覧.csv や、箇所・測点・メッシュのCSV とつなぐ鍵です。',
   '           「測った点」の記録IDは親のライン・測点のもので、「何点目」が測点CSVの行に当たります。',
   '',
