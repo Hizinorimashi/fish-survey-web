@@ -145,7 +145,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v134';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v136';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -329,6 +329,12 @@ window.addEventListener('storage', e=>{
   if(e.key!==LOCK_KEY || !window.WRITE_OK || LOCK_MODE!=='storage') return;
   const o = lockRead();
   if(o && o.id!==TAB_ID) goReadOnly(WHY_OTHER_TAB);
+});
+/* 別のタブで調査を終えた・消したら、こちらの「画面を消さない」も解く。
+   見ているだけのタブは描き直されないので、ここで追いつく（監査100回目 Major） */
+window.addEventListener('storage', e=>{
+  if(!e || e.key!==DB.key.sv) return;
+  try{ wakeSync(); }catch(err){}
 });
 
 /* 記録に関わる書き込みは必ずここを通す。
@@ -3330,6 +3336,8 @@ function render(){
   // 同じ画面なら、見ていた位置に戻す。別の画面なら先頭から
   window.scrollTo(0, (いまの画面 && いまの画面 === 前の画面) ? 前の位置 : 0);
   if(v.onMount) try{ v.onMount(); }catch(e){ console.error(e); }
+  // 「はじめる」〜「終える」の間だけ、画面を点けたままにする（案内を描いたあとで）
+  try{ wakeSync(); }catch(e){ console.error(e); }
 }
 
 /* ---------- 折りたたみ ----------
@@ -3406,6 +3414,93 @@ function startGps(){
   }, ()=>{}, {enableHighAccuracy:true, maximumAge:5000, timeout:20000});
 }
 function stopGps(){ if(gpsWatchId!=null){ navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId=null; } }
+
+/* ---- 画面を消さない（Screen Wake Lock）----
+   画面が消えるとブラウザがGPSの監視を止め、歩いた道すじが途切れる。
+   「はじめる」〜「終える」の間だけ、画面を点けたままにする（2026-10-26）。
+   常時にすると電池を食い、帰ってから野帳を書き起こすときも点きっぱなしになる。
+   別のアプリへ切り替えるとブラウザが勝手に解くので、戻ってきたら取り直す */
+let WAKE = null;            // 取れている間の印（WakeLockSentinel）
+let WAKE_STATE = 'off';     // off / on / lost / failed / unsupported
+let WAKE_PENDING = false;   // 取りに行っている途中。重ねて取りに行かない（監査99回目 Major）
+let WAKE_TIMEOUT_MS = 15000; // これだけ待って返事が無ければ、断られたものとして取り直せるようにする
+function wakeWanted(){
+  // 今日の期間に入っている「調査中」の調査があるときだけ。
+  // 去年の調査を終え忘れていても、そのために画面を点けっぱなしにはしない
+  return DB.surveys().some(sv=>isLiveNow(sv));
+}
+function wakeSupported(){
+  return !!(navigator.wakeLock && typeof navigator.wakeLock.request === 'function');
+}
+async function wakeAcquire(){
+  if(WAKE || WAKE_PENDING || !wakeWanted() || document.visibilityState!=='visible') return;
+  if(!wakeSupported()){ wakeSet('unsupported'); return; }
+  // 「はじめる」→ 描き直し、のように続けて呼ばれても、取りに行くのは1回。
+  // 2回取りに行くと、先に取れた分を捨てて後の分に頼ることになり、
+  // 後の分だけ断られると、取れていたのに持っていない状態になる
+  WAKE_PENDING = true;
+  let s = null, failed = false, timer = null, req = null;
+  // 返事が永遠に来ないと、終える→はじめる、画面に戻る、のどれでも取り直せなくなる
+  //（監査100回目 Minor）。時間切れにして、遅れて取れた分は捨てる。
+  // 呼び出しそのものが例外を投げても、待ちの印を残さない（監査101回目 Minor）
+  try{
+    req = navigator.wakeLock.request('screen');
+    s = await Promise.race([req, new Promise((_, rej)=>{
+      timer = setTimeout(()=>rej(new Error('wake lock timeout')), WAKE_TIMEOUT_MS); })]);
+  }catch(e){ failed = true; }              // 省電力の設定などで断られた／時間切れ／例外
+  finally{
+    if(timer) clearTimeout(timer);
+    WAKE_PENDING = false;
+  }
+  if(failed && s===null && req && typeof req.then === 'function'){
+    req.then(late=>{ try{ late.release().catch(()=>{}); }catch(e){} }).catch(()=>{});
+  }
+  // 待つ間に「終える」を押した／別の経路で取れていた／画面が隠れた → 取れた分は捨てる。
+  // 待つ間に「終える」→「はじめる」と押し直していれば、そのまま使う
+  const 要る = wakeWanted() && !WAKE && document.visibilityState==='visible';
+  if(!要る){
+    if(s){ try{ s.release().catch(()=>{}); }catch(e){} }
+    return;                                // 要らない要求の成否は、いまの案内に反映しない
+  }
+  if(failed){ wakeSet('failed'); return; }
+  WAKE = s;
+  s.addEventListener('release', ()=>{
+    if(WAKE!==s) return;                   // 自分で解いた分は wakeRelease() が片づけ済み
+    WAKE = null;
+    wakeSet(wakeWanted() ? 'lost' : 'off');   // 画面を消した・切り替えた、などで外れた
+  });
+  wakeSet('on');
+}
+function wakeRelease(){
+  const s = WAKE; WAKE = null;
+  if(s){ try{ s.release().catch(()=>{}); }catch(e){} }
+  wakeSet('off');
+}
+/* 要るなら取る、要らないなら解く。画面を描くたびに呼ぶので、
+   調査の削除・ごみ箱からの復元・クラウドからの復元など、
+   どの経路で「調査中」が増減しても追いつく（監査99回目 Major） */
+function wakeSync(){ if(wakeWanted()) wakeAcquire(); else wakeRelease(); }
+/* 状態を変えて、調査画面の案内（出ていれば）だけを書き換える。
+   画面全体を描き直すと、見ている場所や打ちかけが動くため */
+function wakeSet(state){
+  WAKE_STATE = state;
+  const el = $('#wakeNote');
+  if(el) el.innerHTML = wakeNoteHtml();
+}
+function wakeNoteHtml(){
+  switch(WAKE_STATE){
+    case 'on':          return '画面は自動で消えません（電池を使います）';
+    case 'lost':        return '画面を点けたままにする設定が外れました。この画面に戻れば取り直します';
+    case 'failed':      return '画面を点けたままにできませんでした（省電力の設定など）。'
+                             + '画面を消すと道すじの記録が止まります';
+    case 'unsupported': return 'この端末では画面を点けたままにできません。'
+                             + '画面を消すと道すじの記録が止まります';
+    default:            return '';
+  }
+}
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState === 'visible') wakeSync();
+});
 /* 古い測位を使わない。前の地点の座標が付くのを防ぐ */
 function freshFix(maxAgeMs){
   if(!lastFix) return null;
@@ -6512,6 +6607,8 @@ SCREENS.surveyHub = (svUuid)=>{
                     ? `GPSで歩いた道すじを ${esc(t.st.name||'')} に記録しています`
                     : '道すじの行き先が決まらないので、いまは記録していません。'
                       + '記録したい単位で「通電」をはじめてください'; })())}</div>
+            ${sv.status==='調査中'
+              ? `<div id="wakeNote" class="dim small">${wakeNoteHtml()}</div>` : ''}
           </div>
           ${sv.status==='調査中'
             ? `<button class="btn" style="width:auto;margin:0" onclick="endSurvey('${svUuid}')">終える</button>`
@@ -8999,6 +9096,7 @@ function cloudApply(data, 新しい墓標){
       // 途中で失敗したら、書いた分を戻す（半端な状態を残さない）。
       // 縮むキーから先に戻して空きを作り、失敗分はやり直す（監査81回目 Major）
       const 戻せた = rollbackSaveAll(元);
+      try{ wakeSync(); }catch(e){}       // 戻した（or 戻せなかった）あとの状態で合わせる
       toast(戻せた
         ? '戻せませんでした（端末の空き容量をご確認ください）。いまの記録はそのままです'
         : '戻せませんでした。しかも元にも戻せず、一部が書き換わったままです。'
@@ -9016,6 +9114,7 @@ function cloudApply(data, 新しい墓標){
     catch(e){}
     if(!書けた){
       const 戻せた = rollbackSaveAll(元);
+      try{ wakeSync(); }catch(e){}       // 戻した（or 戻せなかった）あとの状態で合わせる
       toast(戻せた
         ? '戻せませんでした（消した印を書けません）。いまの記録はそのままです'
         : '戻せませんでした。しかも元にも戻せず、一部が書き換わったままです', 12000);
@@ -9029,6 +9128,8 @@ function cloudApply(data, 新しい墓標){
   try{ PHOTO_OWNER = ''; PHOTO_OWNER_SV = '';
        PHOTO_OWNER_INFO = {mode:'', kind:'', station:'', species:''}; }catch(e){}
   try{ SCREENS._photos = []; }catch(e){}
+  // 置き換えた記録に「調査中」が増減していても、写真を待つ間に追いつく（監査100回目 Major）
+  try{ wakeSync(); }catch(e){}
   return true;
 }
 /* ============ 写真も預ける ============
@@ -9758,6 +9859,7 @@ async function cloudMerge(){
   for(const k of CLOUD_KEYS){
     if(!DB.save(DB.key[k], m.box[k] || [])){
       const 戻せた = rollbackSaveAll(元);
+      try{ wakeSync(); }catch(e){}       // 戻した（or 戻せなかった）あとの状態で合わせる
       toast(戻せた
         ? '合成できませんでした（端末の空き容量をご確認ください）。記録はそのままです'
         : '合成できませんでした。しかも元に戻せず、一部が書き換わったままです。'
@@ -9773,6 +9875,7 @@ async function cloudMerge(){
   catch(e){}
   if(!墓標書けた){
     const 戻せた = rollbackSaveAll(元);
+    try{ wakeSync(); }catch(e){}       // 戻した（or 戻せなかった）あとの状態で合わせる
     toast(戻せた
       ? '合成できませんでした（消した印を書けません）。記録はそのままです'
       : '合成できませんでした。しかも元に戻せず、一部が書き換わったままです', 12000);
@@ -9780,6 +9883,9 @@ async function cloudMerge(){
   }
   // 残った打ちかけは捨てる（先に flushAllForms で書いた分は記録に入っている）
   cloudDraftReset();
+  // 合わせた結果で「調査中」が増減していても、ドライブへ送り返す通信を待つ間に
+  // 追いつく（監査101回目 Major）
+  try{ wakeSync(); }catch(e){}
   // 親子と代表の位置を、合わせた結果から決め直す。
   // 直しきれなかったら、その状態をドライブへ送らない（監査82回目 minor）
   let 整えた = true;
@@ -9905,47 +10011,100 @@ function cloudSignOut(){
 
 /* ---- 位置GeoJSON（QGISでそのまま開ける形・EPSG:4326） ----
    点・線・面で1ファイルずつ。座標の並びは GeoJSON の決まりで [経度, 緯度]
-   （2026-08-23 の実機の声・鳥アプリから） */
+   （2026-08-23 の実機の声・鳥アプリから）
+   2026-09-15: 物理環境だけの調査でも QGIS に出せるよう、
+   ・各記録に「写真枚数」「写真」（QGIS用ZIPの中の写真のパス、;区切り）
+   ・ライン・測点の中で測った点（GPS付き）
+   ・メッシュの範囲と、入力済みのマス
+   を足した。写真のパスは QGIS用ZIP を作るときにだけ渡される。
+   地図画面から GeoJSON だけを出すときは枚数だけが入る */
 function geoFeature(geom, props){ return {type:'Feature', geometry:geom, properties:props}; }
-function geoProps(sv, st, 種別){
+function geoLL(pt){ return [pt[1], pt[0]]; }
+/* 数値の欄。空は null にする。'' と数を混ぜると、QGIS（GDAL）がその欄を文字列と
+   みなして、数として並べ替え・色分けできなくなる（2026-09-15 の実物確認） */
+function geoNum(v){ const n = numOf(v); return n==='' ? null : n; }
+/* 記録ID → {n:枚数, paths:[ZIP内のパス]}。
+   魚の写真は、その魚が獲れた箇所（st_id）に数える */
+function geoPhotoTable(items, paths){
+  const 表 = {};
+  (items||[]).forEach(it=>{
+    if(!it || !it.st_id) return;
+    const e = 表[it.st_id] || (表[it.st_id] = {n:0, paths:[]});
+    e.n += 1;
+    const p = paths && it.p && paths[it.p.id];
+    if(p) e.paths.push(p);
+  });
+  return 表;
+}
+function geoProps(sv, st, 種別, 写真){
   const si = spotInfoOf(sv, st);
+  const ph = (写真 && 写真[st.uuid]) || {n:0, paths:[]};
   return {
     '種別': 種別, '名前': st.name||'', '調査日': stationDate(st, sv),
     '河川名': sv.river_name||'', '地点': si.spot||'', '地点名': si.site||'',
     '区間名': si.section||'', '調べたもの': exportKind(sv, st),
+    '写真枚数': ph.n, '写真': ph.paths.join(';'),
     '調査ID': sv.uuid, '記録ID': st.uuid,
   };
 }
-function buildGeoJSON(sv){
+/* opt.items … 写真の一覧（省略時は保存済みの分）、opt.paths … 写真ID → ZIP内のパス */
+function buildGeoJSON(sv, opt){
+  opt = opt || {};
+  const 写真 = geoPhotoTable(opt.items || photoItemsOf(sv), opt.paths);
   const 点 = [], 線 = [], 面 = [];
   const sts = DB.stationsOf(sv.uuid).filter(unitReady);
   for(const st of sts){
-    if(isMesh(st)) continue;                       // メッシュは31列とマスCSVで
     const k = unitKindOf(st);
+    if(isMesh(st)){
+      // メッシュ: 範囲（四隅）と、いまの格子で入力済みのマス。
+      // 前の格子のマスは位置が違う場所を指すので出さない（マスCSVには「前の格子」として残る）
+      const g = meshGeom(st);
+      if(g){
+        const ring = g.corners.map(geoLL); ring.push(ring[0]);
+        const pr = geoProps(sv, st, 'メッシュ範囲', 写真);
+        pr['行数'] = g.rows; pr['列数'] = g.cols;
+        面.push(geoFeature({type:'Polygon', coordinates:[ring]}, pr));
+        meshCurrentCells(st).forEach(c=>{
+          if(!Number.isInteger(c.row) || !Number.isInteger(c.col)
+             || c.row<0 || c.col<0 || c.row>=g.rows || c.col>=g.cols) return;
+          const cr = meshCellPoly(g.corners, g.rows, g.cols, c.row, c.col).map(geoLL);
+          cr.push(cr[0]);
+          const pc = geoProps(sv, st, 'メッシュのマス', null);   // 写真は範囲の側に付ける
+          pc['行'] = c.row+1; pc['列'] = c.col+1;
+          pc['水深cm'] = geoNum(c.depth_cm); pc['流速cms'] = geoNum(c.velocity_cms);
+          pc['河床材料'] = c.substrate||''; pc['環境区分'] = c.habitat_type||'';
+          pc['礫の状況'] = c.gravel_condition||''; pc['カバー'] = c.cover||'';
+          pc['備考'] = c.note||''; pc['マスID'] = c.uuid;
+          面.push(geoFeature({type:'Polygon', coordinates:[cr]}, pc));
+        });
+      }
+      continue;
+    }
     if(st.is_spot){
       const pt = stationPt(st);
-      if(pt) 点.push(geoFeature({type:'Point', coordinates:[pt[1], pt[0]]},
-        geoProps(sv, st, '調査地点')));
+      if(pt) 点.push(geoFeature({type:'Point', coordinates:geoLL(pt)},
+        geoProps(sv, st, '調査地点', 写真)));
     }else if(k === 'P'){
       const pt = stationPt(st);
-      if(pt) 点.push(geoFeature({type:'Point', coordinates:[pt[1], pt[0]]},
-        geoProps(sv, st, 'ポイント')));
+      if(pt) 点.push(geoFeature({type:'Point', coordinates:geoLL(pt)},
+        geoProps(sv, st, 'ポイント', 写真)));
     }else if(k === 'E' || k === 'PF'){
       const pts = polyPts(st);
       if(pts.length >= 3){
-        const ring = pts.map(v=>[v[1], v[0]]);
+        const ring = pts.map(geoLL);
         ring.push(ring[0]);                        // 面は始点で閉じる
         面.push(geoFeature({type:'Polygon', coordinates:[ring]},
-          geoProps(sv, st, k==='E' ? '調査範囲' : '河川区分（瀬淵）')));
+          geoProps(sv, st, k==='E' ? '調査範囲' : '河川区分（瀬淵）', 写真)));
       }
     }else if(isLine(st)){
       const a = linePt(st, 'start'), b = linePt(st, 'end');
       if(a){
-        const mids = lineVias(st).map(v=>[v[1], v[0]]);
-        const coords = [[a[1], a[0]]].concat(mids).concat(b ? [[b[1], b[0]]] : []);
+        const mids = lineVias(st).map(geoLL);
+        const coords = [geoLL(a)].concat(mids).concat(b ? [geoLL(b)] : []);
         if(coords.length >= 2){
-          const pr = geoProps(sv, st, '物理環境ライン');
+          const pr = geoProps(sv, st, '物理環境ライン', 写真);
           pr['向き'] = st.line_direction||'';
+          pr['測点数'] = envPoints(st).length;
           線.push(geoFeature({type:'LineString', coordinates:coords}, pr));
         }
       }
@@ -9953,21 +10112,71 @@ function buildGeoJSON(sv){
       // 物理環境の測点・前のやり方の箇所
       const pt = stationPt(st);
       if(pt){
-        const pr = geoProps(sv, st, stationKind(sv, st)==='物理環境' ? '測点' : '箇所');
-        pr['水深cm'] = numOf(st.depth_rep_cm); pr['流速cms'] = numOf(st.velocity_rep_cms);
+        const pr = geoProps(sv, st, stationKind(sv, st)==='物理環境' ? '測点' : '箇所', 写真);
+        pr['水深cm'] = geoNum(st.depth_rep_cm); pr['流速cms'] = geoNum(st.velocity_rep_cms);
         pr['環境区分'] = st.habitat_type||'';
-        点.push(geoFeature({type:'Point', coordinates:[pt[1], pt[0]]}, pr));
+        点.push(geoFeature({type:'Point', coordinates:geoLL(pt)}, pr));
       }
     }
+    // ライン・測点の中で測った点（水深・流速を測った場所）。GPSが付いた分だけ。
+    // 「何点目」で測点CSVの行と、「記録ID」で親のライン・測点とつながる
+    envPoints(st).forEach((p, i)=>{
+      const la = numOf(p && p.latitude), lo = numOf(p && p.longitude);
+      if(la==='' || lo==='' || !validPt([la, lo])) return;
+      const pr = geoProps(sv, st, '測った点', null);       // 写真は親の記録の側に付ける
+      pr['何点目'] = i+1;
+      pr['水深cm'] = geoNum(p.depth_cm); pr['流速cms'] = geoNum(p.velocity_cms);
+      pr['河床材料'] = p.substrate||''; pr['備考'] = p.note||'';
+      pr['GPS精度m'] = geoNum(p.gps_accuracy);
+      点.push(geoFeature({type:'Point', coordinates:[lo, la]}, pr));
+    });
     // 歩いた道すじ（どの種類の記録に付いていても出す）
     const tr = (st.track||[]).filter(validPt);
     if(tr.length >= 2){
-      線.push(geoFeature({type:'LineString',
-        coordinates: tr.map(v=>[v[1], v[0]])},
-        geoProps(sv, st, '歩いた道すじ')));
+      線.push(geoFeature({type:'LineString', coordinates: tr.map(geoLL)},
+        geoProps(sv, st, '歩いた道すじ', null)));
     }
   }
   return {点, 線, 面};
+}
+/* 写真が付いた記録の代表の位置。写真を点にして置くときに使う。
+   点はその点、ラインは始点、囲い・メッシュは角の平均。
+   戻りは {pt, 置き場}。どこを採ったかを一緒に返す。
+   始点や角が無くて記録の位置に落ちたときに「ラインの始点」と書くと
+   説明と実際がずれる（監査95回目 minor） */
+function geoRepPt(st){
+  if(!st) return {pt:null, 置き場:'なし'};
+  const 平均 = pts=>{
+    if(!pts.length) return null;
+    const p = [pts.reduce((a,v)=>a+v[0],0)/pts.length, pts.reduce((a,v)=>a+v[1],0)/pts.length];
+    return validPt(p) ? p : null;
+  };
+  let pt = null, 置き場 = '';
+  if(isMesh(st)){ const c = meshCorners(st); pt = c && 平均(c); 置き場 = '囲いのまん中'; }
+  else if(isUnitPoly(st)){ pt = 平均(polyPts(st)); 置き場 = '囲いのまん中'; }
+  else if(isLine(st)){ pt = linePt(st, 'start'); 置き場 = 'ラインの始点'; }
+  if(!pt){ pt = stationPt(st); 置き場 = '記録の位置'; }
+  return pt ? {pt, 置き場} : {pt:null, 置き場:'なし'};
+}
+/* 写真を1枚1件の点にする（QGIS用ZIPの 写真.geojson）。
+   idx は写真一覧の行（ファイル名・状態つき）、items は同じ並びの写真。
+   位置の無い写真（メモの写真・箇所が消えた写真）も、位置なし（geometry: null）で
+   1件残す。落とすと、写真一覧.csv にはあるのに層に無い写真ができる */
+function buildPhotoFeatures(sv, idx, items){
+  const byId = {};
+  DB.stationsOf(sv.uuid).forEach(st=>{ byId[st.uuid] = st; });
+  return items.map((it, i)=>{
+    const row = idx[i] || {};
+    const st = it.st_id ? byId[it.st_id] : null;
+    const {pt, 置き場} = geoRepPt(st);
+    return geoFeature(pt ? {type:'Point', coordinates:geoLL(pt)} : null, {
+      '写真': row['ファイル名']||'', '状態': row['状態']||'', '種類': it.kind,
+      '名前': it.station||'', '種名': it.species_name||'', '種ID': it.species_id||'',
+      '調査日': it.day||'', '開始時刻': it.time||'', '位置': 置き場,
+      '調査ID': sv.uuid, '記録ID': it.rec_id||'', '箇所ID': it.st_id||'',
+      '写真ID': (it.p && it.p.id)||'',
+    });
+  });
 }
 function exportGeoJSON(svUuid){
   const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
@@ -14173,6 +14382,9 @@ SCREENS.exportHub = (svUuid)=>{
              gear: buildGearRows(sv, snap).length};
   }catch(e){}
   const ph = photoStats(sv);
+  // QGIS用の見出しの数。位置の無い調査でも画面は出す
+  let geo = {点:[], 線:[], 面:[]};
+  try{ geo = buildGeoJSON(sv); }catch(e){}
   return {
     title:'書き出す',
     sub:[{text:sv.river_name||''}],
@@ -14285,6 +14497,27 @@ SCREENS.exportHub = (svUuid)=>{
                調査を分けてください。</b>` : ''}</div>
       </div>
 
+      <div class="card" id="expQgis">
+        <h3 style="margin-top:0">QGIS用（位置と写真をひとまとめ）</h3>
+        <div class="row">
+          <div class="grow"><div class="dim small">点</div>
+            <div class="big">${geo.点.length}</div></div>
+          <div class="grow"><div class="dim small">線</div>
+            <div class="big">${geo.線.length}</div></div>
+          <div class="grow"><div class="dim small">面</div>
+            <div class="big">${geo.面.length}</div></div>
+          <div class="grow"><div class="dim small">写真</div>
+            <div class="big" id="qgPh">${ph.n} 枚</div></div>
+        </div>
+        <div class="dim small">地点・ポイント・ライン・測点（測った点も）・メッシュのマス・
+          囲い・歩いた道すじを GeoJSON（点/線/面）にして、写真の実物と1つのZIPにまとめます。
+          <b>魚の記録が無い（物理環境だけの）調査でも出せます。</b><br>
+          各記録の「写真」の欄に、同じZIPの中の写真のファイル名が入るので、
+          QGISで記録から写真をそのまま開けます（中の「QGISでの使い方.txt」をご覧ください）。</div>
+        <button class="btn" id="qgZip"
+          onclick="exportQgisZip('${svUuid}')">QGIS用にまとめて書き出す（ZIP）</button>
+      </div>
+
       <div class="card" id="expHowto">
         <h3>取り込みかた</h3>
         <div class="dim small">
@@ -14323,8 +14556,11 @@ function buildZip(files){
   return new Blob(parts, {type:'application/zip'});
 }
 /* ファイル名に使えない文字を落とす */
+/* ファイル名に使えない文字を「_」に。「;」も置き換える。GeoJSON の「写真」の欄で
+   複数のパスを「;」でつなぐので、名前に残るとQGIS側で1つのパスが2つに割れる
+   （監査95回目 Major） */
 function safeName(v){
-  return String(v==null?'':v).replace(/[\\/:*?"<>|]/g,'_').replace(/\s+/g,'_').slice(0,40);
+  return String(v==null?'':v).replace(/[\\/:*?"<>|;]/g,'_').replace(/\s+/g,'_').slice(0,40);
 }
 /* この調査の写真を、記録をたどって並べる */
 function photoItemsOf(sv){
@@ -14332,16 +14568,18 @@ function photoItemsOf(sv){
   const stations = DB.stationsOf(sv.uuid);
   stations.forEach(st=>{
     const day = stationDate(st, sv);
+    // st_id … どの箇所（ライン・測点・囲い）の写真か。QGIS用の書き出しで、
+    // 記録と写真をつなぐ手がかり（2026-09-15）
     (st.photos||[]).forEach((pp,i)=>items.push({
       p:pp, kind:'箇所', day, station:st.name||'',
       species_id:'', species_name:'', time:st.survey_time_start||'',
-      lat:st.latitude, lon:st.longitude, rec_id:st.uuid, no:i+1}));
+      lat:st.latitude, lon:st.longitude, rec_id:st.uuid, st_id:st.uuid, no:i+1}));
     DB.catchesOf(st.uuid).forEach(c=>{
       (c.photos||[]).forEach((pp,i)=>items.push({
         p:pp, kind:'魚', day, station:st.name||'',
         species_id:c.species_id||'', species_name:c.species_name||'',
         time:st.survey_time_start||'', lat:st.latitude, lon:st.longitude,
-        rec_id:c.uuid, no:i+1}));
+        rec_id:c.uuid, st_id:st.uuid, no:i+1}));
     });
   });
   DB.notesOf(sv.uuid).forEach(n=>{
@@ -14367,11 +14605,13 @@ async function pendingPhotoItems(sv){
   DB.stationsOf(sv.uuid).forEach(st=>{
     const day = stationDate(st, sv);
     表[st.uuid] = {kind:'箇所', day, station:st.name||'', species_id:'', species_name:'',
-      time:st.survey_time_start||'', lat:st.latitude, lon:st.longitude, rec_id:st.uuid};
+      time:st.survey_time_start||'', lat:st.latitude, lon:st.longitude,
+      rec_id:st.uuid, st_id:st.uuid};
     DB.catchesOf(st.uuid).forEach(c=>{
       表[c.uuid] = {kind:'魚', day, station:st.name||'',
         species_id:c.species_id||'', species_name:c.species_name||'',
-        time:st.survey_time_start||'', lat:st.latitude, lon:st.longitude, rec_id:c.uuid};
+        time:st.survey_time_start||'', lat:st.latitude, lon:st.longitude,
+        rec_id:c.uuid, st_id:st.uuid};
     });
   });
   DB.notesOf(sv.uuid).forEach(n=>{
@@ -14417,7 +14657,7 @@ async function pendingPhotoItems(sv){
           species_name: (sp && sp.ja) || r.owner_sp_name || '',
           time: st ? (st.survey_time_start||'') : '',
           lat: st ? st.latitude : '', lon: st ? st.longitude : '',
-          rec_id: r.owner};
+          rec_id: r.owner, st_id: st ? st.uuid : ''};
       }
       数[r.owner] = (数[r.owner]||0) + 1;
       return Object.assign({p:{id:r.id, ext:r.ext||'', size:r.size||0},
@@ -14447,6 +14687,8 @@ async function exportPhotoCount(sv, n){
     + `その箇所を開いて「写真をもう一度保存」を押すことをおすすめします。`;
   const cnt = $('#phCount');
   if(cnt) cnt.textContent = (n + pend.length) + ' 枚';
+  const cnt2 = $('#qgPh');                 // QGIS用の欄の枚数もそろえる
+  if(cnt2) cnt2.textContent = (n + pend.length) + ' 枚';
   const btn = $('#phZip');
   if(btn) btn.disabled = false;
 }
@@ -14471,95 +14713,224 @@ const ZIP_MAX_BYTES = 3.5*1024*1024*1024;   // 位置の数え方が4GBまで
 /* 端末で無理なく作れる大きさ。超えたら調査を分けてもらう */
 const PHOTO_ZIP_LIMIT = 800*1024*1024;
 
-async function exportPhotoZip(svUuid){
-  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
-  // まだ記録に付いていない写真も入れる。落とすと、取りこぼしに気づけない
+/* 写真ZIPと QGIS用ZIP で共通の下ごしらえ（2026-09-15 に写真ZIPから切り出し）。
+   まだ記録に付いていない写真も入れる。落とすと、取りこぼしに気づけない。
+   読めなかったら null（断りは出してある）*/
+async function photoZipItems(sv){
   let pend;
   try{ pend = await pendingPhotoItems(sv); }
   catch(e){
     toast('写真の置き場を読めませんでした。'
       + '足りないZIPになるおそれがあるため、書き出しを中止します'
       + '（端末を再起動してからお試しください）', 12000);
-    return;
+    return null;
   }
-  const items = photoItemsOf(sv).concat(pend);
-  if(!items.length){ toast('この調査には写真がありません'); return; }
-  if(items.length + 2 > ZIP_MAX_FILES){
-    toast(`写真が多すぎてまとめられません（${items.length}枚）。調査を分けてください`, 9000);
-    return;
+  return {pend, items: photoItemsOf(sv).concat(pend)};
+}
+/* 入れられる量か。無理なら {ok:false, msg}。大きいときの確認もここで取り、
+   やめたら {ok:false, msg:''}（断りは要らない） */
+function photoZipPrecheck(items){
+  if(items.length + 8 > ZIP_MAX_FILES){        // 8 は一覧・断り書き・GeoJSONの分
+    return {ok:false, msg:`写真が多すぎてまとめられません（${items.length}枚）。調査を分けてください`};
   }
   const guess = items.reduce((a,it)=>a + (numOf(it.p && it.p.size)||0), 0);
   if(guess >= PHOTO_ZIP_LIMIT){
-    toast(`写真が多すぎてまとめられません（約${fmtBytes(guess)}）。`
-      + `${fmtBytes(PHOTO_ZIP_LIMIT)}までです。調査を分けて書き出してください`, 9000);
-    return;
+    return {ok:false, msg:`写真が多すぎてまとめられません（約${fmtBytes(guess)}）。`
+      + `${fmtBytes(PHOTO_ZIP_LIMIT)}までです。調査を分けて書き出してください`};
   }
   if(guess >= 0.3*PHOTO_ZIP_LIMIT && !confirm(`約${fmtBytes(guess)}あります。`
-    + '\n時間がかかり、端末によっては失敗します。続けますか？')) return;
+    + '\n時間がかかり、端末によっては失敗します。続けますか？')) return {ok:false, msg:''};
+  return {ok:true};
+}
+/* 写真の実物を ZIP に入れる形にそろえる。dir を渡すと、その中に入れる（QGIS用は「写真/」）。
+   名前の通し番号は「一覧の何番目か」で付ける。入った分だけで数えると、
+   中身が見つからない写真が1枚あるだけで、写真ZIPと QGIS用ZIP で
+   同じ写真の名前がずれる。
+   戻り: {files, idx（一覧の行）, 入れた, missing, paths（写真ID → ZIP内のパス）}
+        大きすぎたら {tooBig: bytes} */
+async function collectPhotoFiles(items, dir){
+  const files=[], idx=[], paths={};
+  let 入れた=0, missing=0, bytes=0;
+  for(let i=0; i<items.length; i++){
+    const it = items[i];
+    let rec=null; try{ rec=await PhotoDB.get(it.p.id); }catch(e){}
+    let buf=null;
+    if(rec && rec.blob){
+      // 記録側の大きさは書いた時のもの。実物で数え直さないと歯止めが効かない
+      bytes += rec.blob.size;
+      if(bytes > PHOTO_ZIP_LIMIT || bytes > ZIP_MAX_BYTES) return {tooBig: bytes};
+      try{ buf = await rec.blob.arrayBuffer(); }catch(e){ buf=null; }
+    }
+    // 中身が見つからなくても、一覧には必ず1行残す。
+    // 落として黙っていると、ZIPだけを見たとき取りこぼしに気づけない
+    // （2026-08-17 の監査 Major）
+    let name = '';
+    if(buf){
+      入れた += 1;
+      name = (dir||'') + photoFilename(it, i+1);
+      files.push({name, u8:new Uint8Array(buf)});
+      paths[it.p.id] = name;
+    }else{
+      missing += 1;
+    }
+    idx.push({'ファイル名':name,
+      '状態': !buf ? '中身が見つかりません'
+              : (it.pending ? 'まだ記録に付いていません（アプリで保存し直してください）'
+                            : '入っています'),
+      '種類':it.kind, '調査日':it.day, '箇所':it.station,
+      '種ID':it.species_id, '種名':it.species_name, '開始時刻':it.time,
+      '緯度':fixCoord(it.lat), '経度':fixCoord(it.lon),
+      '記録ID':it.rec_id, '写真ID':it.p.id});
+  }
+  return {files, idx, 入れた, missing, paths};
+}
+/* 突き合わせ用の一覧と、足りない分の断り書き。同じZIPに入れる */
+function photoZipNotes(items, pend, 集){
+  const enc = new TextEncoder();
+  // どの写真がどの記録のものか、後から分かるように
+  const files = [{name:'写真一覧.csv', u8: enc.encode('﻿'+toCsv(FS_PHOTO_COLS, 集.idx))}];
+  if(pend.length){
+    files.push({name:'まだ記録に付いていない写真.txt', u8: enc.encode(
+      `${pend.length}枚は、まだ記録に付いていません。\r\n`
+      + '端末の空き容量が足りず、保存しきれなかった写真です。\r\n'
+      + 'アプリでその箇所を開き、「写真をもう一度保存」を押してください。\r\n'
+      + 'ファイル名の「未保存」が目印です。\r\n')});
+  }
+  if(集.missing){
+    files.push({name:'足りない写真.txt', u8: enc.encode(
+      `この調査には写真が ${items.length}枚 ありますが、`
+      + `${集.missing}枚は中身が見つからず入れられませんでした。\r\n`
+      + '「写真一覧.csv」の「状態」の欄をご確認ください。\r\n')});
+  }
+  return files;
+}
+function tooBigMsg(bytes){
+  return `写真が大きすぎてまとめられません（${fmtBytes(bytes)}を超えました）。`
+    + '調査を分けて書き出してください';
+}
+
+async function exportPhotoZip(svUuid){
+  if(!ownsLock()){                          // QGIS用と同じ理由（監査95回目 Major）
+    toast('このタブでは書き出せません。記録を入れているタブから書き出してください', 6000);
+    return;
+  }
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
+  const got = await photoZipItems(sv); if(!got) return;
+  const {pend, items} = got;
+  if(!items.length){ toast('この調査には写真がありません'); return; }
+  const pre = photoZipPrecheck(items);
+  if(!pre.ok){ if(pre.msg) toast(pre.msg, 9000); return; }
 
   toast('写真をまとめています…', 8000);
-  const files=[], idx=[];
-  let seq=0, missing=0, bytes=0;
+  let 集;
   try{
-    for(const it of items){
-      let rec=null; try{ rec=await PhotoDB.get(it.p.id); }catch(e){}
-      let buf=null;
-      if(rec && rec.blob){
-        // 記録側の大きさは書いた時のもの。実物で数え直さないと歯止めが効かない
-        bytes += rec.blob.size;
-        if(bytes > PHOTO_ZIP_LIMIT || bytes > ZIP_MAX_BYTES){
-          toast(`写真が大きすぎてまとめられません（${fmtBytes(bytes)}を超えました）。`
-            + '調査を分けて書き出してください', 9000);
-          return;
-        }
-        try{ buf = await rec.blob.arrayBuffer(); }catch(e){ buf=null; }
-      }
-      // 中身が見つからなくても、一覧には必ず1行残す。
-      // 落として黙っていると、ZIPだけを見たとき取りこぼしに気づけない
-      // （2026-08-17 の監査 Major）
-      let name = '';
-      if(buf){
-        seq += 1;
-        name = photoFilename(it, seq);
-        files.push({name, u8:new Uint8Array(buf)});
-      }else{
-        missing += 1;
-      }
-      idx.push({'ファイル名':name,
-        '状態': !buf ? '中身が見つかりません'
-                : (it.pending ? 'まだ記録に付いていません（アプリで保存し直してください）'
-                              : '入っています'),
-        '種類':it.kind, '調査日':it.day, '箇所':it.station,
-        '種ID':it.species_id, '種名':it.species_name, '開始時刻':it.time,
-        '緯度':fixCoord(it.lat), '経度':fixCoord(it.lon),
-        '記録ID':it.rec_id, '写真ID':it.p.id});
+    集 = await collectPhotoFiles(items, '');
+    if(集.tooBig){ toast(tooBigMsg(集.tooBig), 9000); return; }
+    if(!ownsLock()){
+      toast('書き出しの途中で、ほかのタブに使用権が移りました。'
+          + 'このタブを読み込み直してからやり直してください', 8000);
+      return;
     }
-    // 突き合わせ用の一覧を同じZIPに入れる。どの写真がどの記録のものか、後から分かるように
-    files.push({name:'写真一覧.csv',
-      u8:new TextEncoder().encode('\ufeff'+toCsv(FS_PHOTO_COLS, idx))});
-    if(pend.length){
-      files.push({name:'まだ記録に付いていない写真.txt', u8:new TextEncoder().encode(
-        `${pend.length}枚は、まだ記録に付いていません。\r\n`
-        + '端末の空き容量が足りず、保存しきれなかった写真です。\r\n'
-        + 'アプリでその箇所を開き、「写真をもう一度保存」を押してください。\r\n'
-        + 'ファイル名の「未保存」が目印です。\r\n')});
-    }
-    if(missing){
-      files.push({name:'足りない写真.txt', u8:new TextEncoder().encode(
-        `この調査には写真が ${items.length}枚 ありますが、`
-        + `${missing}枚は中身が見つからず入れられませんでした。\r\n`
-        + '「写真一覧.csv」の「状態」の欄をご確認ください。\r\n')});
-    }
-    downloadBlob(`${exportFileBase(sv)}_写真.zip`, buildZip(files));
+    downloadBlob(`${exportFileBase(sv)}_写真.zip`,
+      buildZip(集.files.concat(photoZipNotes(items, pend, 集))));
   }catch(e){
     toast('写真をまとめられませんでした：' + (e && e.message || e)
       + '（枚数が多いときは、調査を分けてお試しください）', 9000);
     return;
   }
-  toast(missing
-    ? `写真 ${seq}枚を書き出しました。${missing}枚は中身が見つかりませんでした`
+  toast(集.missing
+    ? `写真 ${集.入れた}枚を書き出しました。${集.missing}枚は中身が見つかりませんでした`
       + '（ZIPの中の「足りない写真.txt」をご覧ください）'
-    : `写真 ${seq}枚を書き出しました`, missing?9000:3000);
+    : `写真 ${集.入れた}枚を書き出しました`, 集.missing?9000:3000);
+}
+
+/* ---- QGIS用にまとめて書き出す（位置＋写真を1つのZIPに・2026-09-15） ----
+   魚の記録が無い（物理環境だけの）調査でも出せる。中身は
+     点.geojson / 線.geojson / 面.geojson … 記録の位置（無い層は features が空のまま入る）
+     写真.geojson … 写真1枚が1件（付いた記録の位置に置く）
+     写真/ … 写真の実物、写真一覧.csv、QGISでの使い方.txt
+   各記録の「写真」の欄に、同じZIPの中の写真のパスが入るので、
+   QGISで記録と写真がそのままつながる */
+const QGIS_HOWTO = [
+  'QGISでの使い方',
+  '================',
+  '',
+  '1. このZIPを、ひとつのフォルダにまるごと展開します（「写真」フォルダも一緒に）。',
+  '2. QGISを開き、まず「プロジェクトを保存」で、展開したフォルダの中に保存します（.qgz）。',
+  '   写真の欄は、このフォルダからの相対パス（例: 写真/001_箇所_L1_1.jpg）です。',
+  '   プロジェクトを同じフォルダに置くと、QGISがそのまま写真を見つけられます。',
+  '3. 点.geojson / 線.geojson / 面.geojson / 写真.geojson を地図へドラッグします。',
+  '   座標系は EPSG:4326（緯度経度）です。',
+  '',
+  '記録から写真を見る',
+  '------------------',
+  '・写真.geojson … 写真1枚が1件です。「写真」の欄に写真のパスが入っています。',
+  '  レイヤのプロパティ → 属性フォーム → 「写真」の欄のウィジェットを「添付ファイル」にし、',
+  '  パスを「プロジェクトからの相対パス」にすると、地物の情報で写真がそのまま表示されます。',
+  '  「位置」の欄は、その点をどこに置いたか（記録の位置／ラインの始点／囲いのまん中／なし）です。',
+  '  位置の無い写真（メモの写真など）は、地図には出ませんが属性テーブルには残ります。',
+  '・点/線/面.geojson … 「写真」の欄に、その記録の写真のパスが「;」区切りで入っています',
+  '  （「写真枚数」も）。マップチップに次を入れると、1枚目が浮かび上がります:',
+  '  <img src="file:///[% @project_folder %]/[% array_first(string_to_array("写真", \';\')) %]" width="320">',
+  '',
+  '欄の意味',
+  '--------',
+  '・種別 … 調査地点／ポイント／調査範囲／河川区分（瀬淵）／物理環境ライン／測点／',
+  '         測った点（ライン・測点の中で水深・流速を測った場所）／',
+  '         メッシュ範囲／メッシュのマス／歩いた道すじ／箇所（前のやり方）',
+  '・記録ID … 写真一覧.csv や、箇所・測点・メッシュのCSV とつなぐ鍵です。',
+  '           「測った点」の記録IDは親のライン・測点のもので、「何点目」が測点CSVの行に当たります。',
+  '',
+].join('\r\n');
+async function exportQgisZip(svUuid){
+  // 使用権の無いタブの記録は古いことがある。写真を読んでいる間に別のタブへ
+  // 使用権が移ると、時点の違う写真・属性・位置が混ざる（監査95回目 Major）
+  if(!ownsLock()){
+    toast('このタブでは書き出せません。記録を入れているタブから書き出してください', 6000);
+    return;
+  }
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
+  const got = await photoZipItems(sv); if(!got) return;
+  const {pend, items} = got;
+  const pre = photoZipPrecheck(items);
+  if(!pre.ok){ if(pre.msg) toast(pre.msg, 9000); return; }
+
+  toast('QGIS用にまとめています…', 8000);
+  let g, 集;
+  try{
+    集 = await collectPhotoFiles(items, '写真/');
+    if(集.tooBig){ toast(tooBigMsg(集.tooBig), 9000); return; }
+    g = buildGeoJSON(sv, {items, paths: 集.paths});
+    if(!(g.点.length + g.線.length + g.面.length) && !items.length){
+      toast('位置の付いた記録も写真もまだありません', 6000);
+      return;
+    }
+    const enc = new TextEncoder();
+    const files = [];
+    // 4層はいつも入れる（無い層は features が空）。無い層を省くと、
+    // READMEや同梱の使い方の「4ファイル」と食い違う（監査96回目 Major）
+    const 層 = (名, feats)=>{
+      files.push({name: 名+'.geojson',
+        u8: enc.encode(JSON.stringify({type:'FeatureCollection', features:feats}))});
+    };
+    層('点', g.点); 層('線', g.線); 層('面', g.面);
+    層('写真', buildPhotoFeatures(sv, 集.idx, items));
+    files.push({name:'QGISでの使い方.txt', u8: enc.encode(QGIS_HOWTO)});
+    if(items.length) files.push.apply(files, 集.files.concat(photoZipNotes(items, pend, 集)));
+    if(!ownsLock()){
+      toast('書き出しの途中で、ほかのタブに使用権が移りました。'
+          + 'このタブを読み込み直してからやり直してください', 8000);
+      return;
+    }
+    downloadBlob(`${exportFileBase(sv)}_QGIS.zip`, buildZip(files));
+  }catch(e){
+    toast('QGIS用にまとめられませんでした：' + (e && e.message || e)
+      + '（写真が多いときは、調査を分けてお試しください）', 9000);
+    return;
+  }
+  toast(`QGIS用に書き出しました（点${g.点.length}・線${g.線.length}・面${g.面.length}・`
+    + `写真${集.入れた}枚${集.missing ? `。${集.missing}枚は中身が見つかりません` : ''}）。`
+    + 'ZIPを展開して、中の「QGISでの使い方.txt」をご覧ください', 9000);
 }
 
 /* 31列に乗らない分の書き出し */
