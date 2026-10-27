@@ -69,7 +69,7 @@ button{font-family:inherit;font-size:15px;cursor:pointer}
 .seg button{background:var(--panel2);color:var(--dim);border:1px solid var(--line);
   border-radius:8px;padding:9px 12px;font-size:14px}
 .seg button.on{background:var(--accent);border-color:var(--accent);color:#04121f;font-weight:700}
-.seg.basemap button{font-size:13px;padding:7px 10px}
+.seg.basemap button,.seg.trackbar button{font-size:13px;padding:7px 10px}
 #toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(20px);
   /* 背景も文字もテーマの色にそろえる。背景だけ濃い色で固定すると、
      明るい表示のとき「黒地に黒文字」になって読めない（2026-08-24 の実機の声） */
@@ -145,7 +145,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v138';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v139';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1584,7 +1584,8 @@ function coverPresent(st, side){
    とった労力（通電秒数・歩いた距離・調べた面積）
    ============================================================ */
 const TRACK_MIN_MOVE = 3;      // これ未満しか動いていなければ、軌跡に足さない（m）
-const TRACK_SAVE_MS  = 15000;  // 軌跡を保存する間隔（書き込みすぎを防ぐ）
+const TRACK_SAVE_MS  = 3000;   // 軌跡を保存する間隔（書き込みすぎを防ぐ。v139 で 15秒→3秒。
+                               // 保存しない点は残らないので、この間隔がそのまま点の細かさになる）
 
 /* いまの通電秒数。押しっぱなしの分は、実際の時計で足す。
    秒数を数え続ける仕掛けを持たないので、画面を移してもアプリを閉じても狂わない */
@@ -3140,6 +3141,7 @@ function cpue(st){
 
 /* ---- 歩いた道すじを記録する ---- */
 let TRACK_SAVED_AT = 0;
+let TRACK_SAVED_FOR = '';   // 最後に道すじを保存した箇所。別の箇所の最初の点は待たずに保存する（監査109回目 Major）
 /* いま軌跡を記録してよい箇所を返す。1つに決まらなければ null。
    「最初に見つかった調査中の調査」を使うと、去年の調査を終え忘れていたとき、
    いまの位置がそちらへ黙って入って距離・面積・CPUEを壊す（2026-08-17 の監査 Critical） */
@@ -3170,16 +3172,23 @@ function trackTick(fix){
   const st = t.st;
   const pt = [fix.lat, fix.lon];
   if(!validPt(pt)) return;
-  const track = (st.track||[]).filter(validPt);
-  const last = track.length ? track[track.length-1] : null;
+  // 座標と時刻を組にして読む（古い道すじは時刻なし。並びがずれないように）
+  const pairs = trackPairs(st);
+  const last = pairs.length ? pairs[pairs.length-1].pt : null;
   // 立ち止まっていても距離が伸びるのを防ぐ
   if(last && distMeters(last, pt) < TRACK_MIN_MOVE) return;
-  track.push(pt);
-  st.track = track;
-  if(Date.now() - TRACK_SAVED_AT < TRACK_SAVE_MS){
-    return;                                 // 書き込みすぎない。次の機会にまとめて保存
+  // 書き込みすぎない。保存しない点は足さない（v138 までは足してから保存せずに捨てていて、
+  // 約15秒に1点しか残っていなかった。v139 で間隔を3秒にし、足す点はすべて保存する）
+  if(TRACK_SAVED_FOR === st.uuid && Date.now() - TRACK_SAVED_AT < TRACK_SAVE_MS) return;
+  const ms = (typeof fix.t === 'number' && isFinite(fix.t) && fix.t > 0) ? fix.t : Date.now();
+  pairs.push({pt, t:Math.round(ms/1000)});
+  st.track = pairs.map(p=>p.pt);
+  st.track_t = pairs.map(p=>p.t);          // track と同じ並び。時刻の無い古い点は null
+  if(DB.upsert(DB.key.st, st)){
+    TRACK_SAVED_AT = Date.now(); TRACK_SAVED_FOR = st.uuid;
+    // 開いている地図にその調査の道すじが出ていれば、描き足す（画面は描き直さない）
+    try{ allMaps().forEach(m=>{ if(m._trackSv === t.sv.uuid) trackLayerApply(m, m._trackSv); }); }catch(e){}
   }
-  if(DB.upsert(DB.key.st, st)) TRACK_SAVED_AT = Date.now();
 }
 
 /* ============================================================
@@ -3499,6 +3508,7 @@ function render(){
   const cur = STACK[STACK.length-1];
   // ドローン写真の「選んだ印」は、その画面にいる間だけ
   if(!(cur && cur.name === 'orthos')) orthoSelReset();
+  TRACK_SV = '';      // 道すじを描く調査は、画面が背景ボタンを作るときに決まる
   const scr = SCREENS[cur.name] || SCREENS.home;
   let v;
   try{ v = scr(cur.arg); }
@@ -3932,6 +3942,7 @@ function applyBaseMap(slot, name){
     try{ tileErrorFill(ev.tile, ev.coords, b.url, 1); }catch(e){}
   });
   applyOrthos(s.map);   // ドローン写真も重ねる
+  trackLayerApply(s.map, TRACK_SV);   // 歩いた道すじも（調査を開いている地図だけ）
 }
 /* 上の段のどのタイルの、どの部分を切り出すか */
 function tileParentInfo(z, x, y, up){
@@ -4706,13 +4717,228 @@ SCREENS.orthos = ()=>{
         「最新に更新する」では消えませんが、ブラウザでこのサイトのデータを消すと消えます。端末を変えたら入れ直してください。</div>`
   };
 };
-function baseMapButtonsHtml(){
+/* ============================================================
+   歩いた道すじを地図に出す（v139）。
+   記録は箇所の track（[緯度,経度] の並び）と、同じ並びの track_t（各点の時刻・エポック秒）。
+   track_t の無い古い道すじは、時刻の代わりに歩いた順で色を付ける（時刻としては表示しない）。
+   地図ごとに専用の層（空撮 250 の上、記号 400 の下）に描く。触っても反応しない。
+   表示の設定は端末に保存し、全部の地図で共通（「選ぶ」の中身だけ調査ごと）
+   ============================================================ */
+/* 座標と時刻を、元の並びの番号ごとに組にしてから検査する。
+   track_t が短ければ足りない分は null、長ければ余りを捨てる。
+   座標が正しくない点は、その点の時刻ごと外す（並びがずれない） */
+/* 時刻（エポック秒）として使えるか。日付にできないほど大きい値は使わない（地図の準備が止まる。監査109回目 Major） */
+function trackTimeOk(t){
+  return typeof t==='number' && isFinite(t) && t>0 && isFinite(new Date(t*1000).getTime());
+}
+function trackPairs(st){
+  const tr = Array.isArray(st && st.track) ? st.track : [];
+  const tt = Array.isArray(st && st.track_t) ? st.track_t : [];
+  const out = [];
+  for(let i=0; i<tr.length; i++){
+    if(!validPt(tr[i])) continue;
+    const t = tt[i];
+    out.push({pt:tr[i], t:trackTimeOk(t) ? t : null});
+  }
+  return out;
+}
+const TRACK_COLORS = {'赤':'#ff3b30', '黄':'#ffd60a', '水色':'#32d2ff', '白':'#ffffff', '紫':'#bf5af2'};
+const TRACK_WIDTHS = {'細い':2, 'ふつう':4, '太い':7};
+const TRACK_OPACITY = {'濃い':1, '半分':0.6, '薄い':0.35};
+const TRACK_SCOPES = ['記録中の箇所', 'この調査すべて', '選ぶ'];
+const TRACK_MODES = ['1色', '歩いた時刻'];
+// 時刻の色分けは8色の帯にまとめる（点ごとに線を作ると、点が多いと地図が重くなる）
+const TRACK_RAMP = ['#3b4cc0','#4f8fe8','#2cc4d9','#3fcf6b','#b6d92f','#ffd60a','#ff9500','#ff3b30'];
+function trackPref(k, opts, def){
+  const v = prefs()[k];
+  const ok = Array.isArray(opts) ? opts.indexOf(v) >= 0 : (typeof v === 'string' && Object.prototype.hasOwnProperty.call(opts, v));
+  return ok ? v : def;
+}
+function trackShown(){ return prefs().track_show !== false; }
+function trackScope(){ return trackPref('track_scope', TRACK_SCOPES, 'この調査すべて'); }
+function trackMode(){ return trackPref('track_mode', TRACK_MODES, '1色'); }
+function trackColorName(){ return trackPref('track_color', TRACK_COLORS, '赤'); }
+function trackWidthName(){ return trackPref('track_width', TRACK_WIDTHS, 'ふつう'); }
+function trackOpacityName(){ return trackPref('track_opacity', TRACK_OPACITY, '濃い'); }
+/* 「選ぶ」で選んだ箇所（調査ごと・UUID で持つ。名前が同じ・変わった・消したでも取り違えない） */
+function trackSel(svUuid){
+  const a = (prefs().track_sel || {})[svUuid];
+  return Array.isArray(a) ? a.filter(x=>typeof x==='string') : [];
+}
+function trackSelToggle(svUuid, stUuid){
+  const all = Object.assign({}, prefs().track_sel || {});
+  const cur = trackSel(svUuid);
+  all[svUuid] = cur.indexOf(stUuid)>=0 ? cur.filter(x=>x!==stUuid) : cur.concat([stUuid]);
+  prefSet('track_sel', all);
+  trackRefresh();
+}
+/* 出す道すじ（2点以上あるもの）。{st, pairs} の並び */
+function trackTargets(svUuid){
+  if(!svUuid) return [];
+  const sts = DB.stationsOf(svUuid).filter(st=>!st.is_spot);
+  let pick = sts;
+  const sc = trackScope();
+  if(sc === '記録中の箇所'){
+    const t = trackTarget();
+    pick = (t && t.sv.uuid === svUuid) ? sts.filter(st=>st.uuid===t.st.uuid) : [];
+  }else if(sc === '選ぶ'){
+    const sel = new Set(trackSel(svUuid));
+    pick = sts.filter(st=>sel.has(st.uuid));
+  }
+  return pick.map(st=>({st, pairs:trackPairs(st)})).filter(x=>x.pairs.length >= 2);
+}
+/* 時刻の色分けの帯の番号（0〜7）を各点に付ける。
+   時刻がそろった道すじは「出す道すじ全体の最初〜最後の時刻」で、そろっていない道すじは歩いた順で */
+function trackBands(targets){
+  let tmin = Infinity, tmax = -Infinity;
+  targets.forEach(x=>x.pairs.forEach(p=>{ if(p.t!==null){ tmin=Math.min(tmin,p.t); tmax=Math.max(tmax,p.t); } }));
+  const nb = TRACK_RAMP.length;
+  const band = v=>Math.max(0, Math.min(nb-1, Math.floor(v*nb)));
+  return targets.map(x=>{
+    const timed = x.pairs.every(p=>p.t!==null) && tmax > tmin;
+    const n = x.pairs.length;
+    return x.pairs.map((p,i)=> band(timed ? (p.t - tmin)/(tmax - tmin) : (n>1 ? i/(n-1) : 0)));
+  });
+}
+/* 線の束を作る。1色なら全部で1本（複数の線）、時刻なら帯ごとに1本。点の数に比例して層を増やさない */
+function trackLines(targets){
+  if(trackMode() !== '歩いた時刻'){
+    return [{color:TRACK_COLORS[trackColorName()], lines:targets.map(x=>x.pairs.map(p=>p.pt))}];
+  }
+  const bands = trackBands(targets);
+  const per = TRACK_RAMP.map(c=>({color:c, lines:[]}));
+  targets.forEach((x, k)=>{
+    const b = bands[k];
+    let cur = null, curB = -1;
+    for(let i=0; i<x.pairs.length; i++){
+      if(b[i] !== curB){
+        // 帯が変わったら、前の線の最後の点から次の線を始める（途切れないように）
+        const prev = cur && cur.length ? cur[cur.length-1] : null;
+        cur = prev ? [prev] : [];
+        curB = b[i];
+        per[curB].lines.push(cur);
+      }
+      cur.push(x.pairs[i].pt);
+    }
+  });
+  return per.filter(g=>g.lines.some(l=>l.length>=2)).map(g=>({color:g.color, lines:g.lines.filter(l=>l.length>=2)}));
+}
+/* 地図の下の説明（時刻の色分けのときの、最初と最後の時刻） */
+function trackLegendText(targets){
+  if(!trackShown()) return '';
+  if(!targets.length){
+    return trackScope()==='記録中の箇所' ? 'いま道すじを記録している箇所はありません'
+         : trackScope()==='選ぶ' ? '出す道すじを「表示の設定」から選んでください' : 'この調査には、まだ道すじがありません';
+  }
+  if(trackMode() !== '歩いた時刻') return `道すじ ${targets.length}本`;
+  let tmin = Infinity, tmax = -Infinity, untimed = 0;
+  targets.forEach(x=>{
+    if(x.pairs.some(p=>p.t===null)) untimed++;
+    x.pairs.forEach(p=>{ if(p.t!==null){ tmin=Math.min(tmin,p.t); tmax=Math.max(tmax,p.t); } });
+  });
+  const hm = s=>{ try{ return fmtTime(new Date(s*1000).toISOString()); }catch(e){ return '—'; } };
+  const span = !isFinite(tmin) ? '時刻の記録なし'
+             : tmax > tmin ? `${hm(tmin)} → ${hm(tmax)}` : hm(tmin);
+  return `道すじ ${targets.length}本　青 ${span} 赤`
+    + (untimed ? `（${untimed}本は時刻の記録が無いので歩いた順で色分け）` : '');
+}
+/* 地図に描く（描き直す）。地図を作るとき（applyBaseMap）・設定を変えたとき・歩いて点が増えたときに呼ぶ */
+function trackLayerApply(map, svUuid){
+  if(!map || typeof L === 'undefined') return;
+  if(allMaps().indexOf(map) < 0) return;
+  map._trackSv = svUuid || '';
+  (map._trackLayers || []).forEach(l=>{ try{ map.removeLayer(l); }catch(e){} });
+  map._trackLayers = [];
+  const box = document.getElementById('trackLegend');
+  if(!svUuid){ if(box) box.textContent = ''; return; }
+  let targets = [];
+  try{ targets = trackShown() ? trackTargets(svUuid) : []; }catch(e){ console.error(e); }
+  if(box) box.textContent = trackLegendText(targets);
+  if(!targets.length) return;
+  let pane = null;
+  try{ pane = map.getPane('track'); }catch(e){ pane = null; }
+  if(!pane){
+    const tiles = map.getPane('tilePane');
+    pane = map.createPane('track', tiles && tiles.parentNode ? tiles.parentNode : undefined);
+    pane.style.zIndex = '350';
+    pane.style.pointerEvents = 'none';
+  }
+  const w = TRACK_WIDTHS[trackWidthName()], op = TRACK_OPACITY[trackOpacityName()];
+  trackLines(targets).forEach(g=>{
+    try{
+      map._trackLayers.push(L.polyline(g.lines, {pane:'track', color:g.color, weight:w, opacity:op,
+        interactive:false, lineCap:'round', lineJoin:'round'}).addTo(map));
+    }catch(e){ console.error(e); }
+  });
+}
+/* 開いている地図の道すじを描き直す（画面は描き直さない） */
+function trackRefresh(){
+  allMaps().forEach(m=>{ if(m._trackSv) trackLayerApply(m, m._trackSv); });
+  $$('button[data-track]').forEach(b=>b.classList.toggle('on', trackShown()));
+  const box = document.getElementById('trackSet');
+  if(box && box.style.display !== 'none') box.innerHTML = trackSetHtml(box.dataset.sv || '');
+}
+function trackToggle(){ prefSet('track_show', !trackShown()); trackRefresh(); }
+function trackSetPref(k, v){ prefSet(k, v); trackRefresh(); }
+/* 「表示の設定」で開く箱（地図の上・道すじのボタンの下） */
+function trackSetOpen(){
+  const box = document.getElementById('trackSet'); if(!box) return;
+  const open = box.style.display === 'none';
+  box.style.display = open ? '' : 'none';
+  if(open) box.innerHTML = trackSetHtml(box.dataset.sv || '');
+  $$('button[data-track-set]').forEach(b=>b.classList.toggle('on', open));
+}
+function trackSegHtml(k, opts, cur){
+  return `<div class="seg" style="margin-bottom:6px">` + opts.map(o=>
+    `<button type="button" class="${o===cur?'on':''}" data-track-k="${esc(k)}" data-track-v="${esc(o)}">${esc(o)}</button>`
+  ).join('') + `</div>`;
+}
+function trackSetHtml(svUuid){
+  let sel = '';
+  if(trackScope()==='選ぶ' && svUuid){
+    const chosen = new Set(trackSel(svUuid));
+    const sts = DB.stationsOf(svUuid).filter(st=>!st.is_spot && trackPairs(st).length >= 2);
+    sel = sts.length ? sts.map(st=>`<label style="display:flex;gap:8px;align-items:center;margin:4px 0">
+        <input type="checkbox" style="width:20px;height:20px;margin:0" ${chosen.has(st.uuid)?'checked':''}
+          data-track-st="${esc(st.uuid)}"> ${esc(st.name||'（名前なし）')}
+        <span class="dim small">${esc(fmtDist(pathLength(trackPairs(st).map(p=>p.pt))))}</span></label>`).join('')
+      : '<div class="dim small">道すじのある箇所がまだありません</div>';
+  }
+  return `<div class="card" style="padding:10px">
+    <div class="dim small">出す道すじ</div>${trackSegHtml('track_scope', TRACK_SCOPES, trackScope())}${sel}
+    <div class="dim small">色分け</div>${trackSegHtml('track_mode', TRACK_MODES, trackMode())}
+    ${trackMode()==='1色' ? `<div class="dim small">色</div>${trackSegHtml('track_color', Object.keys(TRACK_COLORS), trackColorName())}` : ''}
+    <div class="dim small">太さ</div>${trackSegHtml('track_width', Object.keys(TRACK_WIDTHS), trackWidthName())}
+    <div class="dim small">濃さ</div>${trackSegHtml('track_opacity', Object.keys(TRACK_OPACITY), trackOpacityName())}
+  </div>`;
+}
+/* 設定の箱の押下を1か所で受ける（値は HTML の属性で持ち、onclick の文字列に埋めない） */
+function trackOnClick(ev){
+  const t = ev && ev.target; if(!t || typeof t.closest !== 'function') return;
+  const box = t.closest('#trackSet'); if(!box) return;
+  const b = t.closest('[data-track-k]');
+  if(b){ trackSetPref(b.getAttribute('data-track-k'), b.getAttribute('data-track-v')); return; }
+  const c = t.closest('[data-track-st]');
+  if(c) trackSelToggle(box.dataset.sv || '', c.getAttribute('data-track-st'));
+}
+/* いま描こうとしている画面の調査（背景ボタンを作るときに決まり、applyBaseMap が使う） */
+let TRACK_SV = '';
+function trackButtonsHtml(svUuid){
+  return `<button type="button" data-track="1" class="${trackShown()?'on':''}" onclick="trackToggle()">道すじ</button>`
+    + `<button type="button" data-track-set="1" onclick="trackSetOpen()">表示の設定</button>`;
+}
+function baseMapButtonsHtml(svUuid){
+  TRACK_SV = svUuid || '';   // この画面の地図に描く道すじの調査（applyBaseMap が使う）
   const cur = baseMapName();
   return `<div class="seg basemap" style="margin-bottom:8px">` + Object.keys(BASEMAPS).map(n=>
     `<button type="button" class="${n===cur?'on':''}" onclick="switchBaseMap(this,'${esc(n)}')">${esc(n)}</button>`
   ).join('')
   // ドローン写真があるときだけ、出す／消すのボタンを同じ列に足す
-  + (orthoList().some(o=>o && !o.broken) ? orthoButtonHtml() : '') + `</div>`;
+  + (orthoList().some(o=>o && !o.broken) ? orthoButtonHtml() : '') + `</div>`
+  // 調査を開いている地図だけ、道すじの出す／消すと表示の設定を別の列に出す
+  + (svUuid ? `<div class="seg trackbar" style="margin-bottom:8px">${trackButtonsHtml(svUuid)}</div>`
+      + `<div id="trackSet" data-sv="${esc(svUuid)}" style="display:none"></div>`
+      + `<div id="trackLegend" class="dim small" style="margin:-4px 0 6px"></div>` : '');
 }
 function switchBaseMap(btn, name){
   if(!BASEMAPS[name]) return;
@@ -7028,7 +7254,7 @@ SCREENS.surveyEdit = (svUuid)=>{
       </div>
 
       ${isNew ? '' : recDayBarHtml(sv)}
-      ${baseMapButtonsHtml()}
+      ${baseMapButtonsHtml(sv && sv.uuid)}
       <div id="svmap" class="map"
         style="height:${envMapBig()?'80vh':'50vh'};min-height:260px"></div>
       <div class="dim small" id="f_mapMsg">${isNew
@@ -12260,7 +12486,7 @@ SCREENS.fishMap = (arg)=>{
     html:`
       ${地点札}
       ${recDayBarHtml(sv)}
-      ${baseMapButtonsHtml()}
+      ${baseMapButtonsHtml(sv && sv.uuid)}
       <div id="fishmap" class="map"
         style="height:${envMapBig()?'80vh':'46vh'};min-height:260px"></div>
       <div class="dim small" id="fishHint"></div>
@@ -12620,7 +12846,7 @@ SCREENS.envMap = (arg)=>{
     html:`
       ${fromSpotHtml(spot)}
       ${recDayBarHtml(sv)}
-      ${baseMapButtonsHtml()}
+      ${baseMapButtonsHtml(sv && sv.uuid)}
       <div id="envmap" class="map"
         style="height:${envMapBig()?'80vh':'46vh'};min-height:260px"></div>
 
@@ -13459,7 +13685,7 @@ SCREENS.meshSetup = (stUuid)=>{
         </div>
       </div>
 
-      ${baseMapButtonsHtml()}
+      ${baseMapButtonsHtml(sv && sv.uuid)}
       <div id="meshmap" class="map"></div>
       <div class="dim small" style="margin-top:8px">地図をタップすると、
         1→2→3→4 の順で四隅が決まります。</div>
@@ -13763,7 +13989,7 @@ SCREENS.mesh = (stUuid)=>{
         <div class="dim small">この値が、箇所の代表値としてCSVに出ます。</div>
       </div>` : ''}
 
-      ${baseMapButtonsHtml()}
+      ${baseMapButtonsHtml(sv && sv.uuid)}
       <div id="meshmap2" class="map"></div>
 
       <button class="btn" onclick="nav('meshSetup','${stUuid}')">範囲と格子を決め直す</button>
@@ -13776,9 +14002,10 @@ SCREENS.mesh = (stUuid)=>{
       const c = (g2 ? g2.corners[0] : null) || stationPt(st) || [43.06, 141.35];
       MAPS.main.map = makeMap('meshmap2', c, 17);
       const map = MAPS.main.map;
-      if(!map || !g2) return;
-      applyBaseMap('main', baseMapName());
+      if(!map) return;
+      applyBaseMap('main', baseMapName());   // 格子が無くても背景と道すじは出す（監査109回目 Major）
       addLocateControl(map);
+      if(!g2) return;
       try{ MESHLAYER.forEach(x=>map.removeLayer(x)); }catch(e){}
       MESHLAYER = [];
       const cm = meshCellMap(cells);
@@ -14928,7 +15155,7 @@ SCREENS.map = (svUuid)=>{
     title:'地図',
     sub:[{text:sv.river_name||''}],
     html:`
-      ${baseMapButtonsHtml()}
+      ${baseMapButtonsHtml(sv && sv.uuid)}
       <div id="themap" class="map"></div>
       <div class="dim small" style="margin-top:8px">
         <span style="color:#4aa3ff">●</span> 調査の位置　
@@ -15086,7 +15313,7 @@ SCREENS.offlineMap = (svUuid)=>{
           <button class="btn sm grow" onclick="opolyView()">今の表示範囲を使う</button>
         </div>
       </div>
-      ${baseMapButtonsHtml()}
+      ${baseMapButtonsHtml(sv && sv.uuid)}
       <div id="omap" class="map"></div>
       <div class="card">
         <label>いちばん細かい大きさ</label>
@@ -16204,7 +16431,8 @@ function boot(){
   setInterval(()=>{ try{ PhotoDB.gc(); }catch(e){} }, 30*60*1000);
   // ドローン写真を読んで、地図に重ねられるようにする（別のタブの変更も受ける）
   try{ orthoChannel(); orthoPreload().catch(e=>console.error(e)); }catch(e){}
-  try{ document.addEventListener('click', orthoOnClick); }catch(e){}   // 一覧の押下（選ぶ・消す）を1か所で受ける
+  try{ document.addEventListener('click', orthoOnClick); }catch(e){}
+  try{ document.addEventListener('click', trackOnClick); }catch(e){}     // 道すじの設定の箱の押下   // 一覧の押下（選ぶ・消す）を1か所で受ける
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
