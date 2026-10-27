@@ -151,7 +151,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v142';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v143';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -3591,7 +3591,7 @@ function render(){
   // 囲いの直しかけは、その地図の画面にいて、その記録が生きている間だけ持つ
   if(POLY_EDIT){
     const 生き = DB.liveStation(POLY_EDIT.uuid);
-    if(!cur || cur.name !== POLY_EDIT.screen || !生き){
+    if(!cur || polyEditScreenKey() !== POLY_EDIT.screen || !生き){
       POLY_EDIT = null;
       try{ toast('直しかけの囲いの形は、保存せずに閉じました', 6000); }catch(e){}
     }
@@ -9289,8 +9289,14 @@ function unitMoveOwn(親uuid, 子uuid){
    「直し終える」で、形と全単位の親子をまとめて1回で保存する。「やめる」で捨てる。
    写しはメモリだけ。別の画面へ移る・記録が消える／置き換わる・使用権を失うと捨てる
    ============================================================ */
-let POLY_EDIT = null;      // {uuid, sv, screen:'fishMap'|'envMap', base:updated_at, pts:[[緯度,経度]…], sel:番号|-1, hist:[]}
+let POLY_EDIT = null;      // {uuid, sv, screen:始めた画面の名前と対象, base:updated_at, pts:[[緯度,経度]…], sel:番号|-1, hist:[]}
 let POLY_DRAG_AT = 0;      // 角を引っぱり終えた時刻。直後のクリックを「選ぶ」と取り違えない
+function polyEditScreenKey(){
+  const c = STACK[STACK.length-1];
+  if(!c) return '';
+  let a = ''; try{ a = JSON.stringify(c.arg === undefined ? null : c.arg); }catch(e){ a = String(c.arg); }
+  return c.name + '|' + a;
+}
 function polyEditOn(u){ return !!POLY_EDIT && (!u || POLY_EDIT.uuid === u); }
 function polyEditDirty(){ return !!POLY_EDIT && POLY_EDIT.hist.length > 0; }
 function polyEditReset(){ POLY_EDIT = null; }
@@ -9324,7 +9330,9 @@ function polyEditStart(u){
   // 「直している間にほかで書き換えられた」と取り違えて保存できない）
   const st = DB.liveStation(u);
   if(polyEditable(st)){ toast(polyEditable(st), 7000); return false; }
-  POLY_EDIT = { uuid:st.uuid, sv:st.survey_uuid, screen: fish ? 'fishMap' : 'envMap',
+  // 直しを始めた画面（名前と開いた対象）を覚える。地図で記録する調査は「調査」の画面がそのまま地図を出すので、
+  // 画面の名前を 'fishMap' と決め打ちすると、描き直したとたんに直しかけを捨てていた（2026-10-28 の実機の声）
+  POLY_EDIT = { uuid:st.uuid, sv:st.survey_uuid, screen: polyEditScreenKey(),
                 base: st.updated_at || '', pts: polyPts(st).map(v=>[v[0], v[1]]), sel:-1, hist:[] };
   toast('角を指で引っぱるか、角を押してから行き先をタップしてください。辺の＋で角を足せます', 8000);
   render();
