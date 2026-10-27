@@ -73,6 +73,7 @@ button{font-family:inherit;font-size:15px;cursor:pointer}
 .pe-corner{touch-action:none;width:30px;height:30px;border-radius:50%;background:#fff;border:3px solid #f0883e;color:#04121f;
   font:700 12px/24px sans-serif;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.5)}
 .pe-corner.on{background:#f0883e;color:#fff;border-color:#fff;transform:scale(1.15)}
+.envbg-name{font:700 11px/16px sans-serif;color:#fff;text-shadow:0 0 3px #000,0 0 3px #000;text-align:center;white-space:nowrap;pointer-events:none}
 .pe-plus{width:24px;height:24px;border-radius:50%;background:rgba(4,18,31,.75);border:2px solid #f0883e;color:#f0883e;
   font:700 18px/19px sans-serif;text-align:center}
 #toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(20px);
@@ -150,7 +151,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v141';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v142';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -267,6 +268,7 @@ function goReadOnly(why){
 }
 function openWrite(){
   window.WRITE_OK=true; window.READ_ONLY=false; LOCK_WHY='';
+  try{ if(typeof walkGc === 'function') walkGc(); }catch(e){}   // 道すじの片付けは使用権を取れてから
   try{ render(); }catch(e){}
 }
 
@@ -3239,11 +3241,16 @@ function trackTarget(){
 function trackTick(fix){
   if(!fix || !ownsLock()) return;
   if(fix.acc > GPS_MAX_ACC) return;        // 粗すぎる位置は使わない
+  const pt = [fix.lat, fix.lon];
+  if(!validPt(pt)) return;
+  // 調査ぜんたいの道すじ（v142）。箇所が決まらなくても、調査中の調査が1つに決まれば残す
+  try{
+    const sv0 = trackSurvey();
+    if(sv0) walkTick(sv0, pt, (typeof fix.t === 'number' && isFinite(fix.t) && fix.t > 0) ? fix.t : Date.now());
+  }catch(e){ console.error(e); }
   const t = trackTarget();
   if(!t) return;
   const st = t.st;
-  const pt = [fix.lat, fix.lon];
-  if(!validPt(pt)) return;
   // 座標と時刻を組にして読む（古い道すじは時刻なし。並びがずれないように）
   const pairs = trackPairs(st);
   const last = pairs.length ? pairs[pairs.length-1].pt : null;
@@ -4798,6 +4805,205 @@ SCREENS.orthos = ()=>{
   };
 };
 /* ============================================================
+   調査ぜんたいの道すじ（v142・2026-10-27 の実機の声）。
+   地図で記録する調査では、閉じた囲いが「終わっていない箇所」として何個も並ぶので、箇所の道すじの
+   行き先が決まらず捨てていた。箇所が決まらなくても、調査中の調査が1つに決まれば、ここに残す。
+   置き場は端末の中だけ（IndexedDB fs_walk。ドローン写真・資料PDFと同じ考え方）。
+   調査の記録（sv）には書かない（3秒ごとに調査の記録が新しくなり、合成で別の端末の調査の設定を
+   古い内容で上書きしてしまうため）。クラウド保存・バックアップ・CSV・努力量・集計には入らない。
+   1件＝1本の線（区切り）: {id, sv, day, pts:[[緯度,経度,秒]…]}。日が変わる・15分以上空く・
+   「はじめる」を押し直すと新しい線にする（離れた2地点を直線でつながない）
+   ============================================================ */
+const WalkDB = {
+  _open(){
+    return new Promise((res, rej)=>{
+      if(!window.indexedDB){ rej(new Error('この端末では道すじを保存できません')); return; }
+      let rq; try{ rq = indexedDB.open('fs_walk', 1); }catch(e){ rej(e); return; }
+      rq.onupgradeneeded = ()=>{ const db = rq.result; if(!db.objectStoreNames.contains('seg')) db.createObjectStore('seg', {keyPath:'id'}); };
+      rq.onsuccess = ()=>{ const db = rq.result; db.onversionchange = ()=>{ try{ db.close(); }catch(e){} }; res(db); };
+      rq.onerror = ()=>rej(rq.error);
+      rq.onblocked = ()=>rej(new Error('blocked'));
+    });
+  },
+  async _do(mode, fn){
+    const db = await this._open();
+    try{
+      return await new Promise((res, rej)=>{
+        const tx = db.transaction('seg', mode);
+        const rq = fn(tx.objectStore('seg'));
+        let reqErr = null;
+        tx.oncomplete = ()=>res(rq && rq.result !== undefined ? rq.result : undefined);
+        tx.onerror = ev=>{ reqErr = (ev && ev.target && ev.target.error) || reqErr; };
+        tx.onabort = ()=>rej(tx.error || reqErr || new Error('abort'));
+      });
+    }finally{ try{ db.close(); }catch(e){} }
+  },
+  all(){ return this._do('readonly', st=>st.getAll()); },
+  put(rec){ return this._do('readwrite', st=>st.put(rec)); },
+  del(id){ return this._do('readwrite', st=>st.delete(id)); },
+};
+const WALK_GAP_SEC = 15*60;      // これより空いたら新しい線
+const WALK_MAX_PTS = 20000;      // 1本の点の上限（これを超えたら新しい線）
+let WALK = {};                   // id → 区切り（画面用の写し。正本は fs_walk）
+let WALK_LOADED = false;
+let WALK_CUR = {};               // 調査 → いま足している区切りの id
+let WALK_BREAK = {};             // 調査 → 次は新しい線にする（「はじめる」を押した）
+let WALK_SAVED_AT = 0, WALK_BUSY = false, WALK_WARNED = false;
+let WALK_FAIL = false, WALK_LOADING = false, WALK_GC_DONE = false, WALK_GC_BUSY = false;
+/* 「次は新しい線」の印。「はじめる」の直後に読み込み直しても消えないよう、端末にも書く（監査116回目 Major） */
+function walkBreakAll(){ try{ return JSON.parse(localStorage.getItem('fs_walk_break')||'{}') || {}; }catch(e){ return {}; } }
+/* いま立っている区切りの印（無ければ ''）。印は「何回目の印か」の文字で持つ（監査118回目 Major） */
+function walkBreakToken(svUuid){
+  const m = WALK_BREAK[svUuid], d = walkBreakAll()[svUuid];
+  return (typeof d === 'string' && d) ? d : (d === true ? 'old' : (m ? String(m) : ''));
+}
+function walkBreakOn(svUuid){ return !!walkBreakToken(svUuid); }
+function walkBreakSet(svUuid){
+  const tok = uuid();
+  try{ const a = walkBreakAll(); a[svUuid] = tok; localStorage.setItem('fs_walk_break', JSON.stringify(a)); }
+  catch(e){ return false; }
+  WALK_BREAK[svUuid] = tok;
+  return true;
+}
+/* 印を消す。保存を始めたときの印（tok）といまの印が同じときだけ。
+   保存している間に「終える→はじめる」で新しい印が立っていたら、それは消さない */
+function walkBreakClear(svUuid, tok){
+  if(walkBreakToken(svUuid) !== tok) return;
+  if(WALK_BREAK[svUuid] === tok || tok === 'old') delete WALK_BREAK[svUuid];
+  try{ const a = walkBreakAll(); if(a[svUuid] !== undefined){ delete a[svUuid]; localStorage.setItem('fs_walk_break', JSON.stringify(a)); } }catch(e){}
+}
+/* 起動時に読み込む。読めなければ、記録できないことを一度知らせ、あとの GPS で読み直しを試す */
+async function walkLoad(){
+  if(WALK_LOADING) return false;
+  WALK_LOADING = true;
+  let all = [];
+  try{ all = (await WalkDB.all()) || []; }
+  catch(e){
+    console.error(e);
+    WALK_LOADING = false;
+    if(!WALK_FAIL){ WALK_FAIL = true; try{ toast('この端末では、歩いた道すじを保存できません（道すじの置き場を開けませんでした）', 9000); }catch(_){} }
+    return false;
+  }
+  const m = {};
+  all.forEach(r=>{ if(r && typeof r.id === 'string' && r.id && Array.isArray(r.pts)) m[r.id] = r; });
+  WALK = m; WALK_LOADED = true; WALK_FAIL = false; WALK_LOADING = false;
+  // 読み込み直したあとも、続けて足していた線（今日・15分以内・区切りの印なし）を「いまの線」に戻す
+  const now = Math.round(Date.now()/1000);
+  new Set(Object.values(WALK).map(r=>r.sv)).forEach(u=>{ const r = walkCurrent(u, now); if(r) WALK_CUR[u] = r.id; });
+  try{ await walkGc(); }catch(e){}   // 片付けが終わってから描く
+  try{ allMaps().forEach(mp=>{ if(mp._trackSv) trackLayerApply(mp, mp._trackSv); }); }catch(e){}
+  // 読み込み中に届いた位置を、ここで改めて使う
+  try{ if(lastFix && ownsLock()){ const sv0 = trackSurvey(); if(sv0) walkTick(sv0, [lastFix.lat, lastFix.lon], lastFix.t || Date.now()); } }catch(e){}
+  return true;
+}
+/* 完全に消した調査の道すじを片付ける（ごみ箱の間は残して隠すだけ）。読み込みと使用権の両方がそろってから。
+   使用権は読み込みより遅れて取れることがあるので、使用権を取れたとき（openWrite）からも呼ぶ（監査116回目 Major） */
+async function walkGc(){
+  if(WALK_GC_DONE || WALK_GC_BUSY || !WALK_LOADED) return;
+  try{ if(!ownsLock()) return; }catch(e){ return; }
+  WALK_GC_BUSY = true;
+  try{
+    for(const r of Object.values(WALK)){
+      // 1件ごとに確かめ直す。待っている間に使用権を渡した・別のタブで調査が戻された、を見落とさない（監査118回目 Major）
+      try{ if(!ownsLock()) return; }catch(e){ return; }
+      let ある;
+      try{ ある = DB.loadRaw(DB.key.sv).some(x=>x && x.uuid===r.sv); }catch(e){ return; }   // 読めなければ消さない
+      if(ある) continue;
+      try{ await WalkDB.del(r.id); delete WALK[r.id]; }catch(e){}
+    }
+    // 最後の1件を消している間に使用権を失った・記録が読めなくなった、も見る（監査119回目 Major）
+    try{ if(!ownsLock()) return; DB.loadRaw(DB.key.sv); }catch(e){ return; }
+    WALK_GC_DONE = true;
+  }finally{ WALK_GC_BUSY = false; }
+}
+/* 道すじを足す調査（調査中・いま現場・一般の調査が1つに決まるとき）。決まらなければ null */
+function trackSurvey(){
+  const cand = DB.surveys().filter(sv=>sv.status==='調査中' && isLiveNow(sv) && !isDetail(sv));
+  return cand.length === 1 ? cand[0] : null;
+}
+function walkSegsOf(svUuid){
+  return Object.values(WALK).filter(r=>r && r.sv===svUuid && Array.isArray(r.pts))
+    .sort((a,b)=> ((a.pts[0]||[])[2]||0) - ((b.pts[0]||[])[2]||0) || String(a.id).localeCompare(String(b.id)));
+}
+/* 区切りの名前（調査ぜんたい 10/27、同じ日に2本目からは「10/27 その2」） */
+function walkSegName(r, segs){
+  const same = (segs||walkSegsOf(r.sv)).filter(x=>x.day===r.day);
+  const k = same.findIndex(x=>x.id===r.id);
+  return `調査ぜんたい ${String(r.day||'').slice(5).replace('-','/')}` + (same.length > 1 ? ` その${k+1}` : '');
+}
+function walkPairs(r){
+  return (r.pts||[]).map(p=>{
+    if(!Array.isArray(p)) return null;
+    const pt = [p[0], p[1]];
+    if(!validPt(pt)) return null;
+    return {pt, t: trackTimeOk(p[2]) ? p[2] : null};
+  }).filter(Boolean);
+}
+/* いま足している区切り。読み込み直したあとは、同じ日で最後の点から15分以内のものを続ける */
+function walkCurrent(svUuid, sec){
+  const id = WALK_CUR[svUuid];
+  let r = id ? WALK[id] : null;
+  if(!r){
+    const segs = walkSegsOf(svUuid);
+    r = segs.length ? segs[segs.length-1] : null;
+  }
+  if(!r || walkBreakOn(svUuid)) return null;
+  const last = r.pts[r.pts.length-1];
+  if(r.day !== dateValue()) return null;
+  const 差 = sec - (last ? (last[2]||0) : 0);
+  if(!last || !(差 >= 0 && 差 < WALK_GAP_SEC)) return null;   // 15分以上空いた・時計が戻った
+  if(r.pts.length >= WALK_MAX_PTS) return null;
+  return r;
+}
+/* GPS の1回ぶん。保存の間隔・3m の決まりは箇所の道すじとは別に持つ。保存に成功してから進める */
+function walkTick(sv, pt, ms){
+  if(!WALK_LOADED){ if(!WALK_LOADING) walkLoad().catch(()=>{}); return; }   // 読めていなければ読み直しを試す
+  if(WALK_BUSY) return;
+  if(Date.now() - WALK_SAVED_AT < TRACK_SAVE_MS) return;
+  const sec = Math.round(ms/1000);
+  const cur = walkCurrent(sv.uuid, sec);
+  const last = cur ? cur.pts[cur.pts.length-1] : null;
+  if(last && distMeters([last[0], last[1]], pt) < TRACK_MIN_MOVE) return;
+  const rec = cur ? Object.assign({}, cur, {pts: cur.pts.concat([[pt[0], pt[1], sec]])})
+                  : {id: uuid(), sv: sv.uuid, day: dateValue(), pts: [[pt[0], pt[1], sec]]};
+  const tok = walkBreakToken(sv.uuid);   // この保存を始めたときの区切りの印
+  WALK_BUSY = true;
+  WalkDB.put(rec).then(()=>{
+    WALK[rec.id] = rec; WALK_CUR[sv.uuid] = rec.id;
+    if(!cur && tok) walkBreakClear(sv.uuid, tok);   // 新しい線を書けてから、そのときの区切りの印を消す
+    WALK_SAVED_AT = Date.now();
+    try{ allMaps().forEach(m=>{ if(m._trackSv === sv.uuid) trackLayerApply(m, sv.uuid); }); }catch(e){}
+  }).catch(e=>{
+    console.error(e);
+    if(!WALK_WARNED){ WALK_WARNED = true; toast('歩いた道すじを保存できませんでした（端末の空き容量をご確認ください）', 8000); }
+  }).finally(()=>{ WALK_BUSY = false; });
+}
+/* 「はじめる」の案内。出すときは HTML、出さないときは '' */
+function trackStartHintHtml(sv){
+  if(!sv || !sv.uuid || isDetail(sv)) return '';
+  if(surveyDays(sv).indexOf(dateValue()) < 0) return '';   // 期間の外（後から書き起こすとき）は出さない
+  if(sv.status === '調査中') return '';
+  if(sv.status === '終了') return '<div class="dim small" style="margin:-2px 0 6px">この調査は終了済みです（道すじは記録しません）</div>';
+  if(!writeAllowed()) return '';
+  const 他 = DB.surveys().filter(x=>x.uuid!==sv.uuid && x.status==='調査中' && isLiveNow(x) && !isDetail(x));
+  if(他.length){
+    return `<div class="warnbox small" style="margin-bottom:8px">この調査は「はじめる」を押していないので、道すじを記録していません。
+      いまは <b>${esc(他.map(x=>`${x.river_name||''} ${x.site_name||''}`.trim()||'別の調査').join('・'))}</b> が調査中です。先にそちらを終えてください</div>`;
+  }
+  if(WALK_FAIL){
+    return `<div class="warnbox small" style="margin-bottom:8px">この調査は「はじめる」を押していません。
+      なお、この端末では歩いた道すじを保存できません（道すじの置き場を開けませんでした）。
+      <button class="btn sm ok" style="margin-top:6px" onclick="trackStartFromMap('${esc(sv.uuid)}')">はじめる</button></div>`;
+  }
+  return `<div class="warnbox small" style="margin-bottom:8px">この調査は「はじめる」を押していないので、歩いた道すじを記録していません。
+    <button class="btn sm ok" style="margin-top:6px" onclick="trackStartFromMap('${esc(sv.uuid)}')">はじめる（道すじの記録も始まります）</button></div>`;
+}
+function trackStartFromMap(u){
+  const sv = DB.getAlive(DB.key.sv, u); if(!sv) return;
+  if(trackStartHintHtml(sv).indexOf('trackStartFromMap') < 0){ render(); return; }   // 条件が変わっていたら描き直すだけ
+  startSurvey(u);
+}
+/* ============================================================
    歩いた道すじを地図に出す（v139）。
    記録は箇所の track（[緯度,経度] の並び）と、同じ並びの track_t（各点の時刻・エポック秒）。
    track_t の無い古い道すじは、時刻の代わりに歩いた順で色を付ける（時刻としては表示しない）。
@@ -4856,16 +5062,31 @@ function trackSelToggle(svUuid, stUuid){
 function trackTargets(svUuid){
   if(!svUuid) return [];
   const sts = DB.stationsOf(svUuid).filter(st=>!st.is_spot);
-  let pick = sts;
+  const segs = walkSegsOf(svUuid);
+  const 線 = r=>({st:{uuid:r.id, name:walkSegName(r, segs)}, pairs:walkPairs(r), walk:true});
+  const 箇所 = st=>({st, pairs:trackPairs(st)});
+  let out = [];
   const sc = trackScope();
   if(sc === '記録中の箇所'){
+    // 箇所が決まればその箇所の線、決まらなければいま足している調査ぜんたいの線だけ（前の日の分は出さない）
     const t = trackTarget();
-    pick = (t && t.sv.uuid === svUuid) ? sts.filter(st=>st.uuid===t.st.uuid) : [];
+    if(t && t.sv.uuid === svUuid) out = sts.filter(st=>st.uuid===t.st.uuid).map(箇所);
+    else{
+      const sv0 = trackSurvey();
+      // いつも walkCurrent で決める（区切りの印が立っていれば、新しい線ができるまで何も出さない）
+      const cur = sv0 && sv0.uuid === svUuid ? walkCurrent(svUuid, Math.round(Date.now()/1000)) : null;
+      out = (cur && cur.day === dateValue()) ? [線(cur)] : [];
+    }
   }else if(sc === '選ぶ'){
     const sel = new Set(trackSel(svUuid));
-    pick = sts.filter(st=>sel.has(st.uuid));
+    out = segs.filter(r=>sel.has(r.id)).map(線).concat(sts.filter(st=>sel.has(st.uuid)).map(箇所));
+  }else{
+    // この調査すべて: 調査ぜんたいの線だけ（箇所の線は同じ道を重ねるだけなので出さない）。
+    // 調査ぜんたいの線が無い前の調査は、これまでどおり箇所の線
+    const 全体 = segs.map(線).filter(x=>x.pairs.length >= 2);
+    out = 全体.length ? 全体 : sts.map(箇所);
   }
-  return pick.map(st=>({st, pairs:trackPairs(st)})).filter(x=>x.pairs.length >= 2);
+  return out.filter(x=>x.pairs.length >= 2);
 }
 /* 時刻の色分けの帯の番号（0〜7）を各点に付ける。
    時刻がそろった道すじは「出す道すじ全体の最初〜最後の時刻」で、そろっていない道すじは歩いた順で */
@@ -4916,7 +5137,9 @@ function trackLegendText(targets){
     if(x.pairs.some(p=>p.t===null)) untimed++;
     x.pairs.forEach(p=>{ if(p.t!==null){ tmin=Math.min(tmin,p.t); tmax=Math.max(tmax,p.t); } });
   });
-  const hm = s=>{ try{ return fmtTime(new Date(s*1000).toISOString()); }catch(e){ return '—'; } };
+  const 日違い = isFinite(tmin) && new Date(tmin*1000).toDateString() !== new Date(tmax*1000).toDateString();
+  const hm = s=>{ try{ const d = new Date(s*1000);
+    return (日違い ? `${d.getMonth()+1}/${d.getDate()} ` : '') + fmtTime(d.toISOString()); }catch(e){ return '—'; } };
   const span = !isFinite(tmin) ? '時刻の記録なし'
              : tmax > tmin ? `${hm(tmin)} → ${hm(tmax)}` : hm(tmin);
   return `道すじ ${targets.length}本　青 ${span} 赤`
@@ -4977,11 +5200,13 @@ function trackSetHtml(svUuid){
   let sel = '';
   if(trackScope()==='選ぶ' && svUuid){
     const chosen = new Set(trackSel(svUuid));
-    const sts = DB.stationsOf(svUuid).filter(st=>!st.is_spot && trackPairs(st).length >= 2);
+    const segs = walkSegsOf(svUuid).filter(r=>walkPairs(r).length >= 2);
+    const sts = segs.map(r=>({uuid:r.id, name:walkSegName(r, segs), _pairs:walkPairs(r)}))
+      .concat(DB.stationsOf(svUuid).filter(st=>!st.is_spot && trackPairs(st).length >= 2));
     sel = sts.length ? sts.map(st=>`<label style="display:flex;gap:8px;align-items:center;margin:4px 0">
         <input type="checkbox" style="width:20px;height:20px;margin:0" ${chosen.has(st.uuid)?'checked':''}
           data-track-st="${esc(st.uuid)}"> ${esc(st.name||'（名前なし）')}
-        <span class="dim small">${esc(fmtDist(pathLength(trackPairs(st).map(p=>p.pt))))}</span></label>`).join('')
+        <span class="dim small">${esc(fmtDist(pathLength((st._pairs || trackPairs(st)).map(p=>p.pt))))}</span></label>`).join('')
       : '<div class="dim small">道すじのある箇所がまだありません</div>';
   }
   return `<div class="card" style="padding:10px">
@@ -5010,7 +5235,8 @@ function trackButtonsHtml(svUuid){
 function baseMapButtonsHtml(svUuid){
   TRACK_SV = svUuid || '';   // この画面の地図に描く道すじの調査（applyBaseMap が使う）
   const cur = baseMapName();
-  return `<div class="seg basemap" style="margin-bottom:8px">` + Object.keys(BASEMAPS).map(n=>
+  return (svUuid ? trackStartHintHtml(DB.getAlive(DB.key.sv, svUuid)) : '')
+    + `<div class="seg basemap" style="margin-bottom:8px">` + Object.keys(BASEMAPS).map(n=>
     `<button type="button" class="${n===cur?'on':''}" onclick="switchBaseMap(this,'${esc(n)}')">${esc(n)}</button>`
   ).join('')
   // ドローン写真があるときだけ、出す／消すのボタンを同じ列に足す
@@ -7910,7 +8136,17 @@ SCREENS.surveyHub = (svUuid)=>{
   };
 };
 function startSurvey(u){
+  // 閲覧のみのタブでは何も書かない（区切りの印も。書くと、記録しているタブの線が切れる。監査118回目 Major）
+  if(!writeAllowed()){ toast('このタブでははじめられません。記録を入れているタブでお試しください', 7000); return; }
   const sv = DB.get(DB.key.sv, u); if(!sv) return;
+  if(sv.status === '調査中'){ render(); return; }   // もう始まっている（ほかの画面・タブで押した）
+  // 道すじの区切りの印を先に端末へ書く。書けないまま始めると、読み込み直したときに前の線と
+  // 直線でつながる（監査117回目 Major）。書けなければ始めない。道すじを取らない調査（詳細・期間外）では印は要らない
+  const 取る = !isDetail(sv) && surveyDays(sv).indexOf(dateValue()) >= 0;
+  if(取る){
+    let 印 = false; try{ 印 = walkBreakSet(u); }catch(e){ 印 = false; }
+    if(!印){ toast('端末に書き込めないので、はじめられませんでした（端末の空き容量をご確認ください）', 9000); return; }
+  }
   sv.status='調査中'; sv.started_at = sv.started_at || nowISO();
   if(DB.upsert(DB.key.sv, sv)){ startGps(); render(); }
 }
@@ -9717,6 +9953,26 @@ function fishDrawAll(svUuid){
   const map = MAPS.main.map; if(!map) return;
   try{ FISHLAYER.forEach(x=>map.removeLayer(x)); }catch(e){}
   FISHLAYER = [];
+  // 物理環境の囲い（v142）。基図・空撮の上、道すじ（350）・魚の囲い（400）の下の専用の層に、点線と名前だけ。
+  // 触っても反応しない（地図のタップで魚の点・角を置くのを邪魔しない）。選ぶ・全部入るように・親子には入れない
+  try{
+    let pane = map.getPane('envbg');
+    if(!pane){
+      const tiles = map.getPane('tilePane');
+      pane = map.createPane('envbg', tiles && tiles.parentNode ? tiles.parentNode : undefined);
+      pane.style.zIndex = '300'; pane.style.pointerEvents = 'none';
+    }
+    mapStations(svUuid, 'env').filter(st=>isEnvPoly(st) && recordReady(st)).forEach(st=>{
+      const pts = polyPts(st);
+      if(pts.length < 3) return;
+      FISHLAYER.push(L.polygon(pts, {pane:'envbg', color:'#e0e0e0', weight:2, opacity:.8, dashArray:'4 4',
+        fillColor:'#e0e0e0', fillOpacity:.06, interactive:false}).addTo(map));
+      const c = pts.slice().sort((a,b)=>b[0]-a[0])[0];
+      FISHLAYER.push(L.marker(c, {pane:'envbg', interactive:false, keyboard:false,
+        icon:L.divIcon({className:'', iconSize:[60,18], iconAnchor:[30,9],
+          html:`<div class="envbg-name">${esc(st.name||'')}</div>`})}).addTo(map));
+    });
+  }catch(e){ console.error(e); }
   const list = mapStations(svUuid, 'fish');
   list.forEach(st=>{
     const k = unitKindOf(st);
@@ -11786,6 +12042,21 @@ function buildGeoJSON(sv, opt){
   opt = opt || {};
   const 写真 = geoPhotoTable(opt.items || photoItemsOf(sv), opt.paths);
   const 点 = [], 線 = [], 面 = [];
+  // 調査ぜんたいの道すじ（v142・この端末に残っている分）。1本＝1区切り
+  try{
+    const segs = walkSegsOf(sv.uuid);
+    segs.forEach(r=>{
+      const ps = walkPairs(r);
+      if(ps.length < 2) return;
+      const ts = ps.map(p=>p.t).filter(t=>t!==null);
+      const hm = t=>{ try{ return fmtTime(new Date(t*1000).toISOString()); }catch(e){ return ''; } };
+      線.push(geoFeature({type:'LineString', coordinates: ps.map(p=>geoLL(p.pt))}, {
+        '種別':'歩いた道すじ（調査ぜんたい）', '名前': walkSegName(r, segs), '調査日': r.day || '',
+        '河川名': sv.river_name||'', '開始': ts.length ? hm(ts[0]) : '', '終了': ts.length ? hm(ts[ts.length-1]) : '',
+        '点の数': ps.length, '長さm': Math.round(pathLength(ps.map(p=>p.pt))*10)/10,
+        '調査ID': sv.uuid, '記録ID': r.id }));
+    });
+  }catch(e){ console.error(e); }
   const sts = DB.stationsOf(sv.uuid).filter(recordReady);
   for(const st of sts){
     const k = unitKindOf(st);
@@ -16994,6 +17265,7 @@ function boot(){
   setInterval(()=>{ try{ PhotoDB.gc(); }catch(e){} }, 30*60*1000);
   // ドローン写真を読んで、地図に重ねられるようにする（別のタブの変更も受ける）
   try{ orthoChannel(); orthoPreload().catch(e=>console.error(e)); }catch(e){}
+  try{ walkLoad().catch(e=>console.error(e)); }catch(e){}   // 調査ぜんたいの道すじ（端末の中だけ）
   try{ document.addEventListener('click', orthoOnClick); }catch(e){}
   try{ document.addEventListener('click', trackOnClick); }catch(e){}     // 道すじの設定の箱の押下   // 一覧の押下（選ぶ・消す）を1か所で受ける
 }
