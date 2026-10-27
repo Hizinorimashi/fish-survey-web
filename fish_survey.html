@@ -150,7 +150,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v140';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v141';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2938,14 +2938,24 @@ function polyText(st){
 }
 /* 名前は種類ごとの通し番号（E1・P/F1・P1） */
 function unitAutoName(svUuid, kind, all){
-  const list = (all || DB.stationsOf(svUuid)).filter(x=>unitKindOf(x)===kind);
   const mark = UNIT_MARK[kind] || '';
   let n = 0;
-  list.forEach(x=>{
-    const m = String(x.name||'').match(new RegExp('^' + mark.replace('/','\\/') + '(\\d+)$'));
+  unitNamesOfKind(all || DB.stationsOf(svUuid), kind).forEach(nm=>{
+    const m = String(nm||'').match(new RegExp('^' + mark.replace('/','\\/') + '(\\d+)$'));
     if(m) n = Math.max(n, +m[1]);
   });
   return mark + (n + 1);
+}
+/* その種類の名前として使われている（予約されている）名前。魚の単位の名前に加えて、
+   物理環境の囲いにした元の名前（from_unit）も入れる。合成で元に戻したときに同じ名前が2つにならないように */
+function unitNamesOfKind(list, kind){
+  const out = [];
+  (list||[]).forEach(x=>{
+    if(!x) return;
+    if(unitKindOf(x) === kind) out.push(x.name);
+    else if(x.from_unit && x.from_unit.unit_kind === kind && isEnvPoly(x)) out.push(x.from_unit.name);
+  });
+  return out;
 }
 /* その単位の中に入っているもの（孫も）。輪になっていても止まる */
 function unitDescendants(u, list){
@@ -9243,7 +9253,7 @@ function polyEditButtonsHtml(cur){
   return `<div class="btn2" style="margin:6px 0">
     <button class="btn sm" onclick="polyEditStart('${cur.uuid}')">形を直す</button>
     ${to ? `<button class="btn sm" onclick="unitKindChange('${cur.uuid}')">${esc(UNIT_WORD[to])}にする</button>` : ''}
-  </div>`;
+  </div>${to ? `<button class="btn sm" style="margin-bottom:6px" onclick="unitToEnvPoly('${cur.uuid}')">物理環境の囲いにする（魚の記録が無いとき）</button>` : ''}`;
 }
 /* 魚の単位の親を、記録に書かずに計算する（unitRelink と同じ決まり） */
 function unitParentMap(list){
@@ -9320,14 +9330,129 @@ function polyEditCommit(){
   return true;
 }
 /* 魚の地図の種類を変える（調査範囲 ⇔ 瀬淵）。自動の名前（E数字・P/F数字）なら新しい種類の次の番号にする */
+/* 魚の地図の囲い（E・P/F）を、物理環境の囲い（A）に変える（v141・2026-10-27 の実機の声）。
+   魚の入っていない瀬淵を描いたせいで、外側の囲い（魚あり）を調査範囲にできないときのため。
+   魚の親子から外れ、物理環境の地図に A○ として出る。形・環境の値・写真・メモ・時刻・地点はそのまま。
+   魚・漁具・通電など数に響く記録が入っていたら変えない（魚の集計から消えてしまうため） */
+function unitToEnvPoly(u){
+  if(!writeAllowed()){ toast('このタブでは直せません。記録を入れているタブでお試しください', 7000); return false; }
+  if(POLY_EDIT){ toast('形を直している途中です。先に「直し終える」か「やめる」を押してください', 7000); return false; }
+  const st0 = DB.liveStation(u);
+  const k0 = unitKindOf(st0);
+  if(!(k0 === 'E' || k0 === 'PF')){ toast('物理環境の囲いにできるのは、調査範囲と瀬淵の囲いだけです', 7000); return false; }
+  if(polyDrawing(st0)){ toast('描いている途中の囲いは、閉じてから変えてください', 7000); return false; }
+  if(fishDrawing()){ toast('描いている囲いがあります。先に閉じるか、やめてください', 7000); return false; }
+  if($('#gearBox') && FISH_SEL && !saveEffort(FISH_SEL, {quiet:true})) return false;
+  // 「川の環境」の打ちかけも先に書く。書けないまま変えると、その入力が行き場をなくす（監査113回目 Major）
+  if(ENV_FORM === u && ENV_DIRTY && envFlush() === false){
+    toast('川の環境の打ちかけを保存できないので、変えませんでした。おかしい値を直してください', 9000);
+    return false;
+  }
+  let all; try{ all = DB.loadRaw(DB.key.st); }catch(e){ toast('記録を読めないので、変えませんでした', 8000); return false; }
+  const st = all.find(x=>x && x.uuid===u && !x.deleted_at);
+  if(!st || unitKindOf(st) !== k0){ toast('その記録はもう変わっています。開き直してください', 8000); return false; }
+  // ごみ箱の分も含めて、この囲いを指す魚の記録があれば変えない。戻したときに魚が見えない所へぶら下がる（監査113回目 Major）
+  let cas; try{ cas = DB.loadRaw(DB.key.ca); }catch(e){ toast('魚の記録を読めないので、変えませんでした', 8000); return false; }
+  if(cas.some(c=>c && c.station_uuid===u)){
+    alert(`${st.name} には魚の記録があります（ごみ箱の分も含む）。物理環境の囲いにはできません。`
+      + '\n\nごみ箱の魚も要らないなら、ごみ箱から完全に消してから変えてください');
+    return false;
+  }
+  // 歩いた道すじ・始点終点・手入力の距離や面積がある囲いも変えない（魚の集計の距離・面積から外れるため。監査113回目 Major）
+  const 長さ = stationLengths(st).used, 面積 = stationAreas(st).used;
+  if(trackPairs(st).length >= 2 || 長さ !== '' || 面積 !== ''){
+    alert(`${st.name} には距離や面積（歩いた道すじを含む）が入っているので、物理環境の囲いにはできません。`
+      + '\n\n変えると、魚の集計の距離・面積から外れてしまいます');
+    return false;
+  }
+  const 何 = unitHasOwn(st);
+  if(何){
+    alert(`${st.name} には${何}が入っているので、物理環境の囲いにはできません。`
+      + '\n\n変えると、その数が魚の集計から消えてしまいます。魚の地図の囲いのまま使ってください');
+    return false;
+  }
+  // 魚の親子から外れると、中にあったものの親が変わる。新しく数が合わなくなる親子ができるなら止める
+  const units = all.filter(x=>x && !x.deleted_at && x.survey_uuid===st.survey_uuid && unitKindOf(x));
+  const after = units.filter(x=>x.uuid!==u);
+  const 前 = unitParentMap(units), 後 = unitParentMap(after);
+  const 名 = id=>((units.find(x=>x.uuid===id) || {}).name || '');
+  const 問題 = [];
+  after.forEach(x=>{
+    const p = 後[x.uuid];
+    if(!p || p === 前[x.uuid]) return;
+    const 親 = after.find(y=>y.uuid===p);
+    const w = unitHasOwn(親);
+    if(w) 問題.push(`${名(p)} に${w}が入っています（${名(x.uuid)} が中に入るため）`);
+  });
+  if(問題.length){
+    alert('物理環境の囲いにすると、数が合わなくなるので変えませんでした。\n\n' + 問題.join('\n')
+      + '\n\n先にその記録を中の単位へ移すか消してください');
+    return false;
+  }
+  const 自動 = new RegExp('^' + UNIT_MARK[k0].replace('/','\\/') + '\\d+$').test(String(st.name||''));
+  const 新名 = 自動 ? envAutoName(st.survey_uuid, 'A') : (st.name || '');
+  const 中 = units.filter(x=>x.parent_uuid===u).length;
+  if(!confirm(`${st.name} を「物理環境の囲い」にしますか？\n\n`
+    + `・魚の地図からは消え、物理環境の地図に「${新名}」として出ます\n`
+    + '・形・環境の値・写真・メモ・時刻はそのまま残ります'
+    + (中 ? `\n・中にある ${中}件は、${st.name} の外に出ます（ほかの囲いの中なら、そちらに入ります）` : ''))) return false;
+  // 聞いている間に、ほかで書き換えられていないか
+  let now; try{ now = DB.loadRaw(DB.key.st); }catch(e){ toast('記録を読めないので、変えませんでした', 8000); return false; }
+  if(JSON.stringify(now.filter(x=>x && x.survey_uuid===st.survey_uuid)) !== JSON.stringify(all.filter(x=>x && x.survey_uuid===st.survey_uuid))){
+    toast('聞いている間に記録が書き換えられたので、変えませんでした。もう一度お試しください', 9000);
+    return false;
+  }
+  const t = nowISO();
+  const before = st.name || '';
+  // 変える前の姿を控える。別の端末から魚が合成されてきたら、元の魚の囲いへ戻すのに使う
+  st.from_unit = {unit_kind:k0, name:before,
+                  record_kind: st.record_kind === undefined ? null : st.record_kind,
+                  env_method: st.env_method === undefined ? null : st.env_method};
+  delete st.unit_kind; delete st.parent_uuid;
+  st.record_kind = 'env'; st.env_method = '囲い'; st.name = 新名; st.updated_at = t;
+  // 残った魚の単位の親を、1回の保存の中で付け直す
+  after.forEach(x=>{
+    const p = 後[x.uuid] || '';
+    if((x.parent_uuid||'') !== p){ x.parent_uuid = p; x.updated_at = t; }
+  });
+  if(!DB.save(DB.key.st, all)){ toast('保存できませんでした（端末の空き容量をご確認ください）', 9000); return false; }
+  if(FISH_SEL === u) FISH_SEL = null;
+  if(ENV_FORM === u){ ENV_FORM = ''; ENV_DIRTY = false; }   // 変えた記録へ、魚の地図の入力欄から書き戻さない
+  toast(`${before} を物理環境の囲い「${新名}」にしました。物理環境の地図で見られます`, 8000);
+  render();
+  return true;
+}
+/* 合成の結果で、物理環境の囲い（魚の地図の囲いから変えたもの）を、生きた魚の記録が指していたら、
+   その囲いを元の魚の囲いへ戻す（v141 監査113回目 Major）。魚を見えない所に置かない。戻した名前の並びを返す */
+function envPolyRevertForCatches(box){
+  const sts = (box && box.st) || [], cas = (box && box.ca) || [];
+  const 指す = new Set(cas.filter(c=>c && !c.deleted_at && c.station_uuid).map(c=>c.station_uuid));
+  const t = nowISO(), out = [];
+  sts.forEach(st=>{
+    if(!st || st.deleted_at || !指す.has(st.uuid) || !isEnvPoly(st) || !st.from_unit) return;
+    const f = st.from_unit;
+    if(!(f.unit_kind === 'E' || f.unit_kind === 'PF')) return;
+    let 名 = f.name || '';
+    // 同じ調査に、同じ種類・同じ名前の別の記録（ごみ箱も）があれば、重ならない次の番号にする
+    const 重なる = 名 && sts.some(y=>y && y.uuid!==st.uuid && y.survey_uuid===st.survey_uuid
+      && unitKindOf(y)===f.unit_kind && y.name===名);
+    if(重なる) 名 = unitNextName(sts, st.survey_uuid, f.unit_kind, st.uuid);
+    out.push(`${st.name}→${名}`);
+    st.unit_kind = f.unit_kind;
+    if(名) st.name = 名;
+    if(f.record_kind === null) delete st.record_kind; else st.record_kind = f.record_kind;
+    if(f.env_method === null) delete st.env_method; else st.env_method = f.env_method;
+    delete st.from_unit; st.parent_uuid = ''; st.updated_at = t;
+  });
+  return out;
+}
 function unitNextName(all, svUuid, kind, selfUuid){
   const mark = UNIT_MARK[kind] || '';
   const rx = new RegExp('^' + mark.replace('/','\\/') + '(\\d+)$');
   let n = 0;
-  // ごみ箱の分も数える（戻したときに同じ名前が2つにならないように）
-  all.forEach(x=>{
-    if(!x || x.uuid===selfUuid || x.survey_uuid!==svUuid || unitKindOf(x)!==kind) return;
-    const m = String(x.name||'').match(rx);
+  // ごみ箱の分も、物理環境の囲いにした元の名前も数える（戻したときに同じ名前が2つにならないように）
+  unitNamesOfKind(all.filter(x=>x && x.uuid!==selfUuid && x.survey_uuid===svUuid), kind).forEach(nm=>{
+    const m = String(nm||'').match(rx);
     if(m) n = Math.max(n, +m[1]);
   });
   return mark + (n + 1);
@@ -10054,6 +10179,13 @@ function trashRestore(k, uuid){
   const t = trashKindOf(k); if(!t) return false;
   const x = DB.get(t.key(), uuid);
   if(!x){ toast('その記録はもうありません'); return false; }
+  if(t.key() === DB.key.ca){
+    const 先 = DB.get(DB.key.st, x.station_uuid);
+    if(先 && isEnvPoly(先)){
+      toast(`この魚の記録の囲い（${先.name||''}）は物理環境の囲いになっているので、戻せません`, 9000);
+      return false;
+    }
+  }
   const 一緒に = [];
   // 親だけでなく、その上の親までさかのぼる（監査42回目 Minor）
   trashAncestors(k, x).forEach(pa=>{
@@ -11438,6 +11570,8 @@ async function cloudMerge(){
   }catch(e){}
   const m2 = mergeBackup(全部.合わせ.data, 全部.合わせ.tombstones);
   m.box = m2.box; m.tombs = m2.tombs; m.控え = m2.控え; m.外した = m2.外した;
+  // 物理環境の囲いにした囲いへ、別の端末の魚が合わさってきたら、元の魚の囲いへ戻す
+  const 戻した囲い = envPolyRevertForCatches(m.box);
   // 除く分の中身を、先に端末へ控える（黙って失わない。監査71回目 Critical）。
   // 控えられないときは、合成をやめる
   // 控えは「種類＋中身」の形でそろえる。形が違うと、点検の行数に出ず、
@@ -11497,7 +11631,9 @@ async function cloudMerge(){
     reset('home');
     return;
   }
-  toast('合成しました。ドライブへも送り返します…', 6000);
+  toast((戻した囲い.length
+    ? `別の端末の魚の記録が入っていたので、物理環境の囲いにした ${戻した囲い.join('・')} を魚の地図の囲いに戻しました。` : '')
+    + '合成しました。ドライブへも送り返します…', 戻した囲い.length ? 12000 : 6000);
   let 送り = 'error';
   try{ 送り = await cloudSave({auto:true, nested:true}); }catch(e){}
   // 手元に実体の無い写真を、ドライブから取り寄せる
@@ -11544,11 +11680,14 @@ async function cloudRestore(){
       return;
     }
     const 中 = normalizeDataset(全部.合わせ);
+    // 何台かの端末の控えを読み合わせたもの。物理環境の囲いにした囲いを、別の端末の魚が指していれば元に戻す
+    const 戻した囲い = envPolyRevertForCatches(中.data);
     const いま = CLOUD_KEYS.reduce((a,k)=>a + DB.load(DB.key[k]).length, 0);
     const 控え = CLOUD_KEYS.reduce((a,k)=>a + (中.data[k]||[]).length, 0);
     if(!confirm(`ドライブの控え（${全部.読めた}ファイルを読み合わせ／${控え}件）で、`
       + `いまの記録（${いま}件）を置き換えます。\n`
       + (中.控え.length ? `消した印などで除く分 ${中.控え.length}件は端末に控えます。\n` : '')
+      + (戻した囲い.length ? `別の端末の魚の記録があるので、物理環境の囲いにした ${戻した囲い.join('・')} を魚の地図の囲いに戻します。\n` : '')
       + 'いまの記録は消えます。よろしいですか？')) return;
     if(中.控え.length && !repairBackupPush({種類:'戻すときに除いた行', 中身:中.控え})){
       toast('除く分の控えを取れなかったため、やめました。'
