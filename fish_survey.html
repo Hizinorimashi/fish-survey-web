@@ -153,7 +153,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v144';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v145';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -13399,6 +13399,22 @@ SCREENS.fishMap = (arg)=>{
         style="height:${envMapBig()?'80vh':'46vh'};min-height:260px"></div>
       <div class="dim small" id="fishHint"></div>
       <div class="dim small" id="fishGps"></div>
+
+      <!-- 地図で記録する調査は「調査」の画面がこの地図を出すので、調査の画面の「終える」に行けない。
+           物理環境の地図と同じく、ここで始める・終える（2026-10-28 の実機の声「終了ボタンが無くてログを止められない」） -->
+      <div class="card">
+        <div class="row">
+          <div class="grow"><div class="dim small">いま現場にいるとき</div>
+            <div>${sv.status==='調査中' ? (isDetail(sv) ? '記録中です' : '記録中です（歩いた道すじも記録しています）')
+                 : sv.status==='終了' ? '終えました'
+                 : (isDetail(sv) ? '「はじめる」で時刻が入ります' : '「はじめる」で時刻と道すじの記録が始まります')}</div></div>
+          ${sv.status==='調査中'
+            ? `<button class="btn" style="width:auto;margin:0" onclick="endSurvey('${svUuid}')">終える</button>`
+            : sv.status==='終了'
+            ? `<button class="btn" style="width:auto;margin:0" onclick="reopenSurvey('${svUuid}')">再開する</button>`
+            : `<button class="btn ok" style="width:auto;margin:0" onclick="startSurvey('${svUuid}')">はじめる</button>`}
+        </div>
+      </div>
 
       <button class="btn" onclick="if(fishUseMap('${svUuid}', false)) goTo('survey','${svUuid}')"
         >一覧で見る（箇所の並び）</button>
