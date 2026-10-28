@@ -153,7 +153,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v151';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v152';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2548,7 +2548,8 @@ function envAddAt(svUuid, lat, lon, acc, targetUuid){
 
   const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return null;
   if(envViewOnly()){ toast(VIEW_ONLY_MSG, 6000); return null; }   // 見るだけ（v146）
-  envFlush();            // いま打っている分を、置く前に書いてしまう
+  // いま打っている分を、置く前に書いてしまう。書けなければ置かない（v152）
+  if(!envFlushDirty()){ toast(ENV_FLUSH_NG, 9000); return null; }
   if(!writeAllowed()){
     toast('このタブでは追加できません。記録を入れているタブでお試しください', 6000);
     return null;
@@ -2715,7 +2716,8 @@ function meshCreate(svUuid){
     return null;
   }
   const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return null;
-  envFlush();            // いま打っている分を、作る前に書いてしまう
+  // いま打っている分を、作る前に書いてしまう。書けなければ作らない（監査144回目 Major 1。v152）
+  if(!envFlushDirty()){ toast(ENV_FLUSH_NG, 9000); return null; }
   if(!writeAllowed()){
     toast('このタブでは作れません。記録を入れているタブでお試しください', 6000);
     return null;
@@ -3001,7 +3003,8 @@ function unitDescendants(u, list){
    記録は小さい単位にだけ入るので、足し合わせても二重にならない */
 function unitTotals(u, list, snap){
   const 自分 = (list||[]).find(x=>x && x.uuid===u) || DB.liveStation(u);
-  const みんな = (自分 ? [自分] : []).concat(unitDescendants(u, list));
+  // 描きかけの囲いは数えない（書き出し・全体の集計と同じ。計画点検 2026-10-28 Major 2）
+  const みんな = (自分 ? [自分] : []).concat(unitDescendants(u, list)).filter(recordReady);
   const 種 = new Set();
   let 尾 = 0;
   みんな.forEach(st=>{
@@ -3597,7 +3600,13 @@ function screenKey(cur){
 }
 function render(){
   // 物理環境の画面で打ちかけの分があれば、先に書いてしまう
-  try{ if(typeof envFlush==='function') envFlush(); }catch(e){}
+  // 書けなかったときは止めない（画面の道すじはもう変わっている）が、どの記録かを添えて知らせる。下書きには残っている（v152）
+  try{
+    if(typeof envFlushDirty==='function' && ENV_FORM && ENV_DIRTY){
+      const 名 = (DB.liveStation(ENV_FORM)||{}).name || '';
+      if(!envFlushDirty()) setTimeout(()=>{ try{ toast(`${名} の川の環境の入力は保存できていません（下書きには残っています）。${名} を開いて直してください`, 10000); }catch(e){} }, 0);
+    }
+  }catch(e){}
   // 「新しい調査」の▼地点情報も同じ。画面を作り直す前に、打った分を書く
   try{ if(typeof spotInfoSave==='function') spotInfoSave(); }catch(e){}
   // 同じ画面を作り直すときのために、見ていた位置を控える。
@@ -4906,7 +4915,21 @@ function walkBreakClear(svUuid, tok){
   try{ const a = walkBreakAll(); if(a[svUuid] !== undefined){ delete a[svUuid]; localStorage.setItem('fs_walk_break', JSON.stringify(a)); } }catch(e){}
 }
 /* 起動時に読み込む。読めなければ、記録できないことを一度知らせ、あとの GPS で読み直しを試す */
-async function walkLoad(){
+/* 読み込みの進行中の約束。書き出しは、起動時に始まった読み込みも待てる（計画点検 2026-10-28 Major 4。v152） */
+let WALK_LOAD_PROMISE = null;
+function walkLoad(){
+  if(WALK_LOAD_PROMISE) return WALK_LOAD_PROMISE;
+  WALK_LOAD_PROMISE = walkLoadInner().finally(()=>{ WALK_LOAD_PROMISE = null; });
+  return WALK_LOAD_PROMISE;
+}
+/* 読めている状態にしてから true。読めなければ false（道すじの有無が分からないので、書き出しは中止する） */
+async function walkEnsureLoaded(){
+  if(WALK_LOADED) return true;
+  try{ await walkLoad(); }catch(e){}
+  return !!WALK_LOADED;
+}
+const WALK_EXPORT_NG = '歩いた道すじを読めないため、書き出しを中止しました（道すじの置き場を開けませんでした）。アプリを開き直してからお試しください';
+async function walkLoadInner(){
   if(WALK_LOADING) return false;
   WALK_LOADING = true;
   let all = [];
@@ -4920,6 +4943,8 @@ async function walkLoad(){
   const m = {};
   all.forEach(r=>{ if(r && typeof r.id === 'string' && r.id && Array.isArray(r.pts)) m[r.id] = r; });
   WALK = m; WALK_LOADED = true; WALK_FAIL = false; WALK_LOADING = false;
+  // 書き出しの画面を開いたまま読めるようになったら、「読み込めませんでした」の警告を消して数を出し直す（監査145回目 Minor）
+  try{ const c = STACK[STACK.length-1]; if(c && c.name === 'exportHub') setTimeout(()=>{ try{ const c2 = STACK[STACK.length-1]; if(c2 && c2.name === 'exportHub') render(); }catch(e){} }, 0); }catch(e){}
   // 読み込み直したあとも、続けて足していた線（今日・15分以内・区切りの印なし）を「いまの線」に戻す
   const now = Math.round(Date.now()/1000);
   new Set(Object.values(WALK).map(r=>r.sv)).forEach(u=>{ const r = walkCurrent(u, now); if(r) WALK_CUR[u] = r.id; });
@@ -7555,8 +7580,13 @@ function spotRemove(uu){
   if(!DB.softDelete(DB.key.st, uu)) return;
   // 代表の位置は、そのつど決め直す（監査66回目 Major）
   if(!spotPosFix(st.survey_uuid)){
-    DB.restore(DB.key.st, uu);      // 半端な形を残さない
-    toast('調査の位置を直せなかったので、削除をやめました', 8000);
+    // 半端な形を残さない。戻せなければ、ごみ箱に残っていることと直し方を知らせる（総合監査129回目 Major 5。v152）
+    let 戻せた = false; try{ 戻せた = DB.restore(DB.key.st, uu); }catch(e){ 戻せた = false; }
+    toast(戻せた
+      ? '調査の位置を直せなかったので、削除をやめました'
+      : `調査の位置を直せず、消した地点（${st.name||''}）も戻せませんでした。地点はごみ箱に残っています（ID ${String(uu).slice(0,8)}）。`
+        + '空きを作ってから、ごみ箱から戻すか「データを点検」をお試しください', 12000);
+    spotRefresh();
     return;
   }
   draftClearFor('箇所', uu);
@@ -7596,9 +7626,14 @@ function svSpotAdd(svUuid, lat, lon, acc){
   // 空のままだと、書き出しも取り込みも位置なしになる
   // 代表の位置を直せなかったら、置いた地点も戻す（半端な形を残さない）
   if(!spotPosFix(svUuid)){
-    DB.softDelete(DB.key.st, u);
-    toast('調査の位置を直せなかったので、地点を置けませんでした。'
-      + '端末の空き容量をご確認ください', 9000);
+    // 取り消しの結果も見る。取り消せなければ、残った地点の名前と直し方を知らせる（総合監査129回目 Major 5。v152）
+    let 消せた = false; try{ 消せた = DB.softDelete(DB.key.st, u); }catch(e){ 消せた = false; }
+    const 名 = (DB.get(DB.key.st, u)||{}).name || '';
+    toast(消せた
+      ? '調査の位置を直せなかったので、地点を置けませんでした。端末の空き容量をご確認ください'
+      : `調査の位置を直せず、置いた地点（${名}）の取り消しもできませんでした。地点は残っています（ID ${String(u).slice(0,8)}）。`
+        + '空きを作ってから、地点の一覧で消すか「データを点検」をお試しください', 12000);
+    spotRefresh();   // 実際の状態を描き直す
     return null;
   }
   spotRefresh();
@@ -9238,7 +9273,7 @@ function spotTimes(st, list, sv){
 function spotTotals(stUuid){
   const 種 = {};
   let 尾 = 0;
-  spotStations(stUuid).forEach(x=>{
+  spotStations(stUuid).filter(recordReady).forEach(x=>{   // 描きかけは数えない（v152）
     DB.catchesOf(x.uuid).forEach(c=>{
       const t = catchTotal(c);
       const k = c.species_id || c.species_name;
@@ -10047,11 +10082,12 @@ function fishClosePoly(svUuid){
   if(具合){ toast(具合, 8000); return false; }
   const 一覧 = DB.stationsOf(svUuid).filter(x=>unitKindOf(x));
   const 断り = unitParentBlocked(st, 一覧);
+  let 親 = null, 何 = '';
   if(断り){
     // 「移してください」と言うだけでは詰む。ここで移せるようにする
     const 親id = unitParentOf(st, 一覧);
-    const 親 = 一覧.filter(x=>x.uuid===親id)[0];
-    const 何 = 親 ? unitHasOwn(親) : '';
+    親 = 一覧.filter(x=>x.uuid===親id)[0] || null;
+    何 = 親 ? unitHasOwn(親) : '';
     if(!親 || !何){ toast(断り, 10000); return false; }
     if(!confirm(`${親.name} に入っている${何}を、いま閉じようとしている `
       + `${st.name} へ移しますか？
@@ -10063,27 +10099,59 @@ function fishClosePoly(svUuid){
       toast(断り, 10000);
       return false;
     }
-    const 移し = unitMoveOwn(親.uuid, st.uuid);
-    if(移し !== true){
-      toast(移し === 'broken'
-        ? '移す途中で書けなくなり、半端な状態になっています。'
-          + '「データ点検」を開いてご確認ください'
-        : (移し && 移し.conflict)
-        ? `${st.name} にも ${移し.conflict.join('・')} が入っているので移せません。閉じるのをやめました`
-        : '移せませんでした（端末の空き容量をご確認ください）。'
-          + 'そのままにしてあります', 10000);
-      return false;
-    }
-    toast(`${親.name} の${何}を ${st.name} へ移しました`, 6000);
   }
-  // 閉じたことを記録に残す。残さないと、読み込み直しに耐えられない
-  const st2 = DB.liveStation(st.uuid);
-  if(st2){ delete st2.poly_state; if(!DB.upsert(DB.key.st, st2)){
-    toast('閉じたことを保存できませんでした。もう一度お試しください', 8000); return false; } }
+  // 移す・閉じた印を消す・親子を付け直す、を1回の保存で（総合監査130回目 Major 3。v152）
+  const r = fishClosePolyCommit(svUuid, st.uuid, 親 ? 親.uuid : '');
+  if(r !== true){
+    toast(r === 'broken'
+      ? '移す途中で書けなくなり、半端な状態になっています。「データ点検」を開いてご確認ください'
+      : (r && r.conflict)
+      ? `${st.name} にも ${r.conflict.join('・')} が入っているので移せません。閉じるのをやめました`
+      : '閉じたことを保存できませんでした（端末の空き容量をご確認ください）。そのままにしてあります', 10000);
+    return false;
+  }
+  if(親) toast(`${親.name} の${何}を ${st.name} へ移しました`, 6000);
   FISH_NEXT = {kind:FISH_NEXT.kind, draw:'', survey:svUuid};
-  unitRelink(svUuid);
   const 中 = unitChildren(st.uuid, DB.stationsOf(svUuid)).length;
   toast(`${st.name} を閉じました` + (中 ? `（中に ${中}件）` : ''), 5000);
+  return true;
+}
+/* 囲いを閉じる保存をまとめて1回で（v152）。親の自前の記録を子へ移す（あれば）＋閉じた印を消す＋全単位の親子を付け直す。
+   st を1回・ca を1回。ca が書けなければ st を戻す（戻せなければ 'broken'）。親子の両方に同じ項目があれば {conflict} で何も変えない。
+   前は3〜4回の別々の保存で、途中で失敗すると描きかけに記録が移った（総合監査130回目 Major 3・計画点検 Major 2） */
+function fishClosePolyCommit(svUuid, stUuid, 親uuid){
+  let sts, cas, 元st;
+  try{ sts = DB.loadRaw(DB.key.st); cas = DB.loadRaw(DB.key.ca); 元st = JSON.parse(JSON.stringify(sts)); }
+  catch(e){ return false; }
+  const st = sts.find(x=>x && x.uuid===stUuid && !x.deleted_at);
+  if(!st) return false;
+  const t = nowISO();
+  let caChanged = false;
+  if(親uuid){
+    const 親 = sts.find(x=>x && x.uuid===親uuid && !x.deleted_at);
+    if(!親) return false;
+    const ぶつかる = unitMoveConflicts(親, st);
+    if(ぶつかる.length) return {conflict: ぶつかる};
+    移す欄.forEach(k=>{
+      if(親[k] === undefined || 親[k] === '') return;
+      if(st[k] === undefined || st[k] === '') st[k] = 親[k];
+      delete 親[k];
+    });
+    親.updated_at = t;
+    cas.forEach(c=>{ if(c && !c.deleted_at && c.station_uuid === 親uuid){ c.station_uuid = stUuid; c.updated_at = t; caChanged = true; } });
+  }
+  delete st.poly_state; st.updated_at = t;   // 閉じたことを記録に残す。残さないと、読み込み直しに耐えられない
+  const units = sts.filter(x=>x && !x.deleted_at && x.survey_uuid===svUuid && unitKindOf(x));
+  const 対象 = units.filter(unitReady);
+  units.forEach(x=>{
+    const p = unitReady(x) ? unitParentOf(x, 対象) : '';
+    if((x.parent_uuid||'') !== p){ x.parent_uuid = p; x.updated_at = t; }
+  });
+  if(!DB.save(DB.key.st, sts)) return false;
+  if(caChanged && !DB.save(DB.key.ca, cas)){
+    let 戻せた = false; try{ 戻せた = DB.save(DB.key.st, 元st); }catch(e){}
+    return 戻せた ? false : 'broken';
+  }
   return true;
 }
 /* 描いている途中の囲いの角を、最後の1つだけ取り消す（2026-08-24 の実機の声）。
@@ -12565,8 +12633,10 @@ function buildPhotoFeatures(sv, idx, items){
     });
   });
 }
-function exportGeoJSON(svUuid){
+async function exportGeoJSON(svUuid){
   const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
+  // 調査ぜんたいの道すじは端末の置き場から非同期に読む。読み終わる前に出すと線が黙って欠ける（総合監査132回目 Major 4。v152）
+  if(!(await walkEnsureLoaded())){ toast(WALK_EXPORT_NG, 10000); return; }
   const g = buildGeoJSON(sv);
   const base = `fish_${String(sv.survey_date||'').replace(/-/g,'')}_${(sv.river_name||'').slice(0,10)}`;
   let 出した = 0;
@@ -14325,6 +14395,7 @@ function envMapClick(svUuid, latlng){
   // 直す待ちのときは、新しく置かずに動かす
   if(ENV_MOVE){
     const m = ENV_MOVE;
+    if(!envFlushDirty()){ toast(ENV_FLUSH_NG, 9000); return; }   // 打ちかけが書けないうちは動かさない（v152）
     // すぐ近くに置いてあるものがあれば、そこへ重ねる
     const sn = envSnapTo(svUuid, latlng.lat, latlng.lng, m.uuid);
     const la = sn ? sn.lat : latlng.lat, lo = sn ? sn.lon : latlng.lng;
@@ -14336,8 +14407,7 @@ function envMapClick(svUuid, latlng){
   const 描き = ENV_NEXT.kind === 'A' ? envPolyTarget(svUuid).st : null;
   const sn = envSnapTo(svUuid, latlng.lat, latlng.lng, 描き ? 描き.uuid : null);
   const la = sn ? sn.lat : latlng.lat, lo = sn ? sn.lon : latlng.lng;
-  if(envAddAt(svUuid, la, lo, null)) envSnapTell(sn);
-  render();
+  if(envAddAt(svUuid, la, lo, null)){ envSnapTell(sn); render(); }   // 置けなかったときは描き直さない（知らせが二重になる。監査144回目 Minor 1）
 }
 /* 描いた記号・線・囲いをタップしたとき。ふだんはその記録を選ぶ。
    囲いを描いているとき（つぎが囲い）は、地図をタップしたのと同じに角を置く。
@@ -14379,14 +14449,14 @@ function envAddHere(svUuid){
         + '空の見えるところでお試しいただくか、地図をタップしてください', 9000);
       return;
     }
-    envAddAt(svUuid, f.lat, f.lon, f.acc, 相手UU);
-    render();
+    if(envAddAt(svUuid, f.lat, f.lon, f.acc, 相手UU)) render();   // 置けなかったときは描き直さない（監査144回目 Minor 1）
   }, {keep:true});     // 置いてよいかは 確かめ() が見る
 }
 function envSelect(u){
   if(ENV_SEL === u) return;
   if(!polyEditLeaveOk(u)) return;
-  envFlush();            // 打ちかけの分を、切り替える前に書いてしまう
+  // 打ちかけの分を、切り替える前に書いてしまう。書けなければ切り替えない（総合監査130/131回目 Major。v152）
+  if(!envFlushDirty()){ toast(ENV_FLUSH_NG, 9000); return; }
   ENV_SEL = u;
   envMarkSelected();     // 人が選んだ。曲がりの行き先は、これを先に見る
   render();
@@ -14538,15 +14608,17 @@ function envUndo(svUuid){
   while(i >= 0 && !envHistMine(ENV_HIST[i], svUuid)) i--;
   if(i < 0){ toast('戻せるものがありません'); return false; }
   const h = ENV_HIST[i];
-  ENV_HIST.splice(i, 1);
+  // 履歴は、戻せたあとに外す。先に外すと、保存に失敗したときその操作をもう戻せない（総合監査131回目 Major 3・計画点検 Major 3。v152）
+  const 済 = ()=>{ const j = ENV_HIST.indexOf(h); if(j >= 0) ENV_HIST.splice(j, 1); };
 
   if(h.type === '置いた'){
     const st = DB.liveStation(h.uuid);
-    if(!st){ toast('その記録はもうありません'); return true; }
+    if(!st){ 済(); toast('その記録はもうありません'); return true; }
     if(!DB.softDelete(DB.key.st, h.uuid)){
       toast('戻せませんでした（端末の空き容量をご確認ください）', 8000);
       return false;
     }
+    済();
     draftClearFor('箇所', h.uuid);
     if(ENV_SEL === h.uuid) ENV_SEL = null;
     if(ENV_NEXT.line === h.uuid){
@@ -14557,7 +14629,7 @@ function envUndo(svUuid){
   }
   if(h.type === '終わり'){
     const st = DB.liveStation(h.uuid);
-    if(!st){ toast('その記録はもうありません'); return true; }
+    if(!st){ 済(); toast('その記録はもうありません'); return true; }
     let all;
     try{ all = DB.loadRaw(DB.key.st); }
     catch(e){ toast('保存された記録を読み取れないため、戻せませんでした', 7000); return false; }
@@ -14577,6 +14649,7 @@ function envUndo(svUuid){
       toast('戻せませんでした（端末の空き容量をご確認ください）', 8000);
       return false;
     }
+    済();
     if(h.next){
       draftClearFor('箇所', h.next);
       if(ENV_SEL === h.next) ENV_SEL = h.uuid;
@@ -14587,37 +14660,38 @@ function envUndo(svUuid){
   }
   if(h.type === '曲がり'){
     if(!envUndoBend(h.uuid)) return false;
+    済();
     return true;
   }
   if(h.type === '閉じた'){
     // 閉じたのを取り消して、描きかけに戻す（続けて角を戻せる）
     const st = DB.liveStation(h.uuid);
-    if(!st || !isEnvPoly(st)){ toast('その記録はもうありません'); return true; }
-    // 戻せなかったときは、履歴を元の位置へ戻す。消したままだと、もう一度押したときに
-    // 別の操作を戻してしまう（監査103回目 Major）
+    if(!st || !isEnvPoly(st)){ 済(); toast('その記録はもうありません'); return true; }
+    // 戻せなかったときは履歴を残す。消したままだと、もう一度押したときに別の操作を戻してしまう（監査103回目 Major）
     if(envPolyDrawings(svUuid).length){
-      ENV_HIST.splice(i, 0, h);
       toast('ほかの囲いを描いているので、戻せません', 7000); return false;
     }
     st.poly_state = 'drawing';
     st.survey_time_end = h.prevTime || '';
     st.ended_at = h.prevEnded || '';
     if(!DB.upsert(DB.key.st, st)){
-      ENV_HIST.splice(i, 0, h);
       toast('戻せませんでした（端末の空き容量をご確認ください）', 8000);
       return false;
     }
+    済();
     ENV_SEL = st.uuid;
     toast(`${h.name||''} を閉じたのを取り消しました。描きかけに戻っています`, 5000);
     return true;
   }
   if(h.type === '動かした'){
     const st = DB.liveStation(h.uuid);
-    if(!st){ toast('その記録はもうありません'); return true; }
+    if(!st){ 済(); toast('その記録はもうありません'); return true; }
     if(!envMoveTo(h.uuid, h.which, h.prev.lat, h.prev.lon, h.prev.acc, h.prev)) return false;   // 控え（終点なら時刻と印も）を渡して戻す
+    済();
     toast(`${h.name||''} の${h.which}を元に戻しました`);
     return true;
   }
+  済();   // 知らない種類の履歴は捨てる
   return false;
 }
 /* 「選んだ」のと「置いた」のと、どちらが後かを覚えておく。
@@ -14820,6 +14894,7 @@ function envGrabHere(u, which){
     toast('このタブでは直せません。記録を入れているタブでお試しください', 7000);
     return;
   }
+  if(!envFlushDirty()){ toast(ENV_FLUSH_NG, 9000); return; }   // 打ちかけが書けないうちは動かさない（v152）
   toast('現在地を取っています…');
   getFixOnce(f=>{
     if(!f){ toast('現在地を取れませんでした。地図で直すこともできます', 7000); return; }
@@ -14828,6 +14903,7 @@ function envGrabHere(u, which){
         + '空の見えるところでお試しいただくか、地図で直してください', 9000);
       return;
     }
+    if(!envFlushDirty()){ toast(ENV_FLUSH_NG, 9000); return; }   // 待っている間に打ちかけが変わっていることがある（監査144回目 Major 1）
     if(envMoveTo(u, which, f.lat, f.lon, f.acc)) render();
   });
 }
@@ -14861,6 +14937,13 @@ function envFlush(){
   if(ENV_FORM) return envAutoSaveNow(ENV_FORM);
   return true;
 }
+/* 打ちかけ（ENV_FORM かつ ENV_DIRTY）があるときだけ保存を試み、書けなければ false。打ちかけが無ければ true。
+   envFlush の false は「触っていない」も含むので、止める判断にはこちらを使う（計画点検 2026-10-28 Major 1。v152） */
+function envFlushDirty(){
+  if(!(ENV_FORM && ENV_DIRTY)) return true;
+  return envFlush() !== false;
+}
+const ENV_FLUSH_NG = '保存できない入力があります（値を直すか、端末の空き容量をご確認ください）。直してからもう一度お試しください';
 
 function saveEnvItem(stUuid, opt){
   const quiet = !!(opt && opt.quiet);
@@ -16926,8 +17009,11 @@ async function dbSendTest(){
     toast('つながりませんでした。電波と宛先をご確認ください', 8000);
   }
 }
+let DB_SEND_BUSY = false;
+let DB_SEND_PENDING = {};     // 送れたのに端末に受領の印を保存できなかった分。調査ごと {sv: {receipt, at}}（画面に出し続ける。監査144回目 Minor 2）
 async function dbSendNow(svUuid){
   const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
+  if(DB_SEND_BUSY){ toast('いま送っています。少しお待ちください', 5000); return; }   // 二度押しで2本送らない（総合監査132回目 Minor 1。v152）
   dbSendSavePrefs();
   const c = dbSendCheckUrl(dbSendUrl());
   if(!c.url){ toast(c.why, 7000); return; }
@@ -16944,35 +17030,55 @@ async function dbSendNow(svUuid){
   const r = buildDbRows(sv);
   if(r.blocked.length){ toast('このままでは送れません：' + r.blocked[0], 9000); return; }
   if(!r.rows.length){ toast('送る行がありません', 6000); return; }
-  toast('送っています…', 8000);
-  let res = null, j = null;
+  DB_SEND_BUSY = true;
+  const btn = document.querySelector('button[onclick^="dbSendNow("]');
+  if(btn){ btn.disabled = true; btn.textContent = '送っています…'; }
   try{
-    res = await fetch(c.url + '/ingest', {
-      method:'POST',
-      headers:{'Content-Type':'application/json',
-               'Authorization':'Bearer ' + token,
-               'X-Device-Id': deviceId()},
-      body: JSON.stringify({app:'fish_survey', kind:'db_rows', version:1,
-        survey_uuid: sv.uuid, rows: r.rows}),
-    });
-    try{ j = await res.json(); }catch(e){}
-  }catch(e){
-    toast('送れませんでした（通信エラー）。電波の良いところでお試しください', 10000);
-    return;                        // 受領の印は更新しない
+    toast('送っています…', 8000);
+    let res = null, j = null;
+    try{
+      res = await fetch(c.url + '/ingest', {
+        method:'POST',
+        headers:{'Content-Type':'application/json',
+                 'Authorization':'Bearer ' + token,
+                 'X-Device-Id': deviceId()},
+        body: JSON.stringify({app:'fish_survey', kind:'db_rows', version:1,
+          survey_uuid: sv.uuid, rows: r.rows}),
+      });
+      try{ j = await res.json(); }catch(e){}
+    }catch(e){
+      toast('送れませんでした（通信エラー）。電波の良いところでお試しください', 10000);
+      return;                        // 受領の印は更新しない
+    }
+    if(!res.ok || !j || j.ok !== true){
+      const why = (j && (j.error || j.message)) || ('HTTP ' + res.status);
+      toast('送れませんでした：' + why, 12000);
+      return;                        // 受領の印は更新しない
+    }
+    const receipt = (j.receipt == null ? '' : String(j.receipt));
+    const sv2 = DB.getAlive(DB.key.sv, svUuid);
+    let 印 = false;
+    if(sv2){
+      sv2.db_sent_at = nowISO();
+      sv2.db_receipt = receipt;
+      印 = !!DB.upsert(DB.key.sv, sv2);
+    }
+    if(!印){
+      // 送信そのものは済んでいる。端末に印を書けなかったことを、受領証つきで出し続ける（総合監査132回目 Minor 2。v152）
+      DB_SEND_PENDING[svUuid] = {receipt, at: nowISO()};
+      toast(`データベースは受け取りました（受領証 ${receipt || '—'}）。ただし端末に受領の印を保存できませんでした（空き容量をご確認ください）。`
+        + '同じ記録をもう一度送っても、向こうでは増えません', 15000);
+      render();
+      return;
+    }
+    delete DB_SEND_PENDING[svUuid];   // この調査の分だけ消す（ほかの調査の警告は残す）
+    toast('送りました。' + String(j.message||''), 10000);
+    render();
+  }finally{
+    DB_SEND_BUSY = false;
+    const b2 = document.querySelector('button[onclick^="dbSendNow("]');
+    if(b2){ b2.disabled = false; b2.textContent = 'いま送る'; }
   }
-  if(!res.ok || !j || j.ok !== true){
-    const why = (j && (j.error || j.message)) || ('HTTP ' + res.status);
-    toast('送れませんでした：' + why, 12000);
-    return;                        // 受領の印は更新しない
-  }
-  const sv2 = DB.getAlive(DB.key.sv, svUuid);
-  if(sv2){
-    sv2.db_sent_at = nowISO();
-    sv2.db_receipt = (j.receipt == null ? '' : String(j.receipt));
-    DB.upsert(DB.key.sv, sv2);
-  }
-  toast('送りました。' + String(j.message||''), 10000);
-  render();
 }
 
 /* ---------- 書き出し ---------- */
@@ -16992,10 +17098,20 @@ SCREENS.exportHub = (svUuid)=>{
   // QGIS用の見出しの数。位置の無い調査でも画面は出す
   let geo = {点:[], 線:[], 面:[]};
   try{ geo = buildGeoJSON(sv); }catch(e){}
+  // 道すじをまだ読み終えていなければ、その旨を出し、読み終わったら描き直す（v152）。
+  // 読めない端末（WALK_FAIL）では読み直さない。読み直し→失敗→描き直しを繰り返してしまう（監査144回目 Major 2）
+  const 道すじ読めず = !WALK_LOADED && WALK_FAIL;
+  const 道すじ待ち = !WALK_LOADED && !WALK_FAIL;
+  if(道すじ待ち) walkEnsureLoaded().then(ok=>{
+    const c = STACK[STACK.length-1];
+    if(c && c.name === 'exportHub' && c.arg === svUuid) render();   // 読めたら数を更新、読めなければ「読み込めませんでした」に変わる
+  }).catch(()=>{});
   return {
     title:'書き出す',
     sub:[{text:sv.river_name||''}],
     html:`
+      ${道すじ待ち ? '<div class="dim small">歩いた道すじを読み込んでいます…（終わると数が更新されます）</div>' : ''}
+      ${道すじ読めず ? '<div class="warnbox">歩いた道すじを読み込めませんでした（道すじの置き場を開けません）。位置GeoJSON・QGIS用ZIP は中止されます。アプリを開き直してからお試しください</div>' : ''}
       ${r.blocked.length ? `<div class="ngbox"><b>このままでは書き出せません</b><br>
         ${r.blocked.map(b=>esc(b)).join('<br>')}
         <br><br>時刻が空のままだと、取り込み側が別々の箇所を1つにまとめてしまいます。</div>` : ''}
@@ -17050,8 +17166,10 @@ SCREENS.exportHub = (svUuid)=>{
         <div class="row">
           <button class="btn sm" onclick="dbSendTest()">つながるか試す</button>
         </div>
-        <button class="btn pri" ${r.blocked.length?'disabled':''}
-          onclick="dbSendNow('${svUuid}')">いま送る</button>
+        ${DB_SEND_PENDING[svUuid] ? `<div class="warnbox">データベースは受け取り済みです（受領証 ${esc(DB_SEND_PENDING[svUuid].receipt||'—')}・${esc(fmtTime(DB_SEND_PENDING[svUuid].at))}）が、
+          端末に受領の印を保存できていません。空き容量を確保してください。同じ記録をもう一度送っても、向こうでは増えません。</div>` : ''}
+        <button class="btn pri" ${(r.blocked.length || DB_SEND_BUSY)?'disabled':''}
+          onclick="dbSendNow('${svUuid}')">${DB_SEND_BUSY ? '送っています…' : 'いま送る'}</button>
         ${sv.db_sent_at ? `<div class="dim small" style="margin-top:8px">
           前回の送信：${esc(fmtDate(sv.db_sent_at))} ${esc(fmtTime(sv.db_sent_at))}
           ${sv.db_receipt ? `（受領証 ${esc(sv.db_receipt)}）` : ''}</div>` : ''}
@@ -17505,6 +17623,7 @@ async function exportQgisZip(svUuid){
     return;
   }
   const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return;
+  if(!(await walkEnsureLoaded())){ toast(WALK_EXPORT_NG, 10000); return; }   // 道すじを読み終えてから（v152）
   const got = await photoZipItems(sv); if(!got) return;
   const {pend, items} = got;
   const pre = photoZipPrecheck(items);
