@@ -153,7 +153,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v149';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v150';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2138,9 +2138,10 @@ function envKindOf(st){
   return isLine(st) ? 'L' : 'P';
 }
 /* 開始だけで、終わっていないライン。LE のつなぎ先になる */
+/* 始まりだけのライン。いま地点の地図を開いているなら、その地点の分だけ（別の地点の分を案内しても、ここでは選べない。総合監査131回目 Minor） */
 function envPendingLine(svUuid){
   const list = DB.stationsOf(svUuid).filter(st=>isLine(st)
-    && linePt(st,'start') && !linePt(st,'end'));
+    && linePt(st,'start') && !linePt(st,'end') && ofSpot(st, MAP_SPOT));
   return list.length ? list[list.length-1] : null;
 }
 /* 箇所の通し番号。
@@ -2590,7 +2591,7 @@ function envAddAt(svUuid, lat, lon, acc, targetUuid){
     }
     if(!st){
       const 未完 = DB.stationsOf(svUuid).filter(x=>isLine(x)
-        && linePt(x,'start') && !linePt(x,'end'));
+        && linePt(x,'start') && !linePt(x,'end') && ofSpot(x, MAP_SPOT));
       toast(未完.length > 1
         ? `終わっていないラインが${未完.length}本あります。`
           + 'どれにつなぐか、下のボタンで先に選んでください'
@@ -3200,16 +3201,21 @@ function speciesCount(catches, inds){
   });
   return set.size;
 }
+/* 画面の合計も、調査CSVと同じ「努力量の対象」（effortStations: 魚の単位があれば魚だけ・親子の葉だけ）から足す。
+   調査ぜんぶを無条件に足すと、魚と物理環境が同居したとき画面と調査CSVの距離・面積が食い違う（総合監査132回目 Major。v150） */
+function effortTargets(sv){
+  try{ return effortStations(DB.stationsOf(sv.uuid)); }catch(e){ return DB.stationsOf(sv.uuid); }
+}
 function surveyLengths(sv){
   // 1つも測っていなければ空欄。0を返すと「調べたが0m」に見える
-  const vals = DB.stationsOf(sv.uuid)
+  const vals = effortTargets(sv)
     .map(st=>stationLengths(st).used).filter(v=>v!=='' && isFinite(v));
   const auto = vals.length ? vals.reduce((a,b)=>a+b, 0) : '';
   const manual = numOf(sv.survey_length_m_manual);
   return {auto, manual, used: manual!=='' ? manual : auto};
 }
 function surveyAreas(sv){
-  const vals = DB.stationsOf(sv.uuid)
+  const vals = effortTargets(sv)
     .map(st=>stationAreas(st).used).filter(v=>v!=='' && isFinite(v));
   const auto = vals.length ? vals.reduce((a,b)=>a+b, 0) : '';
   const manual = numOf(sv.survey_area_m2_manual);
@@ -8099,7 +8105,8 @@ SCREENS.surveyHub = (svUuid)=>{
   const svLen = surveyLengths(sv), svArea = surveyAreas(sv);
   const svSec = effortStations(DB.stationsOf(svUuid))
     .reduce((a,st)=>a+spotEffort(st), 0);
-  const nSp = new Set(DB.catchesOfSurvey(svUuid).map(c=>c.species_id).filter(Boolean)).size;
+  // 種数は集計・CSVと同じ数え方（尾数0の記録は数えない）。上だけ「1種」と出ていた（総合監査132回目 Major。v150）
+  const nSp = speciesCount(DB.catchesOfSurvey(svUuid), null);
   // 「何を調べますか」は設定から消した。前に作った調査の種類で入口を閉じるのは、
   // 地点も魚の単位も無い、前の版のままの調査だけにする（監査39回目 Major）
   const envOnly = isEnvSurvey(sv) && !地点あり && !単位あり;
@@ -9311,13 +9318,16 @@ function fishAddAt(svUuid, lat, lon, acc){
   const all = DB.stationsOf(svUuid);
   const no = nextStationNo(svUuid);
   if(no===null){ toast('番号が大きすぎて、これ以上置けません', 7000); return null; }
+  // 名前は、ごみ箱にある分も数えて付ける。生きている分だけだと、消した E1 をごみ箱から戻したとき E1 が2つ並ぶ（総合監査130回目 Minor。v150）
+  let 名前用 = all;
+  try{ 名前用 = DB.load(DB.key.st).filter(x=>x && x.survey_uuid===svUuid); }catch(e){}
   const rec = {
     uuid: uuid(), survey_uuid: svUuid, station_no: no,
     // どの地点の地図で作ったかを覚える。地点に入れた天気・区間名などを
     // 書き出しへ渡すために使う（記録そのものは今までどおり調査にぶら下がる）
     spot_uuid: MAP_SPOT || '',
     survey_date: recDay(sv),
-    unit_kind: k, name: unitAutoName(svUuid, k, all),
+    unit_kind: k, name: unitAutoName(svUuid, k, 名前用),
     started_at: nowISO(), survey_time_start: autoTime(sv),
     survey_type: sv.survey_type_default || '目視',
     env_points: [],
@@ -10279,7 +10289,7 @@ ${(opt && opt.head === false) ? '' : `      <div class="card">
                 onclick="if(envClearBends('${cur.uuid}')) render()">全部消す</button>
             </div>` : '')
           + (envKindOf(cur)==='A'
-            ? `<div class="dim small">囲いの形を直すときは、消して描き直してください。</div>`
+            ? `<div class="dim small">囲いは、ここでは点として動かせません。形を直すときは上の「形を直す」を押してください。</div>`
             : `<div class="dim small">「地図で直す」を押してから、地図をタップしてください。</div>`)
           + `<div class="row" style="margin-top:8px">
             <div class="grow"><label>開始時刻</label>
@@ -12625,7 +12635,7 @@ SCREENS.exportAll = ()=>{
           onclick="nav('exportHub','${sv.uuid}')">
         <div class="row"><div class="grow">
           <div style="font-weight:700">${esc(sv.river_name||'')} ${esc(sv.site_name||'')}</div>
-          <div class="dim small">${esc(String(sv.survey_date||'').slice(0,10))}</div>
+          <div class="dim small">${esc(surveyPeriodText(sv))}</div>
         </div><span class="dim">›</span></div>
       </div>`).join('') : '<div class="dim small">まだ調査がありません。</div>'}
     `};
@@ -14386,7 +14396,7 @@ function envUndo(svUuid){
   if(h.type === '動かした'){
     const st = DB.liveStation(h.uuid);
     if(!st){ toast('その記録はもうありません'); return true; }
-    if(!envMoveTo(h.uuid, h.which, h.prev.lat, h.prev.lon, h.prev.acc, true)) return false;
+    if(!envMoveTo(h.uuid, h.which, h.prev.lat, h.prev.lon, h.prev.acc, h.prev)) return false;   // 控え（終点なら時刻と印も）を渡して戻す
     toast(`${h.name||''} の${h.which}を元に戻しました`);
     return true;
   }
@@ -14550,16 +14560,28 @@ function envMoveTo(u, which, la, lo, acc, 戻すとき){
   // 囲いは点ではない。点の位置として書き込まない（角を動かすのは今回やらない）
   if(isEnvPoly(st)){ ENV_MOVE = null; toast('囲いの形は、ここでは直せません', 6000); return false; }
   const a = (acc===undefined || acc===null || acc==='') ? '' : Math.round(acc);
-  // 動かす前の場所を控える（1つ戻すため）
+  // 動かす前の場所を控える（1つ戻すため）。終点は、終了時刻と終わりの印も一緒に控える（戻したとき一緒に戻す。監査138回目 Major）
   const 前 = which === '始点' ? {lat:st.line_start_lat, lon:st.line_start_lon, acc:st.line_start_acc}
-           : which === '終点' ? {lat:st.line_end_lat, lon:st.line_end_lon, acc:st.line_end_acc}
+           : which === '終点' ? {lat:st.line_end_lat, lon:st.line_end_lon, acc:st.line_end_acc, time: st.survey_time_end || '', ended: st.ended_at || ''}
            : {lat:st.latitude, lon:st.longitude, acc:st.gps_accuracy};
+  // 「1つ戻す」から呼ばれたときは、控え（time・ended つき）が渡ってくる
+  const 戻す = (戻すとき && typeof 戻すとき === 'object') ? 戻すとき : null;
   if(which === '始点'){
     st.line_start_lat = la; st.line_start_lon = lo; st.line_start_acc = a;
   }else if(which === '終点'){
+    const 初めて = !(linePt(st,'end'));
     st.line_end_lat = la; st.line_end_lon = lo; st.line_end_acc = a;
-    // 終わりを入れたら、終わりの時刻も入れておく（無いときだけ）
-    if(!st.survey_time_end) st.survey_time_end = timeValue();
+    if(戻す && ('time' in 戻す)){
+      // 戻すときは、終了時刻と終わりの印も控えのとおりに（はじめて入れた終点を戻せば、どちらも空に戻る）
+      st.survey_time_end = 戻す.time || '';
+      if(戻す.ended) st.ended_at = 戻す.ended; else delete st.ended_at;
+    }else if(初めて){
+      // 終わりをはじめて入れたときは、ふつうに終点を置いたときと同じに時刻を入れる（今日・現場のときだけ。過去の日なら空のまま）。
+      // 前は無条件に今の時刻を入れていたので、過去の日の記録に入力作業日の時刻が入った（総合監査129/131回目 Major。v150）
+      const sv = DB.getAlive(DB.key.sv, st.survey_uuid);
+      if(!st.survey_time_end) st.survey_time_end = sv ? autoTime(sv) : '';
+      st.ended_at = st.ended_at || nowISO();
+    }
   }else{
     st.latitude = la; st.longitude = lo; st.gps_accuracy = a;
   }
