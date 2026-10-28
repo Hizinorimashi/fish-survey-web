@@ -153,7 +153,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v145';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v146';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2213,13 +2213,18 @@ function envUseSurvey(svUuid){
 /* 足せるもの。V は「曲がり」 */
 function envKindWord(k){
   return k==='P' ? 'ポイント' : k==='LS' ? 'ラインの始まり'
-       : k==='LE' ? 'ラインの終わり' : k==='A' ? '囲い（瀬・淵の範囲）' : '曲がり';
+       : k==='LE' ? 'ラインの終わり' : k==='A' ? '囲い（瀬・淵の範囲）'
+       : k==='view' ? '見るだけ' : '曲がり';
 }
+/* 見るだけ（v146）。地図をタップしても何も置かない。記号・線・囲いを押すと選ぶ（今までどおり） */
+function envViewOnly(){ return ENV_NEXT.kind === 'view'; }
 function envSetKind(k){
   const sv = ENV_NEXT.survey;
   // 同じものをもう一度押したら、入れ替えをやめる（同じものを続けて足したいとき）
   if(ENV_NEXT.kind === k) ENV_NEXT = {kind:k, auto:false, line:ENV_NEXT.line, survey:sv};
   else if(k === 'P')       ENV_NEXT = {kind:'P', auto:false, line:'', survey:sv};
+  // 見るだけ。つなぐ相手（line）は持ち越す（見るだけから戻したとき、続きから置ける）
+  else if(k === 'view')    ENV_NEXT = {kind:'view', auto:false, line:ENV_NEXT.line, survey:sv};
   // 曲がりは、続けて置くもの。交互には入れない
   else if(k === 'V')       ENV_NEXT = {kind:'V', auto:false, line:ENV_NEXT.line, survey:sv};
   // 囲いも交互には入れない（角を続けて足すもの）
@@ -2318,6 +2323,11 @@ function envSyncNextUI(){
     if(POLY_EDIT){
       hint.innerHTML = '<b>形を直しています</b>。角を引っぱるか、角を押してから行き先をタップ。'
         + '地図をタップしても何も足しません（下の「直し終える」で保存）';
+    }else if(envViewOnly()){
+      hint.innerHTML = 'いまは<b>見るだけ</b>。地図をタップしても何も置きません。'
+        + '置いてある記号・線・囲いを押すと、その記録を選びます'
+        + (描き.length ? `（<b>${esc(描き.map(x=>x.name||'').join('・'))}</b> は描きかけのままです）` : '')
+        + '<br>置くときは、左下の記号を押してください';
     }else if(描き.length){
       // 描いている間は、つぎに置けるのは囲いの角だけ
       hint.innerHTML = `<b>${esc(描き.map(x=>x.name||'').join('・'))}</b> を描いています。`
@@ -2536,6 +2546,7 @@ function envAddAt(svUuid, lat, lon, acc, targetUuid){
   }
 
   const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return null;
+  if(envViewOnly()){ toast(VIEW_ONLY_MSG, 6000); return null; }   // 見るだけ（v146）
   envFlush();            // いま打っている分を、置く前に書いてしまう
   if(!writeAllowed()){
     toast('このタブでは追加できません。記録を入れているタブでお試しください', 6000);
@@ -5353,6 +5364,8 @@ function drawMe(slot, fix){
    文字で書くと場所を取り、絵文字は端末によって「？」になるので、自前の図で描く。
    鳥アプリの地図ボタンと同じ考え方（2026-08-18 の実機の声） */
 const MAP_ICONS = {
+  // 見るだけ（矢印のカーソル。v146）
+  look: '<path d="M6 3 L19 12.5 L12.6 13.6 L16 20 L13.2 21.4 L9.8 15 L6 18.6 Z"/>',
   // ポイント（●）
   point: '<circle cx="12" cy="12" r="5.5" fill="currentColor" stroke="none"/>',
   // ラインの始まり（●から線が伸びる）
@@ -9175,6 +9188,9 @@ function fishSetKind(k){
   FISH_NEXT = {kind:k, draw:FISH_NEXT.draw, survey:FISH_NEXT.survey};
   render();
 }
+/* 見るだけ（v146）。地図をタップしても何も置かない。置いてある記号・囲いを押すと、その記録を選ぶ */
+function fishViewOnly(){ return FISH_NEXT.kind === 'view'; }
+const VIEW_ONLY_MSG = 'いまは「見るだけ」です。置くときは、地図の左下で置くもの（囲い・ポイント）を先に押してください';
 /* いま描いている途中の囲い */
 function fishDrawing(){
   if(!FISH_NEXT.draw) return null;
@@ -9210,6 +9226,7 @@ function unitReady(st){ return !polyDrawing(st); }
 /* 置く。囲いは角を1つずつ足していく */
 function fishAddAt(svUuid, lat, lon, acc){
   if(POLY_EDIT){ toast('形を直している途中です。先に「直し終える」か「やめる」を押してください', 6000); return null; }
+  if(fishViewOnly()){ toast(VIEW_ONLY_MSG, 6000); return null; }   // 描いている途中でも角を足さない
   const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return null;
   if(!writeAllowed()){
     toast('このタブでは追加できません。記録を入れているタブでお試しください', 6000);
@@ -10017,9 +10034,11 @@ function fishRememberView(svUuid){
    下の囲いが選ばれてしまい、角を置けなかった（2026-08-23 の実機の声）。
    地図のタップは、どこを押しても「置く」に統一する。
    選ぶのは、地図の下に並ぶ名前のボタン（E1・P/F1…）で行う */
-function fishMapTap(svUuid, latlng){
+function fishMapTap(svUuid, latlng, u){
   if(!latlng) return;
   if(POLY_EDIT){ polyEditTap(latlng); return; }   // 形を直している間は、角を動かすだけ
+  // 見るだけ（v146）: 置いてある記号・囲いを押したときは選ぶ。地図そのものを押しても何もしない
+  if(fishViewOnly()){ if(u) fishSelect(u); else toast(VIEW_ONLY_MSG, 6000); return; }
   const cur = FISH_SEL ? DB.liveStation(FISH_SEL) : null;
   if(cur && $('#gearBox') && !saveEffort(cur.uuid, {quiet:true})) return;
   fishAddAt(svUuid, latlng.lat, latlng.lng, null);
@@ -10060,7 +10079,7 @@ function fishDrawAll(svUuid){
       if(!pt) return;
       FISHLAYER.push(L.marker(pt, {icon:envBadge(st.name||'', col, on?30:24, on, false),
         zIndexOffset: on ? 1000 : 0})
-        .on('click', e=>{ L.DomEvent.stop(e); fishMapTap(svUuid, e.latlng); }).addTo(map));
+        .on('click', e=>{ L.DomEvent.stop(e); fishMapTap(svUuid, e.latlng, st.uuid); }).addTo(map));
       return;
     }
     if(polyEditOn(st.uuid)){ polyEditDraw(map, FISHLAYER, col); return; }   // 直している囲いは写しの形で
@@ -10070,16 +10089,16 @@ function fishDrawAll(svUuid){
     if(pts.length >= 3 && !描き中){
       FISHLAYER.push(L.polygon(pts, {color:col, weight:on?4:3, opacity:.95,
         fillColor:col, fillOpacity:on?.22:.12, bubblingMouseEvents:false})
-        .on('click', e=>{ L.DomEvent.stop(e); fishMapTap(svUuid, e.latlng); }).addTo(map));
+        .on('click', e=>{ L.DomEvent.stop(e); fishMapTap(svUuid, e.latlng, st.uuid); }).addTo(map));
     }else{
       FISHLAYER.push(L.polyline(pts, {color:col, weight:3, opacity:.9,
         dashArray:'6 4', bubblingMouseEvents:false})
-        .on('click', e=>{ L.DomEvent.stop(e); fishMapTap(svUuid, e.latlng); }).addTo(map));
+        .on('click', e=>{ L.DomEvent.stop(e); fishMapTap(svUuid, e.latlng, st.uuid); }).addTo(map));
     }
     pts.forEach(v=>{
       FISHLAYER.push(L.circleMarker(v, {radius:描き中?6:4, color:'#fff', weight:2,
         fillColor:col, fillOpacity:1, bubblingMouseEvents:false})
-        .on('click', e=>{ L.DomEvent.stop(e); fishMapTap(svUuid, e.latlng); }).addTo(map));
+        .on('click', e=>{ L.DomEvent.stop(e); fishMapTap(svUuid, e.latlng, st.uuid); }).addTo(map));
     });
     // 名前は、いちばん北の角に置く。真ん中に置くと、入れ子の囲いどうしで重なる
     const c = pts.slice().sort((a,b)=>b[0]-a[0])[0];
@@ -10093,7 +10112,7 @@ function fishDrawAll(svUuid){
     }
     if(c) FISHLAYER.push(L.marker(c, {icon:envBadge(st.name||'', col, on?30:24, on, true),
       zIndexOffset: on ? 1000 : 0})
-      .on('click', e=>{ L.DomEvent.stop(e); fishMapTap(svUuid, e.latlng); }).addTo(map));
+      .on('click', e=>{ L.DomEvent.stop(e); fishMapTap(svUuid, e.latlng, st.uuid); }).addTo(map));
   });
 }
 function fishAllPoints(svUuid){
@@ -13616,6 +13635,7 @@ SCREENS.fishMap = (arg)=>{
         {icon:'fitAll', title:'置いたものが全部入るように', tap:()=>fishFitAll(svUuid)},
       ], 'topright');
       addMapIconBar(map, [
+        {icon:'look',      key:'view', title:'見るだけ（タップしても置きません）', tap:()=>fishSetKind('view')},
         {icon:'areaBig',   key:'E',  title:'つぎは調査範囲（囲い）', tap:()=>fishSetKind('E')},
         {icon:'areaSmall', key:'PF', title:'つぎは河川区分・瀬淵（囲い）', tap:()=>fishSetKind('PF')},
         {icon:'point',     key:'P',  title:'つぎはポイント（点）', tap:()=>fishSetKind('P')},
@@ -13680,6 +13700,13 @@ function fishSyncHint(){
       + '地図をタップしても何も足しません（下の「直し終える」で保存）';
     return;
   }
+  if(fishViewOnly()){
+    el.innerHTML = 'いまは<b>見るだけ</b>。地図をタップしても何も置きません。'
+      + '置いてある囲い・点を押すと、その記録を選びます'
+      + (描き中 ? `（<b>${esc(描き中.name)}</b> は描きかけのままです）` : '')
+      + '<br>置くときは、左下の記号（調査範囲・瀬淵・ポイント）を押してください';
+    return;
+  }
   if(描き中){
     el.innerHTML = `<b>${esc(描き中.name)}</b> を描いています（角 ${polyPts(描き中).length}個）。`
       + `地図をタップして角を足し、右下の「囲いを閉じる」で閉じてください`;
@@ -13691,6 +13718,7 @@ function fishSyncHint(){
     + '<br>直したいものは、下の名前のボタン（E1・P/F1…）で選んでください';
 }
 function fishAddHere(svUuid){
+  if(fishViewOnly()){ toast(VIEW_ONLY_MSG, 6000); return; }   // 現在地を取る前に断る
   if(fixBusy()) return;      // 待っている間の二度押しで、二重に置かない
   toast('現在地を取っています…');
   const 確かめ = fixGuard(svUuid);
@@ -13867,6 +13895,7 @@ SCREENS.envMap = (arg)=>{
       ], 'topright');
       // 足すものは、押しやすい下側に置く
       addMapIconBar(map, [
+        {icon:'look',      key:'view', title:'見るだけ（タップしても置きません）', tap:()=>envSetKind('view')},
         {icon:'point',     key:'P',  title:'つぎはポイント', tap:()=>envSetKind('P')},
         {icon:'lineStart', key:'LS', title:'つぎはラインの始まり', tap:()=>envSetKind('LS')},
         {icon:'lineEnd',   key:'LE', title:'つぎはラインの終わり', tap:()=>envSetKind('LE')},
@@ -14022,6 +14051,7 @@ function envLayerTap(svUuid, u, latlng){
 
 /* いまいる場所に足す */
 function envAddHere(svUuid){
+  if(envViewOnly()){ toast(VIEW_ONLY_MSG, 6000); return; }   // 現在地を取る前に断る（v146）
   if(envPickOn()){
     toast('消すものを選んでいます。先に「やめる」を押してください', 6000);
     return;
