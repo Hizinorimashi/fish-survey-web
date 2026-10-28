@@ -153,7 +153,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v147';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v148';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -8152,7 +8152,9 @@ SCREENS.surveyHub = (svUuid)=>{
         <div class="row">
           <div class="grow">
             <div class="dim small">いま現場にいるとき</div>
-            <div>${sv.status!=='調査中'
+            <div>${sv.status==='終了'
+              ? '終えました。「再開する」を押すと、また時刻と道すじを記録します'
+              : sv.status!=='調査中'
               ? '「はじめる」を押すと、時刻が自動で入り、道すじを記録します'
               : ((()=>{ const t = trackTarget();
                   return t && t.sv.uuid === svUuid
@@ -8164,6 +8166,8 @@ SCREENS.surveyHub = (svUuid)=>{
           </div>
           ${sv.status==='調査中'
             ? `<button class="btn" style="width:auto;margin:0" onclick="endSurvey('${svUuid}')">終える</button>`
+            : sv.status==='終了'
+            ? `<button class="btn" style="width:auto;margin:0" onclick="reopenSurvey('${svUuid}')">再開する</button>`
             : `<button class="btn ok" style="width:auto;margin:0" onclick="startSurvey('${svUuid}')">はじめる</button>`}
         </div>
         <div class="dim small">押さなくても記録はできます。
@@ -8219,50 +8223,82 @@ SCREENS.surveyHub = (svUuid)=>{
     onMount(){ startGps(); }
   };
 };
+/* 調査の名前（知らせに出す） */
+function surveyLabel(sv){
+  return `${sv.river_name||''} ${sv.site_name||''}`.trim() || String(sv.survey_date||'').slice(0,10) || '調査';
+}
+/* はじめる・再開する（v148・2026-10-28 の総合監査129回目で一本化）。
+   前は「再開する」が魚の地図だけ別の関数で、道すじの区切りの印を書かなかった（終える前後の線が直線でつながる）。
+   調査ハブ・物理環境の地図は終了した調査でも「はじめる」を呼び、前の終了時刻（finished_at）が残っていた */
 function startSurvey(u){
   // 閲覧のみのタブでは何も書かない（区切りの印も。書くと、記録しているタブの線が切れる。監査118回目 Major）
   if(!writeAllowed()){ toast('このタブでははじめられません。記録を入れているタブでお試しください', 7000); return; }
   const sv = DB.get(DB.key.sv, u); if(!sv) return;
   if(sv.status === '調査中'){ render(); return; }   // もう始まっている（ほかの画面・タブで押した）
-  // 道すじの区切りの印を先に端末へ書く。書けないまま始めると、読み込み直したときに前の線と
-  // 直線でつながる（監査117回目 Major）。書けなければ始めない。道すじを取らない調査（詳細・期間外）では印は要らない
   const 取る = !isDetail(sv) && surveyDays(sv).indexOf(dateValue()) >= 0;
   if(取る){
+    // 同じ日にもう1つ「調査中」があると、道すじの行き先が1つに決まらず、どちらにも残らない（監査129回目 Major）。
+    // 先にそちらを終えてもらう（終え忘れの調査が、いまの位置を黙って取り込むのも防ぐ）
+    const 他 = DB.surveys().find(x=>x.uuid!==u && x.status==='調査中' && isLiveNow(x) && !isDetail(x));
+    if(他){
+      toast(`「${surveyLabel(他)}」が調査中のままです。同時に記録できる調査は1つなので、先にそちらを終えてください`, 10000);
+      return;
+    }
+    // 道すじの区切りの印を先に端末へ書く。書けないまま始めると、読み込み直したときに前の線と
+    // 直線でつながる（監査117回目 Major）。書けなければ始めない。道すじを取らない調査（詳細・期間外）では印は要らない
     let 印 = false; try{ 印 = walkBreakSet(u); }catch(e){ 印 = false; }
     if(!印){ toast('端末に書き込めないので、はじめられませんでした（端末の空き容量をご確認ください）', 9000); return; }
   }
+  const 再開 = sv.status === '終了';
   sv.status='調査中'; sv.started_at = sv.started_at || nowISO();
-  if(DB.upsert(DB.key.sv, sv)){ startGps(); render(); }
+  delete sv.finished_at;        // 再開したら、前の終了時刻は消す（書き出しの「終了」に残さない）
+  if(DB.upsert(DB.key.sv, sv)){ startGps(); if(再開) toast('調査を再開しました'); render(); }
 }
 function endSurvey(u){
   const sv = DB.get(DB.key.sv, u); if(!sv) return;
-  // 描きかけの囲いが残っていたら終えない。勝手に閉じたり消したりもしない（2026-10-27）
-  const 描き = envPolyOpenIn(u);
+  // 描きかけの囲い（物理環境・魚のどちらも）が残っていたら終えない。勝手に閉じたり消したりもしない
+  //（2026-10-27。魚の囲いを見ていなかった＝監査129回目 Major）
+  const 描き = DB.stationsOf(u).filter(st=>envPolyDrawing(st) || polyDrawing(st));
   if(描き.length){
     toast(`描きかけの囲いがあります（${描き.map(x=>x.name||'').join('・')}）。`
       + '地図で閉じるか「描くのをやめる」を押してから終えてください', 10000);
     return;
   }
   // 通電を押しっぱなしのまま終えると、そのあとも秒数が増え続けて
-  // 単位努力量あたりの尾数が狂う（2026-08-17 の監査 Major）
-  const running = DB.stationsOf(u).filter(effortRunning);
-  for(const st of running){
+  // 単位努力量あたりの尾数が狂う（2026-08-17 の監査 Major）。
+  // 止めるのは1回の保存でまとめて。1件ずつだと途中で失敗したとき、止めた分だけが残る（監査129回目 Major）
+  let all;
+  try{ all = DB.loadRaw(DB.key.st); }
+  catch(e){ toast('記録を読み取れないため、終えられませんでした', 8000); return; }
+  const 元 = all.map(x=>Object.assign({}, x));
+  const now = nowISO();
+  const running = [];
+  for(const st of all){
+    if(!st || st.survey_uuid !== u || st.deleted_at || !effortRunning(st)) continue;
     st.effort_seconds = Math.round(effortSeconds(st));
     delete st.effort_started_at;
-    if(!DB.upsert(DB.key.st, st)){
-      toast(`${st.name} の通電を止められませんでした。調査を終えていません`, 8000);
-      return;                    // 半端な状態で終えない
+    st.updated_at = now;
+    running.push(st.name || '');
+  }
+  if(running.length && !DB.save(DB.key.st, all)){
+    toast('通電を止められませんでした。調査を終えていません（端末の空き容量をご確認ください）', 8000);
+    return;                    // 半端な状態で終えない（何も書けていない）
+  }
+  sv.status='終了'; sv.finished_at = nowISO();
+  if(!DB.upsert(DB.key.sv, sv)){
+    // 調査だけ書けなかった。止めた通電を元に戻す（戻せなければ、その旨を知らせる）
+    if(running.length){
+      const 戻せた = DB.save(DB.key.st, 元);
+      toast(戻せた ? '調査を終えられませんでした（通電は止める前に戻しました）'
+                   : '調査を終えられず、止めた通電も元に戻せませんでした。端末の空き容量をご確認ください', 10000);
     }
+    return;
   }
   if(running.length) toast(`${running.length}件の通電を止めました`);
-  sv.status='終了'; sv.finished_at = nowISO();
-  if(DB.upsert(DB.key.sv, sv)){ stopGps(); toast('調査を終えました'); render(); }
+  stopGps(); toast('調査を終えました'); render();
 }
-function reopenSurvey(u){
-  const sv = DB.get(DB.key.sv, u); if(!sv) return;
-  sv.status='調査中'; delete sv.finished_at;
-  if(DB.upsert(DB.key.sv, sv)){ render(); }
-}
+/* 再開する＝はじめると同じ（区切りの印・同時に1つ・終了時刻の消去もそろえる） */
+function reopenSurvey(u){ startSurvey(u); }
 /* 箇所はいつでも足せる。現場でも、家に帰ってからでも。
    「調査中」は、GPSで道すじを記録するかどうかの合図にすぎない */
 function newStation(svUuid){
@@ -13878,9 +13914,11 @@ SCREENS.envMap = (arg)=>{
       <div class="card">
         <div class="row">
           <div class="grow"><div class="dim small">いま現場にいるとき</div>
-            <div>${sv.status==='調査中' ? '記録中です' : '「はじめる」で時刻が入ります'}</div></div>
+            <div>${sv.status==='調査中' ? '記録中です' : sv.status==='終了' ? '終えました' : '「はじめる」で時刻が入ります'}</div></div>
           ${sv.status==='調査中'
             ? `<button class="btn" style="width:auto;margin:0" onclick="endSurvey('${svUuid}')">終える</button>`
+            : sv.status==='終了'
+            ? `<button class="btn" style="width:auto;margin:0" onclick="reopenSurvey('${svUuid}')">再開する</button>`
             : `<button class="btn ok" style="width:auto;margin:0" onclick="startSurvey('${svUuid}')">はじめる</button>`}
         </div>
       </div>
