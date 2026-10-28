@@ -73,6 +73,8 @@ button{font-family:inherit;font-size:15px;cursor:pointer}
 .pe-corner{touch-action:none;width:30px;height:30px;border-radius:50%;background:#fff;border:3px solid #f0883e;color:#04121f;
   font:700 12px/24px sans-serif;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.5)}
 .pe-corner.on{background:#f0883e;color:#fff;border-color:#fff;transform:scale(1.15)}
+.unit-site{font:700 12px/18px sans-serif;color:#fff;text-shadow:0 0 3px #000,0 0 3px #000,0 0 2px #000;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;pointer-events:none}
+input.ng{border-color:#ff6b6b}
 .envbg-name{font:700 11px/16px sans-serif;color:#fff;text-shadow:0 0 3px #000,0 0 3px #000;text-align:center;white-space:nowrap;pointer-events:none}
 .pe-plus{width:24px;height:24px;border-radius:50%;background:rgba(4,18,31,.75);border:2px solid #f0883e;color:#f0883e;
   font:700 18px/19px sans-serif;text-align:center}
@@ -151,7 +153,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v143';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v144';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -6509,6 +6511,72 @@ function surveyPos(sv){
   const sp = spotList(sv.uuid).map(stationPt).filter(Boolean)[0];
   return sp ? {lat: sp[0], lon: sp[1]} : {lat:'', lon:''};
 }
+/* 調査範囲（E）の地点名（v144・2026-10-28）。E と、その中の瀬淵・ポイントの書き出しの「地点名」になる。
+   自分から parent_uuid をたどり、最初に見つかった「地点名の入った E」の名前を使う。
+   たどるのは、生きている魚の単位で、同じ調査・同じ地点・同じ日・描きかけでない親だけ。
+   壊れた親のつながり・別の地点や日の E からは拾わない（計画点検 Major）。輪になっていても止まる。
+   見つからなければ {name:''}（これまでどおり地点・調査の地点名） */
+function unitSiteOf(st){
+  if(!st || !unitKindOf(st)) return {name:'', from:''};
+  let cur = st;
+  const seen = new Set();
+  while(cur){
+    if(seen.has(cur.uuid)) return {name:'', from:''};
+    seen.add(cur.uuid);
+    if(unitKindOf(cur) === 'E'){
+      const n = String(cur.unit_site_name || '').trim();
+      if(n) return {name:n, from: cur.name || ''};
+    }
+    const pid = cur.parent_uuid;
+    if(!pid) return {name:'', from:''};
+    const p = DB.liveStation(pid);
+    if(!p || !unitKindOf(p) || p.survey_uuid !== cur.survey_uuid || (p.spot_uuid||'') !== (cur.spot_uuid||'')
+       || unitDay(p) !== unitDay(cur) || polyDrawing(p)) return {name:'', from:''};
+    cur = p;
+  }
+  return {name:'', from:''};
+}
+function unitSiteName(st){ return unitSiteOf(st).name; }
+/* 入力欄から保存する（打つたびに保存。画面を移る・アプリを閉じても消えない）。
+   前後の空白は除き、空白だけなら空（これまでどおりの地点名）にする。保存できなければ欄の値は残し、次に打ったときにもう一度試す */
+function unitSiteSave(u, el){
+  if(!el) return false;
+  if(!writeAllowed()){
+    // 書けないタブでも、打った文字が保存されていないことが分かるようにする（監査122回目 Major）
+    el.classList.add('ng');
+    toast('このタブでは保存できません。打った地点名は保存されていません。記録を入れているタブでお試しください', 8000);
+    return false;
+  }
+  const st = DB.liveStation(u);
+  if(!st || unitKindOf(st) !== 'E') return false;
+  const v = String(el.value || '').replace(/\s+/g, ' ').trim();
+  if(String(st.unit_site_name || '') === v){ el.classList.remove('ng'); return true; }
+  st.unit_site_name = v;
+  if(!DB.upsert(DB.key.st, st)){
+    el.classList.add('ng');
+    toast('地点名を保存できませんでした（端末の空き容量をご確認ください）。打った文字は残しています', 8000);
+    return false;
+  }
+  el.classList.remove('ng');
+  try{ fishDrawAll(st.survey_uuid); }catch(e){}   // 地図の札だけ描き直す（画面は描き直さない＝打っている途中を壊さない）
+  return true;
+}
+/* E の欄の地点名の入力欄。中の瀬淵・ポイントには、どの E の地点名かを出す */
+function unitSiteHtml(cur, sv){
+  if(!cur) return '';
+  const k = unitKindOf(cur);
+  if(k === 'E'){
+    const 元 = spotInfoOf(sv, Object.assign({}, cur, {unit_site_name:''})).site || '';
+    return `<label class="dim small" style="display:block;margin:6px 0 2px">地点名（書き出しの「地点名」になります。中の瀬淵・ポイントも同じ）</label>
+      <input id="fishSiteName" value="${esc(cur.unit_site_name || '')}" placeholder="${esc(元 ? '空なら「' + 元 + '」' : '例: 幾品川橋上流')}"
+        oninput="unitSiteSave('${cur.uuid}', this)" onchange="unitSiteSave('${cur.uuid}', this)" autocomplete="off">`;
+  }
+  if(k){
+    const o = unitSiteOf(cur);
+    if(o.name) return `<div class="dim small" style="margin:4px 0">地点名: <b>${esc(o.name)}</b>（${esc(o.from)} から）</div>`;
+  }
+  return '';
+}
 function spotInfoOf(sv, st){
   const s = st || {};
   // 地図で作った記録は、自分では地点情報を持たない。
@@ -6527,7 +6595,8 @@ function spotInfoOf(sv, st){
   const pick = k => 地点あり ? (sp[k] || sv[k] || '') : (s[k] || sv[k] || '');
   return {
     section: pick('section_name'),
-    site:    pick('site_name'),
+    // 魚の単位は、祖先の調査範囲（E）に地点名があればそれ（v144）
+    site:    (unitKindOf(s) ? unitSiteName(s) : '') || pick('site_name'),
     formA:   pick('river_morphology_a'),
     weather: pick('weather'),
     memo:    pick('memo'),
@@ -10014,6 +10083,14 @@ function fishDrawAll(svUuid){
     });
     // 名前は、いちばん北の角に置く。真ん中に置くと、入れ子の囲いどうしで重なる
     const c = pts.slice().sort((a,b)=>b[0]-a[0])[0];
+    // 調査範囲の地点名（v144）。札の右に、触っても反応しない文字で添える。長い名前は14文字で切る
+    const 地点名 = k === 'E' ? String(st.unit_site_name || '').trim() : '';
+    if(c && 地点名){
+      const 短 = 地点名.length > 14 ? 地点名.slice(0, 14) + '…' : 地点名;
+      FISHLAYER.push(L.marker(c, {interactive:false, keyboard:false, zIndexOffset: on ? 999 : -1,
+        icon:L.divIcon({className:'', iconSize:[160,18], iconAnchor:[-16,9],
+          html:`<div class="unit-site">${esc(短)}</div>`})}).addTo(map));
+    }
     if(c) FISHLAYER.push(L.marker(c, {icon:envBadge(st.name||'', col, on?30:24, on, true),
       zIndexOffset: on ? 1000 : 0})
       .on('click', e=>{ L.DomEvent.stop(e); fishMapTap(svUuid, e.latlng); }).addTo(map));
@@ -13350,6 +13427,7 @@ SCREENS.fishMap = (arg)=>{
           <button class="btn sm ng" style="width:auto;margin:0"
             onclick="fishDelete('${cur.uuid}')">消す</button>
         </div>
+        ${unitSiteHtml(cur, sv)}
         ${polyEditPanelHtml(cur)}${polyEditButtonsHtml(cur)}
         ${(()=>{
           // 開始時刻が空だと、この単位の記録は書き出せない・送れない。
