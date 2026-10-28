@@ -153,7 +153,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v146';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v147';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -3562,6 +3562,7 @@ let EFFORT_TIMER = null;
 let ENV_GPS_TIMER = null;
 /* いま出ている画面の見分け。同じ画面を作り直すときは、見ていた位置を保つ */
 let SCREEN_AT = '';
+let SCREEN_PREV = '';   // 1つ前に出ていた画面（v147。地図へ戻ったとき、選んだ単位の欄まで送るかの判断に使う）
 function screenKey(cur){
   if(!cur) return '';
   let a = '';
@@ -3628,6 +3629,7 @@ function render(){
       ? `<div class="ngbox">${esc(LOCK_WHY)}</div>` : '') + (v.html || '');
   const いまの画面 = screenKey(STACK[STACK.length-1]);
   if(いまの画面 !== 前の画面) PICK_SET = null;   // 画面を移ったら、選ぶのはやめる
+  SCREEN_PREV = 前の画面;
   SCREEN_AT = いまの画面;
   // 同じ画面なら、見ていた位置に戻す。別の画面なら先頭から
   window.scrollTo(0, (いまの画面 && いまの画面 === 前の画面) ? 前の位置 : 0);
@@ -9065,17 +9067,20 @@ const MAP_WORK = {};
    同じ画面のなかの描き直しでは選びかけを保ち、
    地点へ戻ってから同じ地図を開いたときは選び直しから始める（監査55回目 Major） */
 let SEL_NAV_AT = -1;
+/* 戻り値は「入り直したか」。開いたときに指名された記録（record）を選ぶのは、入り直したときだけにする。
+   毎回選び直すと、指名つきで開いた地図（測り終える・保存のあと・「地図で見る」から）で
+   ほかの単位の名前を押しても、描き直すたびに指名した記録へ戻ってしまい、選び替えられない（v147） */
 function selResetOnSpotChange(svUuid, spot){
   const key = mapViewKey(svUuid, spot);
   const 入り直した = SEL_NAV_AT !== NAV_SEQ;
   SEL_NAV_AT = NAV_SEQ;
-  if(SEL_SPOT_AT === key && !入り直した) return;
+  if(SEL_SPOT_AT === key && !入り直した) return 入り直した;
   if(SEL_SPOT_AT === key && 入り直した){
     // 同じ地点へ入り直しただけ。描きかけは残し、選んでいる記録だけ手放す
     FISH_SEL = null; FISH_PICK = ''; ENV_SEL = null;
     try{ ENV_MOVE = null; }catch(e){}
     try{ ENV_PICK = null; }catch(e){}
-    return;
+    return 入り直した;
   }
   // 覚えておくのは「描きかけ」だけ。
   // 選んでいる記録まで覚えて戻すと、調査を開き直したときに
@@ -9097,6 +9102,7 @@ function selResetOnSpotChange(svUuid, spot){
                auto: 同じ調査 ? ENV_NEXT.auto : false,
                line: w.line || '', survey: svUuid};
   FISH_SEL = null; FISH_PICK = ''; ENV_SEL = null;
+  return 入り直した;
 }
 /* この地点の地図で作った記録か。地点から開いていないときは、調査ぜんぶが対象 */
 function ofSpot(st, spot){
@@ -13378,14 +13384,15 @@ SCREENS.fishMap = (arg)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
   const spot = mapEnterSpot(svUuid, 頼まれた, 未所属だけ);   // 一覧を作る前に決める
-  selResetOnSpotChange(svUuid, spot);   // 描きかけを控えてから、調査を切り替える
+  const 入り直した = selResetOnSpotChange(svUuid, spot);   // 描きかけを控えてから、調査を切り替える
   fishUseSurvey(svUuid);
   // 読み込み直したあとも、描きかけの続きから再開できるようにする
   if(!FISH_NEXT.draw){
     const 途中 = mapStations(svUuid, 'fish').filter(polyDrawing)[0];
     if(途中) FISH_NEXT = {kind:FISH_NEXT.kind, draw:途中.uuid, survey:svUuid};
   }
-  if(指名 && mapStations(svUuid, 'fish', spot).some(x=>x.uuid===指名)) FISH_SEL = 指名;
+  // 指名された記録を選ぶのは入り直したときだけ（同じ画面の描き直しでは、選び替えたものを保つ。v147）
+  if(入り直した && 指名 && mapStations(svUuid, 'fish', spot).some(x=>x.uuid===指名)) FISH_SEL = 指名;
   const list = mapStations(svUuid, 'fish');
   const 描き中 = fishDrawing();
   // いま開いている調査のものだけを選べる（ほかの調査の記録に書き込ませない）
@@ -13685,9 +13692,25 @@ SCREENS.fishMap = (arg)=>{
         }
         fishRememberView(svUuid);
       }
+      // 入力の画面から戻ってきたときは、選んだ単位の欄まで送る（v147）
+      try{
+        const 前 = String(SCREEN_PREV || '').split('|')[0];
+        if(cur && FISH_RETURN_FROM.indexOf(前) >= 0) fishScrollToCard();
+      }catch(e){}
     }
   };
 };
+/* 魚種の詳細・1尾ずつ・川の環境の画面から魚の地図へ戻ってきたとき、選んだ単位の欄まで送る（v147）。
+   画面を移ると先頭（地図）から出るので、そのたびに地図の下まで送り直していた（2026-10-28 の実機の声）。
+   単位を選び替えたとき（同じ地図の中）は、これまでどおり先頭から */
+const FISH_RETURN_FROM = ['catchEdit', 'individuals', 'speciesPick', 'env'];
+function fishScrollToCard(){
+  const el = $('#fishUnitCard'); if(!el) return false;
+  const hdr = document.querySelector('header');
+  const h = hdr ? hdr.offsetHeight : 0;
+  window.scrollTo(0, Math.max(0, el.getBoundingClientRect().top + (window.scrollY || 0) - h - 6));
+  return true;
+}
 /* いまの状態を、地図の下の一行に出す */
 function fishSyncHint(){
   const el = $('#fishHint'); if(!el) return;
@@ -13757,9 +13780,10 @@ SCREENS.envMap = (arg)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
   if(!sv) return null;
   const spot = mapEnterSpot(svUuid, 頼まれた, 未所属だけ);   // 一覧を作る前に決める
-  selResetOnSpotChange(svUuid, spot);   // 描きかけを控えてから、調査を切り替える
+  const 入り直した = selResetOnSpotChange(svUuid, spot);   // 描きかけを控えてから、調査を切り替える
   envUseSurvey(svUuid);        // 別の調査から持ち越さない
-  if(指名 && mapStations(svUuid, 'env', spot).some(x=>x.uuid===指名)) ENV_SEL = 指名;
+  // 指名された記録を選ぶのは入り直したときだけ（同じ画面の描き直しでは、選び替えたものを保つ。v147）
+  if(入り直した && 指名 && mapStations(svUuid, 'env', spot).some(x=>x.uuid===指名)) ENV_SEL = 指名;
   const all = DB.stationsOf(svUuid);
   // メッシュの範囲は位置の持ち方が違うので、点・線の並びに混ぜない。
   // 混ぜると、位置の無い点として並んでしまう。
@@ -15331,7 +15355,7 @@ function saveCatch(stUuid, caUuid, spId, next){
     if(STACK.length>1 && STACK[STACK.length-2].name==='speciesPick'){ STACK.pop(); render(); }
     else navReplace('speciesPick', stUuid);
   }
-  else { goTo('station', stUuid); }
+  else { goToRecordHome(stUuid); }
 }
 /* 「1尾ずつ測る」へ。記録がまだ無ければ先に作る（個体は記録にぶら下がるため） */
 function toIndividuals(stUuid, caUuid, spId){
@@ -15372,7 +15396,7 @@ function deleteCatch(u){
   const c = DB.get(DB.key.ca, u);
   if(DB.softDelete(DB.key.ca, u)){
     draftClearFor('魚', u);
-    toast('削除しました'); goTo('station', c?c.station_uuid:null);
+    toast('削除しました'); goToRecordHome(c?c.station_uuid:null);
   }
 }
 
@@ -15947,23 +15971,43 @@ SCREENS.individuals = (caUuid)=>{
   };
 };
 
+/* 記録を入れ終えた・消したあとの行き先。
+   地図で作った記録（E・P/F・P）なら、その地点の魚の地図へ（その単位を選んだまま）。
+   前のやり方の箇所なら、箇所の画面へ。
+   「保存する」「削除する」は箇所の画面へ送っていたので、地図の単位だと前のやり方の画面が開き、
+   戻ると調査（地図の先頭）まで戻っていた（2026-10-28 の実機の声）。測り終えると同じ道にそろえる（v147） */
+function goToRecordHome(stUuid){
+  const st = stUuid ? DB.liveStation(stUuid) : null;
+  if(st && unitKindOf(st)){
+    // 地点のある調査で、どの地点にも属さない単位は「その分だけの地図」で開く（mapOpenRecord と同じ）
+    const 地点あり = spotList(st.survey_uuid).some(x=>x.is_spot);
+    const arg = {survey: st.survey_uuid, spot: st.spot_uuid || '', record: st.uuid,
+                 loose: (地点あり && !st.spot_uuid) ? 1 : 0};
+    NAV_SEQ++;
+    STACK = buildChain('fishMap', arg);
+    // 地点が無いと道すじは「ホーム > 調査」で終わり、調査の画面が地図を出すかは調査の設定しだい。
+    // 必ずその単位の地図に戻るよう、地図の画面を明示的に積む（監査126回目 Major）。
+    // 地図で記録する調査（調査の画面がそのまま地図）では、調査を重ねずに「ホーム > 地図」にする。
+    // 重ねると同じ地図が2段になり、「戻る」を1回押しても画面が変わらない（監査127回目 Major）
+    if(STACK[STACK.length-1].name !== 'fishMap'){
+      if(fishMapEntry(DB.getAlive(DB.key.sv, st.survey_uuid))) STACK = [{name:'home', arg:null}];
+      STACK.push({name:'fishMap', arg});
+    }
+    FISH_SEL = st.uuid;
+    render();
+    return;
+  }
+  goTo('station', stUuid);
+}
 /* 測る魚種を切り替える。画面は積み上げず、入れ替える */
 /* 測り終えたら、その記録の魚類調査の画面へ戻る（2026-08-24 の実機の声）。
    goBack だと、魚種の選び直しなどで積んだ画面の分だけ戻りすぎて、
-   地点の一覧まで飛んでしまうことがあった。
-   地図で作った記録（E・P/F・P）なら、その地点の魚の地図へ。
-   前のやり方の箇所なら、箇所の画面へ */
+   地点の一覧まで飛んでしまうことがあった */
 function measureDone(caUuid){
   const c = DB.getAlive(DB.key.ca, caUuid);
   const st = c ? DB.liveStation(c.station_uuid) : null;
   if(!st){ goBack(); return; }
-  if(unitKindOf(st)){
-    FISH_SEL = st.uuid;
-    goTo('fishMap', {survey: st.survey_uuid, spot: st.spot_uuid || '',
-                     record: st.uuid});
-    return;
-  }
-  goTo('station', st.uuid);
+  goToRecordHome(st.uuid);
 }
 function switchMeasure(caUuid){
   navReplace('individuals', caUuid);
