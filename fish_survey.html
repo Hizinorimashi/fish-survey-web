@@ -153,7 +153,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v150';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v151';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -2914,10 +2914,17 @@ function polyInsidePoly(a, b){
    （2026-08-20 の監査 Major） */
 const UNIT_RANK = {E:1, PF:2, P:3};
 /* 単位の日。日付の欄が無い前の版のものは、調査の初日として扱う */
+/* 候補の記録の組で親子を見るとき、その組の調査をここに置く（端末のDBに無い調査でも日付を引ける。監査140回目 Major 2） */
+let UNIT_SV_LOOKUP = null;
+function unitSurveyOf(svUuid){
+  // 候補の表が立っている間は、表に無い調査を端末のDBで補わない（候補だけで決める。監査141回目 Major 1）
+  if(UNIT_SV_LOOKUP) return UNIT_SV_LOOKUP[svUuid] || null;
+  return DB.getAlive(DB.key.sv, svUuid);
+}
 function unitDay(st){
   if(!st) return '';
   if(st.survey_date) return String(st.survey_date).slice(0,10);
-  const sv = DB.getAlive(DB.key.sv, st.survey_uuid);
+  const sv = unitSurveyOf(st.survey_uuid);
   return sv ? stationDate(st, sv) : '';
 }
 function unitParentOf(st, list){
@@ -3077,8 +3084,13 @@ function envHasOwn(st){
    止めてしまうと、そのあと河川区分（瀬淵）に分けられなくなる。
    しかも「中の単位へ移す」道具が無いので、詰んでしまう */
 function unitHasOwn(st){
+  return unitHasOwnIn(st, st ? DB.catchesOf(st.uuid) : []);
+}
+/* 渡された魚の記録（候補）で判定する版。合成・ドライブから戻す・ごみ箱から戻すのように、
+   まだ端末に書いていない記録の組で親子の決まりを確かめるときに使う（計画点検 2026-10-28 Major 2。v151） */
+function unitHasOwnIn(st, catches){
   if(!st) return '';
-  if(DB.catchesOf(st.uuid).length) return '魚の記録';
+  if((catches||[]).some(c=>c && !c.deleted_at && c.station_uuid===st.uuid)) return '魚の記録';
   if(gearCount(st)) return '漁具';
   // 0秒は「押してすぐ止めた」だけ。これで子を作れなくなると、消す手が無い
   //（監査49回目 Major）
@@ -6291,7 +6303,8 @@ function csvCell(v){
   v = v==null ? '' : String(v);
   // Excelの数式として読まれるのを防ぐ。数値（マイナスの緯度経度など）はそのまま通す
   if(/^[=+\-@\t\r]/.test(v) && !/^[+-]?\d+(\.\d+)?$/.test(v)) v = "'"+v;
-  return /[",\n]/.test(v) ? '"'+v.replace(/"/g,'""')+'"' : v;
+  // \r も引用する。引用しないと、先頭が \r の値で行が切れる（監査141回目 Minor）
+  return /[",\r\n]/.test(v) ? '"'+v.replace(/"/g,'""')+'"' : v;
 }
 function toCsv(cols, rows){
   return [cols.join(',')].concat(rows.map(r=>cols.map(c=>csvCell(r[c])).join(','))).join('\r\n');
@@ -9396,6 +9409,68 @@ function polyProblem(pts){
    1尾ずつの記録は魚の記録にぶら下がっているので、一緒についてくる */
 const 移す欄 = ['gears','effort_seconds','effort_started_at','effort_passes',
                 'width_m','length_m_manual','area_m2_manual'];
+/* 親の自前の記録（魚・漁具・通電・距離・面積・回数・川幅）を中の単位へ移す（画面から）。
+   前の版で作られた「記録の入った親の中に記録の入った子」を直す道具（監査140回目 Major 4。v151） */
+function unitMoveOwnTo(親uuid, 子uuid){
+  if(!writeAllowed()){ toast('このタブでは直せません。記録を入れているタブでお試しください', 7000); return false; }
+  const 親 = DB.liveStation(親uuid), 子 = DB.liveStation(子uuid);
+  if(!親 || !子){ toast('その記録はもうありません', 6000); return false; }
+  // 移す先の中にも記録の入った単位があると、今度はそこで二重になる。いちばん小さい単位へ
+  const list = DB.stationsOf(子.survey_uuid);
+  const 中 = unitDescendants(子uuid, list).map(u=>(typeof u === 'string') ? list.find(x=>x.uuid===u) : u).filter(x=>x && unitHasOwn(x));
+  if(中.length){ toast(`${子.name||''} の中の ${中.map(x=>x.name||'').join('・')} にも記録があります。いちばん小さい単位へ移してください`, 9000); return false; }
+  if(!confirm(`${親.name||''} に入っている${unitHasOwn(親)||'記録'}を、${子.name||''} へ移します。よろしいですか？`)) return false;
+  const r = unitMoveOwn(親uuid, 子uuid);
+  if(r && r.conflict){
+    toast(`${子.name||''} にも ${r.conflict.join('・')} が入っているので移せません（移すと ${親.name||''} の値が消えます）。`
+      + '先にどちらかを直してから、もう一度お試しください', 12000);
+    return false;
+  }
+  if(r === 'broken'){ toast('移す途中で失敗し、元に戻せませんでした。「データを点検」をお試しください', 12000); render(); return false; }
+  if(!r){ toast('移せませんでした（端末の空き容量をご確認ください）', 8000); return false; }
+  toast(`${親.name||''} の記録を ${子.name||''} へ移しました`);
+  render();
+  return true;
+}
+/* 親の自前の記録を消す（魚の記録はごみ箱へ・漁具/通電などは外す）。1回ずつの保存で、途中で失敗したら元に戻す */
+function unitClearOwn(親uuid){
+  if(!writeAllowed()){ toast('このタブでは直せません。記録を入れているタブでお試しください', 7000); return false; }
+  const 親 = DB.liveStation(親uuid);
+  if(!親){ toast('その記録はもうありません', 6000); return false; }
+  const 何 = unitHasOwn(親);
+  if(!何) return true;
+  if(!confirm(`${親.name||''} に入っている${何}を消します（魚の記録はごみ箱に入ります）。よろしいですか？`)) return false;
+  let sts, cas, 元st, 元ca;
+  try{ sts = DB.loadRaw(DB.key.st); cas = DB.loadRaw(DB.key.ca); 元st = JSON.parse(JSON.stringify(sts)); 元ca = JSON.parse(JSON.stringify(cas)); }
+  catch(e){ toast('記録を読み取れないため、消しませんでした', 8000); return false; }
+  const p = sts.find(x=>x && x.uuid===親uuid && !x.deleted_at);
+  if(!p){ toast('その記録はもうありません', 6000); return false; }
+  const t = nowISO();
+  移す欄.forEach(k=>{ if(p[k] !== undefined) delete p[k]; });
+  p.updated_at = t;
+  cas.forEach(c=>{ if(c && !c.deleted_at && c.station_uuid===親uuid){ c.deleted_at = t; c.updated_at = t; } });
+  if(!DB.save(DB.key.st, sts)){ toast('消せませんでした（端末の空き容量をご確認ください）', 8000); return false; }
+  if(!DB.save(DB.key.ca, cas)){
+    let 戻せた = false; try{ 戻せた = DB.save(DB.key.st, 元st); }catch(e){}
+    toast(戻せた ? '消せませんでした（端末の空き容量をご確認ください）' : '消す途中で失敗し、元に戻せませんでした。「データを点検」をお試しください', 12000);
+    return false;
+  }
+  toast(`${p.name||''} の${何}を消しました`);
+  render();
+  return true;
+}
+/* 親と子の両方に値がある項目（移すと親の値が消えるもの）。無ければ空 */
+const 移す欄の名前 = {gears:'漁具', effort_seconds:'通電', effort_started_at:'通電（計測中）', effort_passes:'流した回数',
+                     width_m:'川幅', length_m_manual:'距離（手入力）', area_m2_manual:'面積（手入力）'};
+function unitMoveConflicts(親, 子){
+  const 値あり = (x, k)=>{
+    const v = x ? x[k] : undefined;
+    if(v === undefined || v === null || v === '') return false;
+    if(Array.isArray(v)) return v.length > 0;
+    return true;
+  };
+  return 移す欄.filter(k=>値あり(親, k) && 値あり(子, k)).map(k=>移す欄の名前[k] || k);
+}
 function unitMoveOwn(親uuid, 子uuid){
   // 1つの入れ物につき1回の保存にまとめる。別々に保存すると、
   // 途中で失敗したとき親と子の両方に値が残る（監査71回目 Minor）
@@ -9410,6 +9485,9 @@ function unitMoveOwn(親uuid, 子uuid){
   const 親 = sts.find(x=>x && x.uuid===親uuid);
   const 子 = sts.find(x=>x && x.uuid===子uuid);
   if(!親 || !子) return false;
+  // 親子の両方に同じ項目があると、親の値を黙って捨てることになる。1つでもあれば何も変えずに断る（監査142回目 Critical 2）
+  const ぶつかる = unitMoveConflicts(親, 子);
+  if(ぶつかる.length) return {conflict: ぶつかる};
   const t = nowISO();
   移す欄.forEach(k=>{
     if(親[k] === undefined || 親[k] === '') return;
@@ -9657,6 +9735,10 @@ function unitParentMap(list){
 /* 形・種類を変える前と後の親を比べ、新しくできる親子の親に「数に響く記録」があれば理由の並びを返す。
    もとからある親子（今回変わらないもの）は理由にしない */
 function unitNewParentProblems(before, after){
+  return unitNewParentProblemsIn(before, after, null);
+}
+/* 同上。catches を渡せば、その魚の記録（候補）で親の自前の記録を見る。null なら端末のDB */
+function unitNewParentProblemsIn(before, after, catches){
   const 前 = unitParentMap(before), 後 = unitParentMap(after);
   const 名 = u=>((before.find(x=>x.uuid===u) || after.find(x=>x.uuid===u) || {}).name || '');
   const out = [];
@@ -9664,10 +9746,78 @@ function unitNewParentProblems(before, after){
     const p = 後[st.uuid];
     if(!p || p === 前[st.uuid]) return;
     const 親 = after.find(x=>x.uuid===p);
-    const 何 = unitHasOwn(親);
+    const 何 = catches ? unitHasOwnIn(親, catches) : unitHasOwn(親);
     if(何) out.push(`${名(p)} に${何}が入っています（${名(st.uuid)} が中に入るため）`);
   });
   return {problems: out, parents: 後};
+}
+/* 記録の組（stations・catches）ぜんたいが「記録の入った親の中に記録の入った子」を持たないか。
+   合成・ドライブから戻す・JSONの取り込み・修復前の控えへの置き換えのように、記録を丸ごと入れ替える前に見る。
+   違反の文の並びを返す（無ければ空）。調査ごとに見る（親子は同じ調査の中だけ） */
+function unitParentProblemsIn(stations, catches, surveys){
+  return unitParentProblemKeysIn(stations, catches, surveys).map(x=>x.text);
+}
+/* 同上。{key:'調査|親|子', text:'文'} の並びで返す。戻す前後の差（新しくできる違反だけ）を見るときに使う */
+function unitParentProblemKeysIn(stations, catches, surveys){
+  const out = [];
+  const 調査 = {};
+  (stations||[]).forEach(x=>{ if(x && !x.deleted_at && unitKindOf(x)) (調査[x.survey_uuid] || (調査[x.survey_uuid] = [])).push(x); });
+  // 候補の調査（渡されたもの）で日付と名前を引く。端末のDBにまだ無い調査でも候補だけで決まる（監査140回目 Major 2）
+  const 前の表 = UNIT_SV_LOOKUP;
+  const 表 = {};
+  // 渡されなければ、端末の生きている調査を候補にする（丸ごと置き換え・合成・戻すは、それぞれの候補を渡す）
+  const 元 = surveys || DB.alive(DB.key.sv);
+  (元||[]).forEach(sv=>{ if(sv && sv.uuid && !sv.deleted_at) 表[sv.uuid] = sv; });
+  UNIT_SV_LOOKUP = 表;
+  try{
+    Object.keys(調査).forEach(su=>{
+      const units = 調査[su];
+      const ready = units.filter(unitReady);
+      const m = unitParentMap(ready);
+      const 名 = u=>((units.find(x=>x.uuid===u) || {}).name || '');
+      const 見た = {};
+      ready.forEach(st=>{
+        const p = m[st.uuid]; if(!p) return;
+        const 親 = units.find(x=>x.uuid===p);
+        const 何 = unitHasOwnIn(親, catches);
+        if(!何) return;
+        const k = su + '|' + p + '|' + st.uuid; if(見た[k]) return; 見た[k] = true;
+        const sv = unitSurveyOf(su);
+        out.push({key:k, text:`${sv ? surveyLabel(sv) + 'の' : ''}${名(p)} に${何}が入っています（${名(st.uuid)} が中に入るため）`});
+      });
+    });
+  }finally{ UNIT_SV_LOOKUP = 前の表; }
+  return out;
+}
+/* 魚の単位を1つ消す（親子の付け直しまで1回の保存で）。
+   消すと中の単位が上の囲いに付き直るので、その上の囲いに記録が入っていれば断る（検査=true）。
+   前は「消す」と「付け直す」が別の保存で、片方だけ失敗すると消えた親を指す子が残った（総合監査130回目 Major 4・計画点検 Major 3。v151）
+   戻り値 {ok:true} か {why:'理由'} */
+function unitDeleteOne(u, 検査){
+  let all;
+  try{ all = DB.loadRaw(DB.key.st); }catch(e){ return {why:'記録を読み取れないため、消しませんでした'}; }
+  const st = all.find(x=>x && x.uuid===u && !x.deleted_at);
+  if(!st) return {ok:true};
+  const sv = st.survey_uuid;
+  const units = ()=>all.filter(x=>x && !x.deleted_at && x.survey_uuid===sv && unitKindOf(x));
+  const before = units().map(x=>Object.assign({}, x));
+  const t = nowISO();
+  st.deleted_at = t; st.updated_at = t;
+  const after = units();
+  if(検査){
+    let cas = [];
+    try{ cas = DB.load(DB.key.ca).filter(c=>c && !c.deleted_at); }catch(e){ return {why:'記録を読み取れないため、消しませんでした'}; }
+    const 問題 = unitNewParentProblemsIn(before, after, cas).problems;
+    if(問題.length) return {why:`${st.name||''} を消すと、${問題.join('。')}。先にその記録を中の単位へ移すか消してください`};
+  }
+  // 親子を付け直す（unitRelink と同じ決まり。描きかけは親にも子にもしない）
+  const 対象 = after.filter(unitReady);
+  after.forEach(x=>{
+    const p = unitReady(x) ? unitParentOf(x, 対象) : '';
+    if((x.parent_uuid||'') !== p){ x.parent_uuid = p; x.updated_at = t; }
+  });
+  if(!DB.save(DB.key.st, all)) return {why:'消せませんでした（端末の空き容量をご確認ください）'};
+  return {ok:true};
 }
 /* 保存する。対象の記録を書き換えたうえで、親が変わった単位の parent_uuid と時刻もそろえ、
    fs_stations をまるごと1回で書く（途中で失敗して形と親子が食い違わないように） */
@@ -9918,6 +10068,8 @@ function fishClosePoly(svUuid){
       toast(移し === 'broken'
         ? '移す途中で書けなくなり、半端な状態になっています。'
           + '「データ点検」を開いてご確認ください'
+        : (移し && 移し.conflict)
+        ? `${st.name} にも ${移し.conflict.join('・')} が入っているので移せません。閉じるのをやめました`
         : '移せませんでした（端末の空き容量をご確認ください）。'
           + 'そのままにしてあります', 10000);
       return false;
@@ -9945,12 +10097,10 @@ function fishUndoCorner(svUuid){
   }
   const pts = (st.poly||[]);
   if(pts.length <= 1){
-    if(!DB.softDelete(DB.key.st, st.uuid)){
-      toast('取り消せませんでした', 6000); return false;
-    }
+    const r = unitDeleteOne(st.uuid, false);   // 消すのと親子の付け直しを1回の保存で
+    if(r.why){ toast(r.why, 8000); return false; }
     FISH_NEXT = {kind:FISH_NEXT.kind, draw:'', survey:FISH_NEXT.survey};
     if(FISH_SEL === st.uuid) FISH_SEL = null;
-    unitRelink(st.survey_uuid);   // 消えた囲いを親に持ったままにしない
     toast('最初の角を取り消したので、囲いを描くのをやめました', 5000);
     render();
     return true;
@@ -9969,10 +10119,10 @@ function fishCancelPoly(){
   const st = fishDrawing();
   if(!st) return false;
   if(!confirm(`${st.name} を描くのをやめます。よろしいですか？`)) return false;
-  if(!DB.softDelete(DB.key.st, st.uuid)) return false;
+  const r = unitDeleteOne(st.uuid, false);   // 消すのと親子の付け直しを1回の保存で
+  if(r.why){ toast(r.why, 8000); return false; }
   FISH_NEXT = {kind:FISH_NEXT.kind, draw:'', survey:FISH_NEXT.survey};
   if(FISH_SEL === st.uuid) FISH_SEL = null;
-  unitRelink(st.survey_uuid);     // 消えた囲いを親に持ったままにしない
   toast('やめました');
   return true;
 }
@@ -10617,6 +10767,34 @@ function trashRestore(k, uuid){
   // 親から順に戻す。親が戻らないまま子だけ戻すと、見えない記録になる
   // （2026-08-20 の監査 Major）
   const 順 = 一緒に.slice().reverse().concat([{k, uuid}]);
+  // 戻したあとの親子を先に試算する。記録の入った親の中に、記録の入った単位が戻ると二重に数える
+  //（総合監査130回目 Major 1・v151）。戻す単位と一緒に戻る魚の記録も候補に入れて見る
+  {
+    const 戻すst = new Set(順.filter(p=>p.k==='st').map(p=>p.uuid));
+    const 戻すca = new Set(順.filter(p=>p.k==='ca').map(p=>p.uuid));
+    if(戻すst.size || 戻すca.size){
+      let stAll, caAll, svAll;
+      try{ stAll = DB.loadRaw(DB.key.st); caAll = DB.loadRaw(DB.key.ca); svAll = DB.loadRaw(DB.key.sv); }
+      catch(e){ toast('記録を読み取れないため、戻せませんでした', 8000); return false; }
+      const 戻すsv = new Set(順.filter(p=>p.k==='sv').map(p=>p.uuid));
+      const 生き = a=>a.filter(x=>x && !x.deleted_at);
+      const 候補st = stAll.map(x=>(x && 戻すst.has(x.uuid)) ? Object.assign({}, x, {deleted_at: undefined}) : x)
+        .filter(x=>x && !x.deleted_at);
+      const 候補ca = caAll.map(x=>(x && 戻すca.has(x.uuid)) ? Object.assign({}, x, {deleted_at: undefined}) : x)
+        .filter(x=>x && !x.deleted_at);
+      // 調査も一緒に戻るときは、その調査を候補に入れる（日付の無い前の版の単位は調査の日付で親子を決める。監査141回目 Major 1）
+      const 候補sv = svAll.map(x=>(x && 戻すsv.has(x.uuid)) ? Object.assign({}, x, {deleted_at: undefined}) : x)
+        .filter(x=>x && !x.deleted_at);
+      // 戻す前の違反（前の版で作られたもの）はそのまま。戻したことで新しくできる違反だけを断る。
+      // 魚の記録だけを戻すとき（親子は変わらないが、親に記録が生じる）も、この差で拾える（監査140回目 Major 1）
+      const 前 = new Set(unitParentProblemKeysIn(生き(stAll), 生き(caAll), 生き(svAll)).map(x=>x.key));
+      const 問題 = unitParentProblemKeysIn(候補st, 候補ca, 候補sv).filter(x=>!前.has(x.key)).map(x=>x.text);
+      if(問題.length){
+        toast(`戻せません。${問題.join('。')}。先にその記録を中の単位へ移すか消してから戻してください`, 12000);
+        return false;
+      }
+    }
+  }
   const 戻した = [];
   for(const pa of 順){
     let r = false;
@@ -11230,6 +11408,16 @@ function cloudDraftReset(){
   try{ ENV_HIST = []; ENV_SEL = null; ENV_MOVE = null; }catch(e){}
   try{ POLY_EDIT = null; }catch(e){}   // 囲いの直しかけも、置き換え前の形を指したままになるので捨てる
 }
+function cloudApplyViolationOk(data){
+  if(data && data.__violationOk){ delete data.__violationOk; return true; }
+  const 違反 = unitParentProblemsIn((data && data.st) || [], (data && data.ca) || [], (data && data.sv) || []);
+  if(!違反.length) return true;
+  const 文 = `置き換える記録に、数が二重になる組があります。\n${違反.join('\n')}\n\n`
+    + 'ふつうは、元の端末で親の記録を中の単位へ移すか消してから、もう一度お試しください。\n'
+    + '元の端末がもう無いなどで、それでも置き換えるときは OK を押してください（置き換えたあと、魚の地図のその囲いで「中の単位へ移す／消す」ができます）';
+  if(!confirm(文)){ toast('置き換えませんでした（何も変えていません）', 8000); return false; }
+  return true;
+}
 function cloudApply(data, 新しい墓標){
   // 通信を待っている間に、別のタブへ使用権が移ることがある。
   // そのまま置き換えると、別のタブで入れた記録を消す（監査38回目 Critical）
@@ -11237,6 +11425,10 @@ function cloudApply(data, 新しい墓標){
     toast('このタブでは戻せません。記録を入れているタブでお試しください', 8000);
     return false;
   }
+  // 置き換える記録の組に「記録の入った親の中に記録の入った子」があれば、まず断る（計画点検 2026-10-28 Major 1・v151）。
+  // ただし元の端末がもう無いと直す手が無くなるので、理由を見せたうえで「それでも置き換える」は選べる。
+  // 置き換えたあとは、魚の地図のその囲いに「中の単位へ移す／消す」の道具が出る（監査140回目 Major 4）
+  if(!cloudApplyViolationOk(data)) return false;
   const 元 = {};
   try{ CLOUD_KEYS.forEach(k=>{ 元[k] = DB.loadRaw(DB.key[k]); }); }
   catch(e){ toast('いまの記録を読み取れないため、戻せませんでした', 8000); return false; }
@@ -11977,23 +12169,34 @@ async function cloudMerge(){
     toast('打ちかけを保存できないため、合成をやめました', 10000);
     return;
   } }catch(e){}
+  // 端末に書けず画面の中（メモリ）だけに残った入力も、同じ控えに入れる。
+  // 容量が足りないときこそ、ここにしか残っていない（監査82回目 Major）。
+  // ただし控えを書くのは、下の違反判定に通ってから（断るときは控えも増やさない。監査140回目 Major 3）
+  let 残り = {};
   try{
-    const 残り = Object.assign({}, draftAll());
-    // 端末に書けず画面の中（メモリ）だけに残った入力も、同じ控えに入れる。
-    // 容量が足りないときこそ、ここにしか残っていない（監査82回目 Major）
+    残り = Object.assign({}, draftAll());
     Object.keys(DRAFT_HOLD).forEach(k2=>{
       if(DRAFT_HOLD[k2]) 残り[k2] = DRAFT_HOLD[k2];
     });
-    if(Object.keys(残り).length
-       && !repairBackupPush({種類:'合成前の書きかけ', 中身: 残り})){
-      toast('書きかけの控えを取れなかったため、合成をやめました', 10000);
-      return;
-    }
-  }catch(e){}
+  }catch(e){ 残り = {}; }
   const m2 = mergeBackup(全部.合わせ.data, 全部.合わせ.tombstones);
   m.box = m2.box; m.tombs = m2.tombs; m.控え = m2.控え; m.外した = m2.外した;
   // 物理環境の囲いにした囲いへ、別の端末の魚が合わさってきたら、元の魚の囲いへ戻す
   const 戻した囲い = envPolyRevertForCatches(m.box);
+  // 合成した結果に「記録の入った親の中に記録の入った子」があれば、何も書かずにやめる
+  //（別の端末で親に魚を入れていた、など。総合監査130回目 Major 2・v151）。どの控えも取る前に見る
+  {
+    const 違反 = unitParentProblemsIn(m.box.st || [], m.box.ca || [], m.box.sv || []);
+    if(違反.length){
+      toast(`合成をやめました（何も変えていません）。${違反.join('。')}。`
+        + 'どちらかの端末で、親の記録を中の単位へ移すか消してドライブへ保存してから、もう一度合成してください', 15000);
+      return;
+    }
+  }
+  if(Object.keys(残り).length && !repairBackupPush({種類:'合成前の書きかけ', 中身: 残り})){
+    toast('書きかけの控えを取れなかったため、合成をやめました', 10000);
+    return;
+  }
   // 除く分の中身を、先に端末へ控える（黙って失わない。監査71回目 Critical）。
   // 控えられないときは、合成をやめる
   // 控えは「種類＋中身」の形でそろえる。形が違うと、点検の行数に出ず、
@@ -12104,6 +12307,8 @@ async function cloudRestore(){
     const 中 = normalizeDataset(全部.合わせ);
     // 何台かの端末の控えを読み合わせたもの。物理環境の囲いにした囲いを、別の端末の魚が指していれば元に戻す
     const 戻した囲い = envPolyRevertForCatches(中.data);
+    if(!cloudApplyViolationOk(中.data)) return;
+    中.data.__violationOk = true;   // ここで通したので、cloudApply では聞き直さない
     const いま = CLOUD_KEYS.reduce((a,k)=>a + DB.load(DB.key[k]).length, 0);
     const 控え = CLOUD_KEYS.reduce((a,k)=>a + (中.data[k]||[]).length, 0);
     if(!confirm(`ドライブの控え（${全部.読めた}ファイルを読み合わせ／${控え}件）で、`
@@ -13584,8 +13789,21 @@ SCREENS.fishMap = (arg)=>{
             // それでも囲い自身に入っている値は、見て直せるようにしておく
             //（2026-08-23 の実機の声）
             const 何 = unitOwnInfo(cur);
-            if(!何) return '';
-            return `<div class="card">
+            // 数に響く記録（魚・漁具・通電・距離など）が囲い自身に入っていると、中の単位と二重に数える。
+            // 前の版で作られた分を直せるよう、中の単位へ移す／消す道具を出す（監査140回目 Major 4。v151）
+            const 響く = unitHasOwn(cur);
+            const 直す = 響く ? `<div class="card">
+              <div class="warnbox">この${esc(UNIT_WORD[unitKindOf(cur)]||'囲い')}そのものに<b>${esc(響く)}</b>が入っています。
+                中に単位があるので、このままだと<b>二重に数えます</b>。中の単位へ移すか、消してください。</div>
+              <div class="dim small">移す先（中に記録のある単位は除く）:</div>
+              <div class="seg">${unitDescendants(cur.uuid, list)
+                .filter(d=>!unitDescendants(d.uuid, list).some(x=>unitHasOwn(x)))
+                .map(c=>`<button type="button" onclick="unitMoveOwnTo('${cur.uuid}','${c.uuid}')">${esc(c.name||'')} へ移す</button>`).join('')
+                || '<span class="dim small">移せる単位がありません（中の単位にも記録があります）</span>'}</div>
+              <button class="btn ng" onclick="unitClearOwn('${cur.uuid}')">この囲い自身の${esc(響く)}を消す</button>
+            </div>` : '';
+            if(!何) return 直す;
+            return 直す + `<div class="card">
               <div class="dim small">この${esc(UNIT_WORD[unitKindOf(cur)]||'囲い')}そのものに
                 <b>${esc(何)}</b>が入っています（中の単位とは別に残ります）。</div>
               <button class="btn" onclick="nav('env','${cur.uuid}')">
@@ -13823,11 +14041,11 @@ function fishDelete(u){
       + '足りないところを直すか、端末の空き容量をご確認ください', 9000);
     return;
   }
-  if(!DB.softDelete(DB.key.st, u)) return;
+  const r = unitDeleteOne(u, true);
+  if(r.why){ toast(r.why, 10000); return; }
   draftClearFor('箇所', u);
   if(FISH_SEL === u) FISH_SEL = null;
   if(FISH_NEXT.draw === u) FISH_NEXT = {kind:FISH_NEXT.kind, draw:'', survey:FISH_NEXT.survey};
-  unitRelink(st.survey_uuid);
   toast('消しました');
   render();
 }
