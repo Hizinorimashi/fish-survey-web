@@ -153,7 +153,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v148';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v149';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -3315,13 +3315,13 @@ function draftForForm(key){ return draftHeld(key) || draftGet(key); }
 function draftClearFor(kind, u){
   const keys = [];
   if(kind === 'メモ')  keys.push('note:'+u);
-  if(kind === '魚')    keys.push('catch:'+u);
+  if(kind === '魚')    keys.push('catch:'+u, 'individual:'+u);
   if(kind === '箇所'){
     keys.push('station:'+u, 'envitem:'+u, 'effort:'+u, 'env:'+u);
     // その箇所の中の記録の分も。新規の魚の鍵（catch:new:<箇所>:<種>）も含める
     try{
       DB.load(DB.key.ca).forEach(c=>{
-        if(c && c.station_uuid===u) keys.push('catch:'+c.uuid);
+        if(c && c.station_uuid===u) keys.push('catch:'+c.uuid, 'individual:'+c.uuid);
       });
     }catch(e){}
     try{
@@ -3586,6 +3586,7 @@ function render(){
   // 押すたびに先頭へ戻ると、下のほうの入力が打てない（2026-08-20 の実機の声）
   const 前の画面 = SCREEN_AT;
   const 前の位置 = window.scrollY || window.pageYOffset || 0;
+  SCREEN_PREV = 前の画面;   // 画面を組む前に決める（組んでいる途中の判断でも使える。v149）
   try{
     ENV_FORM = ''; ENV_DIRTY = false; PHOTO_OWNER = ''; PHOTO_OWNER_SV = '';
     PHOTO_OWNER_INFO = {mode:'', kind:'', station:'', species:''};
@@ -3629,7 +3630,6 @@ function render(){
       ? `<div class="ngbox">${esc(LOCK_WHY)}</div>` : '') + (v.html || '');
   const いまの画面 = screenKey(STACK[STACK.length-1]);
   if(いまの画面 !== 前の画面) PICK_SET = null;   // 画面を移ったら、選ぶのはやめる
-  SCREEN_PREV = 前の画面;
   SCREEN_AT = いまの画面;
   // 同じ画面なら、見ていた位置に戻す。別の画面なら先頭から
   window.scrollTo(0, (いまの画面 && いまの画面 === 前の画面) ? 前の位置 : 0);
@@ -9103,6 +9103,14 @@ const MAP_WORK = {};
    同じ画面のなかの描き直しでは選びかけを保ち、
    地点へ戻ってから同じ地図を開いたときは選び直しから始める（監査55回目 Major） */
 let SEL_NAV_AT = -1;
+/* 地図の「親」にあたる画面。ここから地図へ入ったときは選び直しから始める。
+   それ以外（魚種の詳細・1尾ずつ・川の環境・メモ・書き出し・設定など、地図から開いた子の画面）から
+   「戻る」で帰ってきたときは、選んでいた記録をそのまま保つ（総合監査130・131回目 Major。v149） */
+const MAP_PARENT_SCREENS = ['', 'home', 'survey', 'surveyHub', 'spot', 'map', 'fishMap', 'envMap'];
+function cameBackFromChild(){
+  const 前 = String(SCREEN_PREV || '').split('|')[0];
+  return MAP_PARENT_SCREENS.indexOf(前) < 0;
+}
 /* 戻り値は「入り直したか」。開いたときに指名された記録（record）を選ぶのは、入り直したときだけにする。
    毎回選び直すと、指名つきで開いた地図（測り終える・保存のあと・「地図で見る」から）で
    ほかの単位の名前を押しても、描き直すたびに指名した記録へ戻ってしまい、選び替えられない（v147） */
@@ -9112,8 +9120,10 @@ function selResetOnSpotChange(svUuid, spot){
   SEL_NAV_AT = NAV_SEQ;
   if(SEL_SPOT_AT === key && !入り直した) return 入り直した;
   if(SEL_SPOT_AT === key && 入り直した){
-    // 同じ地点へ入り直しただけ。描きかけは残し、選んでいる記録だけ手放す
-    FISH_SEL = null; FISH_PICK = ''; ENV_SEL = null;
+    // 同じ地点へ入り直しただけ。描きかけは残す。
+    // 子の画面から戻ってきたなら、選んでいる記録も保つ（地図の画面はこのあと、生きている一覧に無ければ外す）。
+    // 地点・調査の画面から開き直したなら、選び直しから
+    if(!cameBackFromChild()){ FISH_SEL = null; FISH_PICK = ''; ENV_SEL = null; }
     try{ ENV_MOVE = null; }catch(e){}
     try{ ENV_PICK = null; }catch(e){}
     return 入り直した;
@@ -16003,11 +16013,37 @@ SCREENS.individuals = (caUuid)=>{
     `,
     onMount(){
       const el=$('#i_tl'); if(el) el.focus();
-      bulkRestore(caUuid);      // 画面を描き直しても、打ち込み途中の並びを残す
+      // 全長・尾叉長・まとめて入れる欄の書きかけ（v149）。前は下書きが無く、魚種タブを押すと消えていた（総合監査130回目 Major）
+      const key = 'individual:'+caUuid;
+      const base = collectIndividual();   // 「開いたときの姿」は空欄の状態。戻した値を基準にすると、消したときに書きかけごと捨てる（監査134回目 Major）
+      bulkRestore(caUuid);      // 画面を描き直しても、打ち込み途中の並びを残す（画面の中の控え）
+      const d = draftForForm(key);
+      if(d){
+        applyVals({'#i_tl': d.tl, '#i_fl': d.fl});
+        const box = $('#i_bulk'); if(box && d.bulk !== undefined) box.value = d.bulk || '';   // 端末に残した分が正。空ならそれも反映
+        if((d.tl || d.fl || d.bulk) && !IND_DRAFT_QUIET) toast('書きかけを戻しました');
+      }
+      IND_DRAFT_QUIET = false;
+      draftBind(key, collectIndividual, base);
       bulkHint();
     }
   };
 };
+function collectIndividual(){
+  return {tl: strVal('#i_tl'), fl: strVal('#i_fl'), bulk: strVal('#i_bulk')};
+}
+/* 1尾（またはまとめて）入れ終えたあとの書きかけ。入れた欄は空にし、残っている欄だけ覚えておく。
+   直後の描き直しでは「書きかけを戻しました」を出さない（入れた知らせを消してしまう。監査134回目 Minor） */
+let IND_DRAFT_QUIET = false;
+function individualDraftAfter(caUuid, d){
+  const key = 'individual:'+caUuid;
+  const 残り = !!(d.tl || d.fl || d.bulk);
+  // 画面の中の控え（DRAFT_HOLD）も draftTouch と同じに扱う。古い控えが残ると、入れ終えた全長が戻ってきて二重に入れかねない（監査135回目 Major）。
+  // 全部空のときも、端末の古い書きかけを消せなければ空の控えを置いて、古い値より優先させる（監査136回目 Major）
+  if(draftSave(key, 残り ? d : null)) delete DRAFT_HOLD[key];
+  else DRAFT_HOLD[key] = d;
+  if(残り) IND_DRAFT_QUIET = true;
+}
 
 /* 記録を入れ終えた・消したあとの行き先。
    地図で作った記録（E・P/F・P）なら、その地点の魚の地図へ（その単位を選んだまま）。
@@ -16101,6 +16137,7 @@ function bulkSep(){
   if(v.trim()!=='' && !/[\s,、，;；\/]$/.test(v)) box.value = v + ' ';
   box.focus();
   bulkKeepAll();
+  draftTouch();      // ボタンで欄を書き換えたときは input が出ないので、書きかけも更新する（v149）
   bulkHint();
 }
 /* 打ち間違いを1つ戻す。テンキーだと文字を選んで直しにくいため */
@@ -16111,6 +16148,7 @@ function bulkUndo(){
   box.value = t.length ? t.join(' ') + ' ' : '';
   box.focus();
   bulkKeepAll();
+  draftTouch();      // 同上
   bulkHint();
 }
 
@@ -16140,6 +16178,7 @@ function addIndividualsBulk(caUuid){
   });
   if(!DB.save(DB.key.ind, all)) return;      // 保存できていないので欄も消さない
   delete BULK_TEXT[caUuid];                  // 入れ終わったので覚えておかない
+  individualDraftAfter(caUuid, {tl: strVal('#i_tl'), fl: strVal('#i_fl'), bulk: ''});
   toast(`${r.ok.length}尾を追加しました`);
   render();
 }
@@ -16159,6 +16198,7 @@ function addIndividual(caUuid){
     individual_number:no, total_length_cm:tl, fork_length_cm:fl,
     recorded_at:nowISO()};
   if(!DB.upsert(DB.key.ind, rec)) return;   // 保存できていないので欄も消さない
+  individualDraftAfter(caUuid, {tl: '', fl: '', bulk: strVal('#i_bulk')});   // 入れた分の書きかけは消す（まとめて入れる欄は残す）
   toast(`${no}尾目：${tl}cm`);
   render();                                  // 一覧を出し直し、欄は空に戻る
 }
