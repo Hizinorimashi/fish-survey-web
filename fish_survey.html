@@ -70,6 +70,8 @@ button{font-family:inherit;font-size:15px;cursor:pointer}
   border-radius:8px;padding:9px 12px;font-size:14px}
 .seg button.on{background:var(--accent);border-color:var(--accent);color:#04121f;font-weight:700}
 .seg.basemap button,.seg.trackbar button{font-size:13px;padding:7px 10px}
+.seg.maptab{margin:0 0 8px}
+.seg.maptab button{flex:1;font-size:15px;padding:10px 12px;text-align:center}
 .pe-corner{touch-action:none;width:30px;height:30px;border-radius:50%;background:#fff;border:3px solid #f0883e;color:#04121f;
   font:700 12px/24px sans-serif;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.5)}
 .pe-corner.on{background:#f0883e;color:#fff;border-color:#fff;transform:scale(1.15)}
@@ -153,7 +155,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v152';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v153';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -8119,15 +8121,22 @@ function fishUseMap(svUuid, on){
   }
   return true;
 }
-SCREENS.survey = (svUuid)=>{
+/* 「調査」の画面が代理で出す地図。'env'＝地点の無い前の版の物理環境の調査、'fish'＝地図で記録する調査（entry 'map'）、''＝調査ハブ。
+   タブの切り替え（v153）で、STACK の末尾が「調査」のまま地図が出ている経路を見分けるのにも使う */
+function surveyDirectMap(svUuid){
   const sv0 = DB.getAlive(DB.key.sv, svUuid);
+  if(!sv0) return '';
   // 地点を置いてある調査は、種類にかかわらず調査ハブ（地点の並び）へ。
   // 地点が無い前の版の物理環境の調査だけ、これまでどおり地図へ直行する
   if(isEnvSurvey(sv0) && !spotList(svUuid).length
-     && !isMesh({env_method: sv0.env_method_default})){
-    return SCREENS.envMap(svUuid);
-  }
-  if(fishMapEntry(sv0)) return SCREENS.fishMap(svUuid);
+     && !isMesh({env_method: sv0.env_method_default})) return 'env';
+  if(fishMapEntry(sv0)) return 'fish';
+  return '';
+}
+SCREENS.survey = (svUuid)=>{
+  const 代理 = surveyDirectMap(svUuid);
+  if(代理 === 'env') return SCREENS.envMap(svUuid);
+  if(代理 === 'fish') return SCREENS.fishMap(svUuid);
   return SCREENS.surveyHub(svUuid);
 };
 SCREENS.surveyHub = (svUuid)=>{
@@ -9178,7 +9187,8 @@ function selResetOnSpotChange(svUuid, spot){
     // 同じ地点へ入り直しただけ。描きかけは残す。
     // 子の画面から戻ってきたなら、選んでいる記録も保つ（地図の画面はこのあと、生きている一覧に無ければ外す）。
     // 地点・調査の画面から開き直したなら、選び直しから
-    if(!cameBackFromChild()){ FISH_SEL = null; FISH_PICK = ''; ENV_SEL = null; }
+    // 魚類｜物理環境のタブで切り替えたときも、両方の選択を保つ（相手のタブで前に選んでいたものに戻る。v153）
+    if(!cameBackFromChild() && !MAP_TAB_JUMP){ FISH_SEL = null; FISH_PICK = ''; ENV_SEL = null; }
     try{ ENV_MOVE = null; }catch(e){}
     try{ ENV_PICK = null; }catch(e){}
     return 入り直した;
@@ -9979,6 +9989,9 @@ function unitToEnvPoly(u){
     toast('聞いている間に記録が書き換えられたので、変えませんでした。もう一度お試しください', 9000);
     return false;
   }
+  // 確認のあとに読み直した now を土台にする（同じ調査の分は確認前と同じ内容なので、手元の写しを使う）。
+  // 古い全件で保存すると、聞いている間に進んだ別の調査の更新を巻き戻す（監査146回目 Critical）
+  all = now.map(x=>(x && x.survey_uuid===st.survey_uuid) ? (all.find(y=>y && y.uuid===x.uuid) || x) : x);
   const t = nowISO();
   const before = st.name || '';
   // 変える前の姿を控える。別の端末から魚が合成されてきたら、元の魚の囲いへ戻すのに使う
@@ -10023,6 +10036,96 @@ function envPolyRevertForCatches(box){
   });
   return out;
 }
+/* 物理環境の囲い（A）を魚の地図の囲い（E・P/F）にする（v153・2026-10-29）。unitToEnvPoly の逆。
+   魚の地図から変えたもの（from_unit あり）は、合成の自動の戻し（envPolyRevertForCatches）と同じ決まりで
+   種類・名前・record_kind・env_method を元に戻してから from_unit を外す。物理環境の地図で描いたものは種類を選んで入れる。
+   魚の親子に入るので、新しく数が合わなくなる親子ができるなら理由を出して断る（v151 の決まり）。
+   形・環境の値・写真・メモ・時刻・地点はそのまま。fs_stations は1回の保存（親子の付け直しも同じ写し） */
+function envPolyToUnit(u, kind){
+  if(!writeAllowed()){ toast('このタブでは直せません。記録を入れているタブでお試しください', 7000); return false; }
+  if(POLY_EDIT){ toast('形を直している途中です。先に「直し終える」か「やめる」を押してください', 7000); return false; }
+  if(!(kind === 'E' || kind === 'PF')){ toast('瀬淵か調査範囲のどちらにするかを選んでください', 7000); return false; }
+  const st0 = DB.liveStation(u);
+  if(!st0 || !isEnvPoly(st0)){ toast('魚の囲いにできるのは、物理環境の囲いだけです', 7000); return false; }
+  if(envPolyDrawing(st0)){ toast('描いている途中の囲いは、閉じてから変えてください', 7000); return false; }
+  if(polyPts(st0).length < 3){ toast('角が3つより少ないので、魚の囲いにはできません', 7000); return false; }
+  if(ENV_MOVE){ toast('位置を直している途中です。先に終えるか「やめる」を押してください', 7000); return false; }
+  if(envPickOn()){ toast('消すものを選んでいます。先に「やめる」を押してください', 7000); return false; }
+  // 物理環境の打ちかけを先に書く。書けないまま変えると、その入力が行き場をなくす
+  if(!envFlushDirty()){ toast(ENV_FLUSH_NG, 9000); return false; }
+  let all; try{ all = DB.loadRaw(DB.key.st); }catch(e){ toast('記録を読めないので、変えませんでした', 8000); return false; }
+  const st = all.find(x=>x && x.uuid===u && !x.deleted_at);
+  if(!st || !isEnvPoly(st) || envPolyDrawing(st)){ toast('その記録はもう変わっています。開き直してください', 8000); return false; }
+  const f = (st.from_unit && st.from_unit.unit_kind === kind) ? st.from_unit : null;
+  const 同じ調査 = all.filter(x=>x && x.survey_uuid===st.survey_uuid);
+  // 名前: 元の名前 → 自動の名前（A○・空）なら次の番号 → 手で付けた名前はそのまま。
+  // ただし、同じ種類で使われている名前（生きたもの・ごみ箱・ほかの囲いが控えた元の名前）と重なるなら次の番号
+  const 使用中 = unitNamesOfKind(同じ調査.filter(x=>x.uuid!==u), kind);
+  let 新名 = (f && f.name) ? f.name : ((!st.name || /^A\d+$/.test(String(st.name))) ? '' : st.name);
+  if(!新名 || 使用中.indexOf(新名) >= 0) 新名 = unitNextName(all, st.survey_uuid, kind, u);
+  // 魚の親子に入る。新しく数が合わなくなる親子ができるなら止める（例: 魚の入った P/F6 の中に戻す）。
+  // もとからある組は理由にしない（差分だけを見る）
+  const units = 同じ調査.filter(x=>!x.deleted_at && unitKindOf(x));
+  const 候補 = Object.assign({}, st, {unit_kind:kind, name:新名, parent_uuid:''});
+  delete 候補.record_kind; delete 候補.env_method; delete 候補.from_unit;
+  const r = unitNewParentProblems(units, units.concat([候補]));
+  if(r.problems.length){
+    alert('魚の囲いにすると、数が合わなくなるので変えませんでした。\n\n' + r.problems.join('\n')
+      + '\n\n先にその記録を中の単位へ移すか消してください');
+    return false;
+  }
+  const 中 = units.filter(x=>(r.parents[x.uuid]||'') === u).length;
+  if(!confirm(`${st.name} を魚の地図の「${UNIT_WORD[kind]}」にしますか？\n\n`
+    + `・物理環境の地図からは消え、魚の地図に「${新名}」として出ます\n`
+    + '・形・環境の値・写真・メモ・時刻はそのまま残ります'
+    + (中 ? `\n・中にある ${中}件は、${新名} の中に入ります` : ''))) return false;
+  // 聞いている間に、ほかで書き換えられていないか
+  let now; try{ now = DB.loadRaw(DB.key.st); }catch(e){ toast('記録を読めないので、変えませんでした', 8000); return false; }
+  if(JSON.stringify(now.filter(x=>x && x.survey_uuid===st.survey_uuid)) !== JSON.stringify(同じ調査)){
+    toast('聞いている間に記録が書き換えられたので、変えませんでした。もう一度お試しください', 9000);
+    return false;
+  }
+  // 確認のあとに読み直した now を土台にする（同じ調査の分は確認前と同じ内容なので、手元の写しを使う）。
+  // 古い全件で保存すると、聞いている間に進んだ別の調査の更新を巻き戻す（監査146回目 Critical）
+  all = now.map(x=>(x && x.survey_uuid===st.survey_uuid) ? (all.find(y=>y && y.uuid===x.uuid) || x) : x);
+  const t = nowISO();
+  const before = st.name || '';
+  st.unit_kind = kind; st.name = 新名; st.parent_uuid = '';
+  if(f){   // 元の姿に戻す（合成の自動の戻しと同じ）
+    if(f.record_kind === null || f.record_kind === undefined) delete st.record_kind; else st.record_kind = f.record_kind;
+    if(f.env_method === null || f.env_method === undefined) delete st.env_method; else st.env_method = f.env_method;
+  }else{ delete st.record_kind; delete st.env_method; }
+  delete st.from_unit;
+  st.updated_at = t;
+  // 親子を同じ写しの中で付け直す（この囲い自身の親と、中に入ることになる単位の親）
+  const units2 = 同じ調査.filter(x=>!x.deleted_at && unitKindOf(x));
+  const m = unitParentMap(units2);
+  units2.forEach(x=>{
+    const p = m[x.uuid] || '';
+    if((x.parent_uuid||'') !== p){ x.parent_uuid = p; x.updated_at = t; }
+  });
+  if(!DB.save(DB.key.st, all)){ toast('保存できませんでした（端末の空き容量をご確認ください）', 9000); return false; }
+  if(ENV_SEL === u) ENV_SEL = null;
+  if(ENV_FORM === u){ ENV_FORM = ''; ENV_DIRTY = false; }   // 変えた記録へ、物理環境の入力欄から書き戻さない
+  toast(`${before} を魚の地図の「${新名}」にしました`, 8000);
+  // 物理環境の地図からは消えるので、魚類のタブに切り替えてその単位を選ぶ（消えたように見せない。計画点検 Minor 1）
+  FISH_SEL = u;
+  if(mapTabNow() === 'env' && mapTabSwitch(st.survey_uuid, 'fish', u)) return true;
+  render();
+  return true;
+}
+/* 物理環境の地図の、選んだ囲いの欄に出すボタン（閉じた囲いだけ） */
+function envToUnitButtonsHtml(cur){
+  if(!cur || !isEnvPoly(cur) || envPolyDrawing(cur) || polyEditOn(cur.uuid)) return '';
+  const f = (cur.from_unit && (cur.from_unit.unit_kind === 'E' || cur.from_unit.unit_kind === 'PF')) ? cur.from_unit : null;
+  if(f) return `<button class="btn sm" style="margin-bottom:6px" onclick="envPolyToUnit('${cur.uuid}','${f.unit_kind}')"
+    >魚の囲いに戻す（${esc(UNIT_WORD[f.unit_kind]||'')}・${esc(f.name||'')} として）</button>`;
+  return `<div class="dim small">魚の地図の囲いにする（魚を記録したいとき）:</div>
+    <div class="btn2" style="margin:0 0 6px">
+      <button class="btn sm" onclick="envPolyToUnit('${cur.uuid}','PF')">${esc(UNIT_WORD.PF)}にする</button>
+      <button class="btn sm" onclick="envPolyToUnit('${cur.uuid}','E')">${esc(UNIT_WORD.E)}にする</button>
+    </div>`;
+}
 function unitNextName(all, svUuid, kind, selfUuid){
   const mark = UNIT_MARK[kind] || '';
   const rx = new RegExp('^' + mark.replace('/','\\/') + '(\\d+)$');
@@ -10066,6 +10169,9 @@ function unitKindChange(u){
     toast('聞いている間に記録が書き換えられたので、変えませんでした。もう一度お試しください', 9000);
     return false;
   }
+  // 確認のあとに読み直した now を土台にする（同じ調査の分は確認前と同じ内容なので、手元の写しを使う）。
+  // 古い全件で保存すると、聞いている間に進んだ別の調査の更新を巻き戻す（監査146回目 Critical）
+  all = now.map(x=>(x && x.survey_uuid===st.survey_uuid) ? (all.find(y=>y && y.uuid===x.uuid) || x) : x);
   const before = st.name || '';
   if(!unitCommitAll(all, st.survey_uuid, u, change)){
     toast('保存できませんでした（端末の空き容量をご確認ください）', 9000);
@@ -10301,6 +10407,75 @@ function fromSpotHtml(spot){
     <span class="chip">${esc(st.name||'地点')}</span>
     <span class="dim small">から開いています。押すと地点へ戻ります</span></div>`;
 }
+/* 魚類｜物理環境のタブ（v153・2026-10-29 の実機の声「物理環境の囲いにすると魚の地図からいじれない」）。
+   同じ地点・同じ地図の位置（中心・寄り具合・向き）・選んでいた記録のまま、もう一方の地図に切り替える。
+   道具は地図ごとに分けたまま（1つの地図に全部並べると押しにくく、タップの意味が増えすぎる） */
+let MAP_TAB_JUMP = false;   // タブで切り替えている最中（selResetOnSpotChange が選択を消さないための印）
+function mapTabHtml(svUuid, cur){
+  const b = (k, w)=>`<button type="button" class="${cur===k?'on':''}"
+    onclick="mapTabSwitch('${svUuid}','${k}')">${w}</button>`;
+  return `<div class="seg maptab" data-seg="maptab">${b('fish','魚類')}${b('env','物理環境')}</div>`;
+}
+/* いま出ている地図はどちらか（画面の名前ではなく、地図の箱で見る。「調査」の画面が地図を代理で出すことがある） */
+function mapTabNow(){
+  if(document.getElementById('envmap')) return 'env';
+  if(document.getElementById('fishmap')) return 'fish';
+  return '';   // 地図の画面ではない（ここから切り替えない。監査146回目 Minor）
+}
+/* record を渡すと、切り替えた先でその記録を選ぶ（魚の地図の「物理環境の囲い」の名前・地図の札から） */
+function mapTabSwitch(svUuid, to, record){
+  to = (to === 'env') ? 'env' : 'fish';
+  const いま = mapTabNow();
+  if(!いま){ toast('地図の画面で切り替えてください', 6000); return false; }
+  if(いま === to){                      // 同じタブ。指名の記録を選ぶだけ
+    if(record){ if(to === 'env') envSelect(record); else fishSelect(record); }
+    return true;
+  }
+  // 順番（計画点検 2026-10-29 Major 3・監査146回目 Major 1）: まず断る → 直しかけの形は捨ててよいか聞く（まだ外さない）
+  // → 打ちかけを書く（2つ目が書けなければ1つ目も戻す）→ 形を外す → 切り替え。
+  // どこかで止まったら、STACK・選択・地図の位置・記録はいっさい変えない
+  if(ENV_MOVE){ toast('位置を直している途中です。先に終えるか「やめる」を押してください', 7000); return false; }
+  if(envPickOn()){ toast('消すものを選んでいます。先に「やめる」を押してください', 7000); return false; }
+  if(polyEditDirty() && !confirm('直しかけの形を捨てて、切り替えますか？')) return false;
+  let 控え = null;
+  try{ 控え = DB.loadRaw(DB.key.st); }catch(e){ toast('記録を読めないので、切り替えませんでした', 8000); return false; }
+  const 採捕を書いた = !!($('#gearBox') && FISH_SEL);                                     // 魚の地図の採捕記録の打ちかけ
+  if(採捕を書いた && !saveEffort(FISH_SEL, {quiet:true})) return false;
+  if(!envFlushDirty()){                                                                  // 川の環境の打ちかけ（両方の地図）
+    toast(ENV_FLUSH_NG, 9000);
+    // 1つ目（採捕記録）を書いたときだけ控えで戻す。戻せなければその旨（監査147回目 Minor）
+    if(採捕を書いた && !DB.save(DB.key.st, 控え)) toast('採捕記録の打ちかけだけが保存されました（川の環境は未保存）', 9000);
+    return false;
+  }
+  POLY_EDIT = null;   // 聞いて了承ずみ（直しかけが無ければ何もしない）
+  // 地図の位置を相手にも写す（同じ所を見たまま切り替わる）
+  const key = mapViewKey(svUuid);
+  const map = MAPS.main.map;
+  if(map){
+    try{
+      const c = map.getCenter();
+      const v = {lat:c.lat, lon:c.lng, zoom:map.getZoom(), bearing:mapBearing(map)};
+      FISH_VIEW[key] = v; ENV_VIEW[key] = v;
+    }catch(e){}
+  }
+  if(record){ if(to === 'env') ENV_SEL = record; else FISH_SEL = record; }   // 一覧に無ければ画面の側で外れる
+  const name = to === 'env' ? 'envMap' : 'fishMap';
+  const arg = {survey:svUuid, spot:MAP_SPOT||'', loose: MAP_LOOSE ? 1 : 0};
+  const top = STACK[STACK.length-1] || {};
+  const 下 = STACK[STACK.length-2];
+  // STACK の扱い（計画点検 2026-10-29 Major 1）:
+  // ・末尾が「調査」のまま地図を代理で出している経路（地図で記録する調査・地点の無い物理環境の調査）では、
+  //   切り替え先の地図を1段積む（「戻る」で調査＝元の地図へ）。元の地図へ戻すときは、その1段を外す
+  // ・末尾が地図（地点から・loose から）なら、末尾だけを置き換える
+  MAP_TAB_JUMP = true;
+  try{
+    if(top.name === 'survey'){ NAV_SEQ++; STACK.push({name, arg}); render(); }
+    else if((top.name === 'fishMap' || top.name === 'envMap') && 下 && 下.name === 'survey' && 下.arg === svUuid
+            && !MAP_SPOT && !MAP_LOOSE && surveyDirectMap(svUuid) === to){ NAV_SEQ++; STACK.pop(); render(); }
+    else navReplace(name, arg);
+  }finally{ MAP_TAB_JUMP = false; }
+  return true;
+}
 function fishRememberView(svUuid){
   const map = MAPS.main.map; if(!map) return;
   try{
@@ -10331,22 +10506,33 @@ function fishDrawAll(svUuid){
   FISHLAYER = [];
   // 物理環境の囲い（v142）。基図・空撮の上、道すじ（350）・魚の囲い（400）の下の専用の層に、点線と名前だけ。
   // 触っても反応しない（地図のタップで魚の点・角を置くのを邪魔しない）。選ぶ・全部入るように・親子には入れない
+  // 「見るだけ」のときだけ、面と名前の札を押せる（押すと物理環境のタブに切り替わり、その囲いを選ぶ。v153）。
+  // 札は魚の囲いより上の層に出す（魚の囲いの中にある囲いでも押せるように）。
+  // 置くときは面も札も反応しない（囲いの内側に角や点を置くのを邪魔しない。v142 計画点検 M6）。
+  // 層の設定は呼ばれるたびに置き直す（前のモードの設定を残さない。計画点検 2026-10-29 Major 4）
   try{
+    const 押せる = fishViewOnly() && !POLY_EDIT;
     let pane = map.getPane('envbg');
     if(!pane){
       const tiles = map.getPane('tilePane');
       pane = map.createPane('envbg', tiles && tiles.parentNode ? tiles.parentNode : undefined);
-      pane.style.zIndex = '300'; pane.style.pointerEvents = 'none';
+      pane.style.zIndex = '300';
     }
+    pane.style.pointerEvents = 押せる ? 'auto' : 'none';
     mapStations(svUuid, 'env').filter(st=>isEnvPoly(st) && recordReady(st)).forEach(st=>{
       const pts = polyPts(st);
       if(pts.length < 3) return;
-      FISHLAYER.push(L.polygon(pts, {pane:'envbg', color:'#e0e0e0', weight:2, opacity:.8, dashArray:'4 4',
-        fillColor:'#e0e0e0', fillOpacity:.06, interactive:false}).addTo(map));
+      const 飛ぶ = e=>{ L.DomEvent.stop(e); mapTabSwitch(svUuid, 'env', st.uuid); };
+      const pg = L.polygon(pts, {pane:'envbg', color:'#e0e0e0', weight:2, opacity:.8, dashArray:'4 4',
+        fillColor:'#e0e0e0', fillOpacity:.06, interactive:押せる, bubblingMouseEvents:false});
+      if(押せる) pg.on('click', 飛ぶ);
+      FISHLAYER.push(pg.addTo(map));
       const c = pts.slice().sort((a,b)=>b[0]-a[0])[0];
-      FISHLAYER.push(L.marker(c, {pane:'envbg', interactive:false, keyboard:false,
-        icon:L.divIcon({className:'', iconSize:[60,18], iconAnchor:[30,9],
-          html:`<div class="envbg-name">${esc(st.name||'')}</div>`})}).addTo(map));
+      const mk = L.marker(c, {pane: 押せる ? 'markerPane' : 'envbg', interactive: 押せる, keyboard:false,
+        icon:L.divIcon({className: 押せる ? 'envbg-tap' : '', iconSize:[60,18], iconAnchor:[30,9],
+          html:`<div class="envbg-name">${esc(st.name||'')}</div>`})});
+      if(押せる) mk.on('click', 飛ぶ);
+      FISHLAYER.push(mk.addTo(map));
     });
   }catch(e){ console.error(e); }
   const list = mapStations(svUuid, 'fish');
@@ -10475,7 +10661,7 @@ ${(opt && opt.head === false) ? '' : `      <div class="card">
           <button class="btn sm ng" style="width:auto;margin:0"
             onclick="envDelete('${cur.uuid}')">消す</button>
         </div>
-        ${polyEditPanelHtml(cur)}${polyEditButtonsHtml(cur)}
+        ${polyEditPanelHtml(cur)}${polyEditButtonsHtml(cur)}${envToUnitButtonsHtml(cur)}
 
         ${(envFixFold(cur.uuid), '')}${foldHtml('envfix', '位置と時刻を直す',
           `<span class="fsub">${envKindOf(cur)==='L' ? '始点・終点・時刻'
@@ -12497,6 +12683,12 @@ function buildGeoJSON(sv, opt){
     });
   }catch(e){ console.error(e); }
   const sts = DB.stationsOf(sv.uuid).filter(recordReady);
+  // 囲い（魚・物理環境）に付ける環境の値。どちらの囲いでも同じ列で出す（v153）
+  const geoEnvAttrs = (pr, st)=>{
+    pr['水深cm'] = geoNum(st.depth_rep_cm); pr['流速cms'] = geoNum(st.velocity_rep_cms);
+    pr['環境区分'] = st.habitat_type||''; pr['河床材料'] = st.substrate1||'';
+    return pr;
+  };
   for(const st of sts){
     const k = unitKindOf(st);
     if(isMesh(st)){
@@ -12537,8 +12729,10 @@ function buildGeoJSON(sv, opt){
       if(pts.length >= 3){
         const ring = pts.map(geoLL);
         ring.push(ring[0]);                        // 面は始点で閉じる
-        面.push(geoFeature({type:'Polygon', coordinates:[ring]},
-          geoProps(sv, st, k==='E' ? '調査範囲' : '河川区分（瀬淵）', 写真)));
+        // 魚の囲いにも、入れてある環境の値を出す（物理環境の囲いから魚の囲いにしても属性が消えない。v153）
+        const pr = geoProps(sv, st, k==='E' ? '調査範囲' : '河川区分（瀬淵）', 写真);
+        geoEnvAttrs(pr, st);
+        面.push(geoFeature({type:'Polygon', coordinates:[ring]}, pr));
       }
     }else if(isEnvPoly(st)){
       // 物理環境の囲い（瀬・淵の範囲）。閉じたものだけここに来る（描きかけは recordReady で外れる）
@@ -12547,8 +12741,7 @@ function buildGeoJSON(sv, opt){
         const ring = pts.map(geoLL);
         ring.push(ring[0]);
         const pr = geoProps(sv, st, '物理環境の囲い', 写真);
-        pr['水深cm'] = geoNum(st.depth_rep_cm); pr['流速cms'] = geoNum(st.velocity_rep_cms);
-        pr['環境区分'] = st.habitat_type||''; pr['河床材料'] = st.substrate1||'';
+        geoEnvAttrs(pr, st);
         面.push(geoFeature({type:'Polygon', coordinates:[ring]}, pr));
       }
     }else if(isLine(st)){
@@ -13743,6 +13936,8 @@ SCREENS.fishMap = (arg)=>{
         中 ? `<span class="fsub">中に${中}</span>` : ''}</button>`;
   };
   const 地点札 = fromSpotHtml(spot);
+  // 同じ地点の物理環境の囲い（閉じたもの）。名前を押すと物理環境のタブへ（v153）
+  const 環境囲い = mapStations(svUuid, 'env').filter(st=>isEnvPoly(st) && recordReady(st));
   return {
     title: `${sv.river_name||''} ${sv.site_name||''}`.trim() || '魚の調査',
     sub:[{text:surveyPeriodText(sv)},
@@ -13750,6 +13945,7 @@ SCREENS.fishMap = (arg)=>{
          {text:`${list.length}件`}],
     html:`
       ${地点札}
+      ${mapTabHtml(svUuid, 'fish')}
       ${recDayBarHtml(sv)}
       ${baseMapButtonsHtml(sv && sv.uuid)}
       <div id="fishmap" class="map"
@@ -13784,6 +13980,13 @@ SCREENS.fishMap = (arg)=>{
         <div class="dim small">記録は、いちばん小さい単位に入れます。
           大きい単位は、中に入っているものの集計になります。</div>
       </div>
+      ${環境囲い.length ? `<div class="card">
+        <h3 style="margin-top:0">物理環境の囲い</h3>
+        <div class="seg">${環境囲い.map(st=>`<button type="button"
+          onclick="mapTabSwitch('${svUuid}','env','${st.uuid}')">${esc(st.name||'')}</button>`).join('')}</div>
+        <div class="dim small">押すと物理環境のタブに切り替わり、その囲いの入力欄が出ます。
+          地図の上の囲いは「見るだけ」のときに押せます。</div>
+      </div>` : ''}
 
       ${MAP_LOOSE ? `<div class="warnbox">ここには、<b>地点に属さない以前の記録</b>だけを
         出しています。直すことはできますが、新しくは作れません。
@@ -14071,6 +14274,7 @@ function fishSyncHint(){
     el.innerHTML = 'いまは<b>見るだけ</b>。地図をタップしても何も置きません。'
       + '置いてある囲い・点を押すと、その記録を選びます'
       + (描き中 ? `（<b>${esc(描き中.name)}</b> は描きかけのままです）` : '')
+      + '。薄い点線の囲い（物理環境）を押すと、物理環境のタブに切り替わります'
       + '<br>置くときは、左下の記号（調査範囲・瀬淵・ポイント）を押してください';
     return;
   }
@@ -14172,6 +14376,7 @@ SCREENS.envMap = (arg)=>{
          {text:`${list.filter(recordReady).length}件`}],
     html:`
       ${fromSpotHtml(spot)}
+      ${mapTabHtml(svUuid, 'env')}
       ${recDayBarHtml(sv)}
       ${baseMapButtonsHtml(sv && sv.uuid)}
       <div id="envmap" class="map"
