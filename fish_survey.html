@@ -155,7 +155,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v155';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v156';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -13915,7 +13915,9 @@ SCREENS.trash = ()=>{
             onclick="if(trashRestore('${t.k}','${x.uuid}')) render()">戻す</button>
           <button class="btn sm ng" style="width:auto;margin:0"
             onclick="if(trashPurge('${t.k}','${x.uuid}')) render()">完全に消す</button>
-        </div>`;
+        </div>${t.k === 'sv' ? `<div style="margin:-4px 0 10px"><button class="btn sm" style="width:auto"
+            onclick="dbSendBundle('${x.uuid}')">削除をデータベースへ送る</button>
+          <span class="dim small">データベースにも「消した」と伝えます（完全に消す前に）</span></div>` : ''}`;
       }).join('')}
       ${list.length > 100 ? `<div class="dim small">ほか ${list.length-100}件</div>` : ''}
     </div>`;
@@ -13934,7 +13936,8 @@ SCREENS.trash = ()=>{
            </div>`
          : `<button class="btn" onclick="pickStart()">選んでまとめて片づける</button>`}
         <div class="dim small">消したものは、ここに残っています。
-           戻すと元の場所に出ます。「完全に消す」ともう戻せません。</div>
+           戻すと元の場所に出ます。「完全に消す」ともう戻せません。
+           データベースへ送った調査を消したときは、完全に消す前に「削除をデータベースへ送る」を押してください（完全に消したあとでは伝えられません）。</div>
          ${TRASH_KINDS.map(塊).join('')}`
       : '<div class="card dim">ごみ箱は空です。</div>',
   };
@@ -17342,6 +17345,172 @@ async function dbSendNow(svUuid){
   }
 }
 
+/* ---------- 調査をまるごと送る（spec 22.3・v156） ----------
+   31列の「いま送る」とは別系統。この調査の記録（調査・箇所＝地点/魚の単位/物理環境・魚・個体・メモ・マス）を
+   消した行も含めてそのまま送る。登録地点（si）・写真の本体・歩いた道すじ（fs_walk）は送らない。
+   受け口は /ingest/fish。受領の印は 31列とは別の欄（bundle_db_*）に、調査の updated_at を変えずに書く */
+let DB_BUNDLE_BUSY = false;
+function buildBundlePayload(svUuid){
+  const sv = DB.get(DB.key.sv, svUuid);   // ごみ箱の調査も送れる（削除をデータベースへ伝える）
+  if(!sv) return null;
+  const data = {sv:[sv]};
+  ['st','ca','ind','nt','mc'].forEach(k=>{
+    data[k] = DB.loadRaw(DB.key[k]).filter(x=>x && x.survey_uuid === svUuid);   // 消した行も含める。読めなければ例外
+  });
+  return {app:'fish_survey', kind:'survey_bundle', version:1, exported_at: nowISO(), survey_uuid: svUuid, data};
+}
+/* 送る前に分かる「向こうで断られるもの」。描きかけの囲い・記録の決まりの違反 */
+function bundleProblems(svUuid){
+  const sv = DB.get(DB.key.sv, svUuid); if(!sv) return ['調査がありません'];
+  const st = DB.loadRaw(DB.key.st).filter(x=>x && x.survey_uuid===svUuid && !x.deleted_at);
+  const ca = DB.loadRaw(DB.key.ca).filter(x=>x && x.survey_uuid===svUuid && !x.deleted_at);
+  const out = [];
+  const 描き = st.filter(x=>polyDrawing(x) || envPolyDrawing(x));
+  if(描き.length) out.push('描いている途中の囲いがあります（' + 描き.map(x=>x.name||'').join('・') + '）。閉じるか、やめてから送ってください');
+  try{ bundleOwnProblems(st, ca).forEach(t=>out.push(t)); }catch(e){}
+  return out;
+}
+/* まるごと送信の「記録の決まり」: 数に響く記録（魚・漁具・通電・距離面積・流した回数や川幅）が、親子の中で 2 段以上にあるときだけ断る。
+   親に記録があって中の単位が空、は許す（DB 側の検査と同じ。監査152回目 Major 2）。親は囲いの形から（unitParentMap） */
+function bundleOwnProblems(st, ca){
+  const units = st.filter(x=>unitKindOf(x) && unitReady(x));
+  const m = unitParentMap(units);
+  const by = {}; units.forEach(u=>{ by[u.uuid] = u; });
+  const own = {}; units.forEach(u=>{ own[u.uuid] = unitHasOwnIn(u, ca); });
+  const out = [];
+  units.forEach(u=>{
+    if(!own[u.uuid]) return;
+    let cur = m[u.uuid] || '', seen = {};
+    while(cur && !seen[cur]){
+      seen[cur] = 1;
+      if(own[cur]){
+        out.push(`${by[cur].name||''} に${own[cur]}が入っています（${u.name||''} が中に入るため）。数が二重になるので、中の単位へ移すか消してから送ってください`);
+        break;
+      }
+      cur = m[cur] || '';
+    }
+  });
+  return out;
+}
+/* 送る本文の大きさ（バイト）。文字数では日本語が数え足りず、送ってから 413 になる（監査152回目 Minor 1） */
+function bundleBodyBytes(text){
+  try{ return new TextEncoder().encode(text).length; }catch(e){}
+  try{ return new Blob([text]).size; }catch(e){}
+  return text.length * 3;
+}
+/* 受領の印を、調査の updated_at を変えずに書く（合成で別の端末の設定を古い印で上書きしないため） */
+function bundleMark(svUuid, m){
+  let all; try{ all = DB.loadRaw(DB.key.sv); }catch(e){ return false; }
+  const sv = all.find(x=>x && x.uuid===svUuid); if(!sv) return false;
+  Object.assign(sv, m);
+  return DB.save(DB.key.sv, all);
+}
+async function dbSendBundle(svUuid){
+  const sv = DB.get(DB.key.sv, svUuid); if(!sv){ toast('その調査はもうありません'); return; }
+  if(DB_BUNDLE_BUSY || DB_SEND_BUSY){ toast('いま送っています。少しお待ちください', 5000); return; }
+  if(!writeAllowed()){ toast('このタブでは送れません。記録を入れているタブからお送りください', 7000); return; }
+  dbSendSavePrefs();
+  const c = dbSendCheckUrl(dbSendUrl());
+  if(!c.url){ toast(c.why, 7000); return; }
+  const token = dbSendToken();
+  if(!token){ toast('合言葉を入れてください', 6000); return; }
+  if(/[^\x20-\x7e]/.test(token)){
+    toast('合言葉に日本語などが混ざっています。データベースが表示した半角の合言葉を入れてください', 9000);
+    return;
+  }
+  if(!sv.deleted_at){
+    const 問題 = bundleProblems(svUuid);
+    if(問題.length){ toast('このままでは送れません：' + 問題[0], 10000); return; }
+  }
+  if(!c.ts && !confirm('宛先が Tailscale（.ts.net）ではありません。この宛先に記録を送りますか？')) return;
+  let payload;
+  try{ payload = buildBundlePayload(svUuid); }
+  catch(e){ toast('記録を読み取れないため、送れませんでした', 8000); return; }
+  if(!payload) return;
+  const body = JSON.stringify(payload);
+  if(bundleBodyBytes(body) > 24 * 1024 * 1024){
+    toast('この調査は大きすぎて送れません（上限 25MB）。調査を分けるか、データベースの管理者に相談してください（JSONバックアップは控えとして書き出せます）', 12000);
+    return;
+  }
+  DB_BUNDLE_BUSY = true;
+  const btn = document.querySelector('button[onclick^="dbSendBundle("]');
+  if(btn){ btn.disabled = true; btn.textContent = '送っています…'; }
+  try{
+    toast('送っています…', 8000);
+    let res = null, j = null;
+    try{
+      res = await fetch(c.url + '/ingest/fish', {
+        method:'POST',
+        headers:{'Content-Type':'application/json', 'Authorization':'Bearer ' + token, 'X-Device-Id': deviceId()},
+        body,
+      });
+      try{ j = await res.json(); }catch(e){}
+    }catch(e){
+      toast('送れませんでした（通信エラー）。電波の良いところでお試しください', 10000);
+      return;                        // 受領の印は更新しない
+    }
+    if(j && j.stored === true && j.ok !== true){
+      // 記録は入ったが向こうの控え（CSV）の同期に失敗。印は付けず、もう一度送ってもらう（二重にはならない）
+      toast('送れましたが、データベース側の控えの同期に失敗しました。少し待ってから、もう一度「調査をまるごと送る」を押してください（二重にはなりません）', 15000);
+      return;
+    }
+    if(!res.ok || !j || j.ok !== true){
+      const why = (j && (j.error || j.message)) || ('HTTP ' + res.status);
+      const 詳細 = (j && Array.isArray(j.errors) && j.errors.length) ? '\n' + j.errors.slice(0, 3).join('\n') : '';
+      toast('送れませんでした：' + why + 詳細, 15000);
+      return;                        // 受領の印は更新しない
+    }
+    const receipt = (j.receipt == null ? '' : String(j.receipt));
+    const 印 = bundleMark(svUuid, {bundle_db_sent_at: nowISO(), bundle_db_receipt: receipt,
+                                   bundle_db_send_result: String(j.message||'ok').slice(0, 300)});
+    if(!印){
+      toast(`データベースは受け取りました（受領証 ${receipt || '—'}）。ただし端末に受領の印を保存できませんでした（空き容量をご確認ください）。同じ記録をもう一度送っても、向こうでは増えません`, 15000);
+      render();
+      return;
+    }
+    const 注意 = (j.warnings && j.warnings.length) ? `（注意 ${j.warnings.length}件: ${j.warnings[0]}）` : '';
+    toast('送りました。' + String(j.message||'') + 注意, 12000);
+    render();
+  }finally{
+    DB_BUNDLE_BUSY = false;
+    const b2 = document.querySelector('button[onclick^="dbSendBundle("]');
+    if(b2){ b2.disabled = false; b2.textContent = sv.deleted_at ? '削除をデータベースへ送る' : '調査をまるごと送る'; }
+  }
+}
+/* 書き出し画面の「調査をまるごと送る」の札 */
+function bundleCardHtml(svUuid, 宛先の欄を出す){
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv) return '';
+  let p = null, 数 = null;
+  try{
+    p = buildBundlePayload(svUuid);
+    const st = p.data.st.filter(x=>!x.deleted_at);
+    数 = {地点: st.filter(x=>x.is_spot).length, 単位: st.filter(x=>unitKindOf(x)).length,
+          環境: st.filter(x=>!x.is_spot && !unitKindOf(x) && stationKind(sv, x)==='物理環境').length,
+          魚: p.data.ca.filter(x=>!x.deleted_at).length, 個体: p.data.ind.filter(x=>!x.deleted_at).length,
+          マス: p.data.mc.filter(x=>!x.deleted_at).length, メモ: p.data.nt.filter(x=>!x.deleted_at).length,
+          消した: ['st','ca','ind','nt','mc'].reduce((a,k)=>a + p.data[k].filter(x=>x.deleted_at).length, 0)};
+  }catch(e){}
+  const 問題 = bundleProblems(svUuid);
+  return `<div class="card">
+    <h3 style="margin-top:0">調査をまるごと送る</h3>
+    <div class="dim small">この調査の<b>すべての記録</b>（地点・調査範囲や瀬淵やポイント・物理環境・魚・1尾ずつ・メモ・メッシュのマス。
+      消した分も「消した」として）をデータベースへ送ります。写真の本体は送りません（写真ZIPで別に取り込みます）。
+      <b>同じものを2回送っても、向こうでは増えません。</b>上の31列の送信とは別の控えに入ります。</div>
+    ${数 ? `<div class="dim small" style="margin-top:6px">地点 ${数.地点}・魚の単位 ${数.単位}・物理環境 ${数.環境}・魚 ${数.魚}・個体 ${数.個体}・マス ${数.マス}・メモ ${数.メモ}${数.消した ? `（消した分 ${数.消した}）` : ''}</div>` : ''}
+    ${宛先の欄を出す ? `<label>宛先</label>
+      <input id="dbs_url" value="${esc(dbSendUrl())}" placeholder="https://…….ts.net/app-ingest">
+      <label>合言葉</label>
+      <input id="dbs_token" type="password" value="${esc(dbSendToken())}" placeholder="データベース側の受け口が表示したもの">
+      <div class="row"><button class="btn sm" onclick="dbSendTest()">つながるか試す</button></div>` : '<div class="dim small">宛先と合言葉は上と同じです。</div>'}
+    ${問題.length ? `<div class="ngbox"><b>このままでは送れません</b><br>${問題.map(t=>esc(t)).join('<br>')}</div>` : ''}
+    <button class="btn pri" ${(問題.length || DB_BUNDLE_BUSY) ? 'disabled' : ''}
+      onclick="dbSendBundle('${svUuid}')">${DB_BUNDLE_BUSY ? '送っています…' : '調査をまるごと送る'}</button>
+    ${sv.bundle_db_sent_at ? `<div class="dim small" style="margin-top:8px">
+      前回のまるごと送信：${esc(fmtDate(sv.bundle_db_sent_at))} ${esc(fmtTime(sv.bundle_db_sent_at))}
+      ${sv.bundle_db_receipt ? `（受領証 ${esc(sv.bundle_db_receipt)}）` : ''}</div>` : ''}
+  </div>`;
+}
+
 /* ---------- 書き出し ---------- */
 SCREENS.exportHub = (svUuid)=>{
   const sv = DB.getAlive(DB.key.sv, svUuid);
@@ -17435,6 +17604,7 @@ SCREENS.exportHub = (svUuid)=>{
           前回の送信：${esc(fmtDate(sv.db_sent_at))} ${esc(fmtTime(sv.db_sent_at))}
           ${sv.db_receipt ? `（受領証 ${esc(sv.db_receipt)}）` : ''}</div>` : ''}
       </div>` : ''}
+      ${bundleCardHtml(svUuid, !canExportDbCsv(sv))}
       <div class="card">
         <h3 style="margin-top:0">31列に乗らない分</h3>
         <div class="row">
