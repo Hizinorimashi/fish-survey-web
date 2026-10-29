@@ -155,7 +155,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v153';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v154';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -13980,13 +13980,11 @@ SCREENS.fishMap = (arg)=>{
         <div class="dim small">記録は、いちばん小さい単位に入れます。
           大きい単位は、中に入っているものの集計になります。</div>
       </div>
-      ${環境囲い.length ? `<div class="card">
-        <h3 style="margin-top:0">物理環境の囲い</h3>
+      ${環境囲い.length ? foldHtml('fishenvpoly', '物理環境の囲い', `<span class="fsub">${環境囲い.length}件</span>`, `
         <div class="seg">${環境囲い.map(st=>`<button type="button"
           onclick="mapTabSwitch('${svUuid}','env','${st.uuid}')">${esc(st.name||'')}</button>`).join('')}</div>
         <div class="dim small">押すと物理環境のタブに切り替わり、その囲いの入力欄が出ます。
-          地図の上の囲いは「見るだけ」のときに押せます。</div>
-      </div>` : ''}
+          地図の上の囲いは「見るだけ」のときに押せます。</div>`, false) : ''}
 
       ${MAP_LOOSE ? `<div class="warnbox">ここには、<b>地点に属さない以前の記録</b>だけを
         出しています。直すことはできますが、新しくは作れません。
@@ -14528,6 +14526,26 @@ function envDrawAll(svUuid){
   const map = MAPS.main.map; if(!map) return;
   try{ ENVLAYER.forEach(x=>map.removeLayer(x)); }catch(e){}
   ENVLAYER = [];
+  // 魚の地図の調査範囲（E・閉じたもの）を、薄い点線と名前だけで重ねる（v154・2026-10-29 の実機の声「物理環境タブで調査範囲を見たい」）。
+  // 触っても反応しない専用の層（基図の上・物理環境の記号の下）。選ぶ・全部入るように・色分けには入れない（v142 計画点検 M6 と同じ決まり）
+  try{
+    let pane = map.getPane('fishbg');
+    if(!pane){
+      const tiles = map.getPane('tilePane');
+      pane = map.createPane('fishbg', tiles && tiles.parentNode ? tiles.parentNode : undefined);
+      pane.style.zIndex = '300'; pane.style.pointerEvents = 'none';
+    }
+    mapStations(svUuid, 'fish').filter(st=>unitKindOf(st)==='E' && unitReady(st)).forEach(st=>{
+      const vs = polyPts(st);
+      if(vs.length < 3) return;
+      ENVLAYER.push(L.polygon(vs, {pane:'fishbg', color:'#d2b4ff', weight:2, opacity:.8, dashArray:'6 4',
+        fillColor:'#d2b4ff', fillOpacity:.05, interactive:false}).addTo(map));
+      const c = vs.slice().sort((a,b)=>b[0]-a[0])[0];
+      ENVLAYER.push(L.marker(c, {pane:'fishbg', interactive:false, keyboard:false,
+        icon:L.divIcon({className:'', iconSize:[80,18], iconAnchor:[40,9],
+          html:`<div class="envbg-name">${esc(st.name||'')}（調査範囲）</div>`})}).addTo(map));
+    });
+  }catch(e){ console.error(e); }
   const pts = [];
   const range = envColorRange(svUuid);
   mapStations(svUuid, 'env').forEach(st=>{
