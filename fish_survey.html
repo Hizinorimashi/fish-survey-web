@@ -155,7 +155,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v156';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v157';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -17508,7 +17508,37 @@ function bundleCardHtml(svUuid, 宛先の欄を出す){
     ${sv.bundle_db_sent_at ? `<div class="dim small" style="margin-top:8px">
       前回のまるごと送信：${esc(fmtDate(sv.bundle_db_sent_at))} ${esc(fmtTime(sv.bundle_db_sent_at))}
       ${sv.bundle_db_receipt ? `（受領証 ${esc(sv.bundle_db_receipt)}）` : ''}</div>` : ''}
+    <button class="btn" ${問題.length ? 'disabled' : ''}
+      onclick="exportBundleFile('${svUuid}')">同じ中身をファイルに書き出す（JSON）</button>
+    <div class="dim small">送るのと同じ中身を 1 つのファイルにします。OneDrive などのフォルダに控えとして置けます（iPhone では「ファイル」アプリで保存先を選びます）。
+      圏外で送れないときは、あとでこのファイルをデータベースに取り込めます。</div>
+    ${sv.bundle_file_at ? `<div class="dim small" style="margin-top:8px">
+      前回のファイル書き出し：${esc(fmtDate(sv.bundle_file_at))} ${esc(fmtTime(sv.bundle_file_at))}</div>` : ''}
   </div>`;
+}
+/* 「調査をまるごと送る」と同じ中身（buildBundlePayload）を 1 つの JSON ファイルにする（v157）。
+   送信と同じ検査（描きかけ・記録の決まり）を通す。通信・宛先・合言葉・大きさの上限は関係ない。
+   書き出した印（bundle_file_at）は送信の印とは別の欄に、調査の updated_at を変えずに書く */
+function exportBundleFile(svUuid){
+  const sv = DB.getAlive(DB.key.sv, svUuid); if(!sv){ toast('その調査はもうありません'); return; }
+  // 使用権のないタブから書き出すと、別のタブが書き換えている途中のばらばらな中身を混ぜてしまう（31列の CSV と同じ）
+  if(!ownsLock()){ toast('このタブでは書き出せません。記録を入れているタブから書き出してください', 6000); return; }
+  const 問題 = bundleProblems(svUuid);
+  if(問題.length){ toast('このままでは書き出せません：' + 問題[0], 10000); return; }
+  let payload;
+  try{ payload = buildBundlePayload(svUuid); }
+  catch(e){ toast('記録を読み取れないため、書き出せませんでした', 8000); return; }
+  if(!payload) return;
+  const text = JSON.stringify(payload);
+  if(!ownsLock()){
+    toast('書き出しの途中で、ほかのタブに使用権が移りました。このタブを読み込み直してからやり直してください', 8000);
+    return;
+  }
+  download(`${exportFileBase(sv)}_まるごと.json`, text, 'application/json');
+  if(!bundleMark(svUuid, {bundle_file_at: nowISO()})){
+    toast('ファイルは作りましたが、書き出した日時を端末に控えられませんでした（空き容量をご確認ください）', 8000);
+  }
+  render();
 }
 
 /* ---------- 書き出し ---------- */
