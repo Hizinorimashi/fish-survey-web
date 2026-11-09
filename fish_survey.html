@@ -155,7 +155,7 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
      localStorage  fs_          IndexedDB  fish_survey_media
      キャッシュ    fish-survey-* / fish-map-*
    ============================================================ */
-const APP_VERSION = 'v157';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
+const APP_VERSION = 'v158';   // sw.js の CACHE 名と揃える（smoke テストが照合する）
 
 /* ---------- 小道具 ---------- */
 const $  = (s,r)=> (r||document).querySelector(s);
@@ -1073,7 +1073,7 @@ function searchPlace(name){
 /* <<<FS_SPECIES_AUTO_START>>>
    ここから下は自動生成。手で書き換えない。
    作り直す: 魚類データベース/scripts/generate_fish_app_species.py
-   元:       species_master の is_active=TRUE を sort_order 順に 103種 */
+   元:       species_master の is_active=TRUE を sort_order 順に 106種 */
 const SPECIES = [
   {id:"FW001", ja:"ミツバヤツメ", fam:"ヤツメウナギ科", ord:1},
   {id:"FW003", ja:"キタスナヤツメ", fam:"ヤツメウナギ科", ord:2},
@@ -1178,6 +1178,9 @@ const SPECIES = [
   {id:"FW109", ja:"テナガエビ", fam:"テナガエビ科", ord:101},
   {id:"FW110", ja:"ヌマエビ", fam:"ヌマエビ科", ord:102},
   {id:"FW111", ja:"モクズガニ", fam:"モクズガニ科", ord:103},
+  {id:"FW112", ja:"ウチダザリガニ", fam:"ザリガニ科", ord:104},
+  {id:"FW113", ja:"ニホンザリガニ", fam:"アジアザリガニ科", ord:105},
+  {id:"FW114", ja:"アメリカザリガニ", fam:"アメリカザリガニ科", ord:106},
 ];
 const SPECIES_ALIAS = {
   "アカハラ": "FW021",
@@ -1204,7 +1207,7 @@ const SPECIES_ALIAS = {
   "ヨシノボリ": "FW101",
   "ライギョ": "FW085",
 };
-const SPECIES_STAMP = {n:103, sha:"9db2a39aa715"};
+const SPECIES_STAMP = {n:106, sha:"b0f01a463063"};
 /* <<<FS_SPECIES_AUTO_END>>> */
 
 /* 親魚と稚魚の区別（サクラマス FW050／ヤマメ FW050J、サケ FW044／サケ稚魚 FW044J）は
